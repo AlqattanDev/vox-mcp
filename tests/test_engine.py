@@ -324,6 +324,7 @@ async def test_queued_converse_does_not_open_the_microphone(tmp_path: Path):
 
     status = await engine.status()
     assert status["operation"]["queue_depth"] == 1
+    assert status["operation"]["queue"][0]["agent"] == "mobilescape"
     # The whole point: waiting in line must not hold the device open.
     assert status["session"]["microphone_open"] is False
     assert engine.microphone_open is False

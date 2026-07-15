@@ -35,7 +35,8 @@ from .diagnostics import static_diagnostics
 from .errors import BusyError, PrivacyError, ServiceUnavailableError, VoxError
 from .eventlog import JsonlEventLogger, read_events
 from .intents import classify_spoken_intent
-from .lease import LeaseManager, OperationGate
+from .agents import AgentVoices, FALLBACK_VOICES
+from .lease import DEFAULT_AGENT, LeaseManager, OperationGate
 from .models import SessionState, SpokenIntent, StopReason
 from .services import ServiceSupervisor
 from .speech import LocalSpeechClient, SpeechResult, synthesize_with_macos_say
@@ -81,6 +82,8 @@ class VoxEngine:
         self.gate.on_event = self._log_queue_event
 
         self.default_voice = os.environ.get("VOX_VOICE", "af_sky").lower()
+        self.agent_voices = AgentVoices(home / "agents.json", default_voice=self.default_voice)
+        self._voice_pool: list[str] | None = None
         self.default_language = os.environ.get("VOX_LANGUAGE", "en")
         self.default_wait_seconds = float(os.environ.get("VOX_WAIT_SECONDS", "60"))
         self.input_device: int | str | None = os.environ.get("VOX_INPUT_DEVICE")
@@ -248,11 +251,13 @@ class VoxEngine:
         client_id: str,
         action: str,
         operation: Callable[[], Awaitable[Any]],
+        *,
+        agent: str | None = None,
     ) -> Any:
         await self._claim(client_id)
         if self.state.state is SessionState.PAUSED:
             raise PrivacyError("Voice session is paused; resume it before using audio")
-        async with self.gate.operation(client_id, action):
+        async with self.gate.operation(client_id, action, agent=agent or DEFAULT_AGENT):
             self._set_active(client_id)
             try:
                 return await operation()
@@ -632,13 +637,17 @@ class VoxEngine:
         listen_duration_min: float | None = None,
         trailing_silence_s: float | None = None,
         language: str | None = None,
+        agent: str | None = None,
         **_: Any,
     ) -> dict[str, Any]:
         async def operation() -> dict[str, Any]:
+            # Resolved inside the turn, not before it: resolving first would let
+            # voice-lookup latency decide queue order instead of arrival order.
+            # An explicit voice= always wins over the agent's assigned voice.
             spoken = await self._speak_locked(
                 client_id,
                 message,
-                voice=voice,
+                voice=voice or await self._agent_voice(agent),
                 speed=speed,
                 instructions=instructions,
                 interruptible=True,
@@ -658,7 +667,7 @@ class VoxEngine:
             result["session"] = self.state.snapshot().to_dict()
             return result
 
-        return await self._run_operation(client_id, "converse", operation)
+        return await self._run_operation(client_id, "converse", operation, agent=agent)
 
     async def speak(
         self,
@@ -669,20 +678,21 @@ class VoxEngine:
         speed: float = 1.0,
         instructions: str | None = None,
         interruptible: bool = True,
+        agent: str | None = None,
         **_: Any,
     ) -> dict[str, Any]:
         async def operation() -> dict[str, Any]:
             result = await self._speak_locked(
                 client_id,
                 message,
-                voice=voice,
+                voice=voice or await self._agent_voice(agent),
                 speed=speed,
                 instructions=instructions,
                 interruptible=interruptible,
             )
             return {**result, "session": self.state.snapshot().to_dict()}
 
-        return await self._run_operation(client_id, "speak", operation)
+        return await self._run_operation(client_id, "speak", operation, agent=agent)
 
     async def listen(
         self,
@@ -692,6 +702,7 @@ class VoxEngine:
         listen_duration_min: float | None = None,
         trailing_silence_s: float | None = None,
         language: str | None = None,
+        agent: str | None = None,
         **_: Any,
     ) -> dict[str, Any]:
         return await self._run_operation(
@@ -704,6 +715,7 @@ class VoxEngine:
                 trailing_silence_s=trailing_silence_s,
                 language=language,
             ),
+            agent=agent,
         )
 
     async def session(
@@ -714,12 +726,13 @@ class VoxEngine:
         pause_seconds: float | None = None,
         target_client_id: str | None = None,
         force: bool = False,
+        agent: str | None = None,
         **_: Any,
     ) -> dict[str, Any]:
         action = action.lower().strip()
         administrative = client_id == "http-control"
         if action == "status":
-            return await self.status()
+            return await self._status_for_agent(agent)
         if action == "start":
             if administrative:
                 if self.state.state is SessionState.OFF:
@@ -789,8 +802,8 @@ class VoxEngine:
             self.state.start(client_id)
         else:
             raise VoxError(f"Unknown voice session action: {action}")
-        self._log(f"session.{action}", client_id=client_id)
-        return await self.status()
+        self._log(f"session.{action}", client_id=client_id, agent=agent or DEFAULT_AGENT)
+        return await self._status_for_agent(agent)
 
     async def control(
         self,
@@ -925,12 +938,11 @@ class VoxEngine:
             payload["formatted_content"] = _format_transcription(payload, output_format)
         return payload
 
-    async def voice_registry(
-        self, client_id: str, *, provider: str | None = None, **_: Any
-    ) -> dict[str, Any]:
-        del client_id
-        if provider not in {None, "kokoro", "local"}:
-            raise VoxError("Vox local-only mode exposes only local Kokoro voices")
+    async def _available_voices(self) -> list[str]:
+        """Return the local Kokoro voices, cached; the pool rarely changes."""
+
+        if self._voice_pool is not None:
+            return self._voice_pool
         endpoint = self.config.tts_url.rstrip("/") + "/audio/voices"
         try:
             async with httpx.AsyncClient(
@@ -940,8 +952,33 @@ class VoxEngine:
                 response.raise_for_status()
                 payload = response.json()
             voices = payload if isinstance(payload, list) else payload.get("voices", [])
+            pool = [str(voice) for voice in voices if str(voice).strip()]
         except Exception:
-            voices = ["af_sky", "af_heart", "af_bella", "am_adam", "bf_emma", "bm_george"]
+            pool = []
+        if not pool:
+            # Do not cache a fallback: Kokoro may just be starting up.
+            return list(FALLBACK_VOICES)
+        self._voice_pool = pool
+        return pool
+
+    async def _agent_voice(self, agent: str | None) -> str:
+        label = agent or DEFAULT_AGENT
+        if label == DEFAULT_AGENT:
+            return self.default_voice
+        # Only a first-ever assignment needs the live pool; a known agent must
+        # never wait on Kokoro to find out what it already sounds like.
+        existing = self.agent_voices.assignments.get(label)
+        if existing:
+            return existing
+        return self.agent_voices.resolve(label, await self._available_voices())
+
+    async def voice_registry(
+        self, client_id: str, *, provider: str | None = None, **_: Any
+    ) -> dict[str, Any]:
+        del client_id
+        if provider not in {None, "kokoro", "local"}:
+            raise VoxError("Vox local-only mode exposes only local Kokoro voices")
+        voices = await self._available_voices()
         clone_names: list[str] = []
         try:
             clone_document = json.loads((Path.home() / ".voicemode" / "voices.json").read_text())
@@ -973,6 +1010,7 @@ class VoxEngine:
                 "local_only": True,
             },
             "default": self.default_voice,
+            "agents": dict(self.agent_voices.assignments),
             "local_only": True,
         }
 
@@ -1097,6 +1135,14 @@ class VoxEngine:
             limit,
             days,
         )
+
+    async def _status_for_agent(self, agent: str | None) -> dict[str, Any]:
+        """Status plus who is asking and which voice they will speak in."""
+
+        label = agent or DEFAULT_AGENT
+        status = await self.status()
+        status["agent"] = {"id": label, "voice": await self._agent_voice(label)}
+        return status
 
     async def status(self) -> dict[str, Any]:
         self.state.resume_if_due()

@@ -27,10 +27,12 @@ from starlette.responses import JSONResponse, Response
 from . import __version__
 from .audio import default_latest_recording_path
 from .errors import VoxError
+from .lease import DEFAULT_AGENT
 
 
 _ENGINE: Any | None = None
 _ENGINE_LOCK = threading.Lock()
+_AGENT_MAX_LENGTH = 64
 
 
 def get_engine() -> Any:
@@ -68,6 +70,44 @@ def _client_id(ctx: Context) -> str:
         if normalized:
             return f"mcp:host:{normalized[:96]}"
     return f"mcp:{ctx.session_id}"
+
+
+def _normalize_agent(value: Any) -> str | None:
+    """Reduce a speaker label to the safe alphabet, or None if nothing is left."""
+
+    if value is None:
+        return None
+    normalized = re.sub(r"[^a-z0-9._-]+", "-", str(value).strip().lower()).strip("-")
+    return normalized[:_AGENT_MAX_LENGTH] or None
+
+
+def _agent_from_url(ctx: Context) -> str | None:
+    """Read ?agent=<name> off the MCP URL for this request.
+
+    This is the primary mechanism: a project sets it once in its own MCP
+    config, so no agent can forget to identify itself per call. stdio has no
+    request, hence the defensive lookups.
+    """
+
+    request = getattr(ctx.request_context, "request", None)
+    params = getattr(request, "query_params", None)
+    if params is None:
+        return None
+    try:
+        return params.get("agent")
+    except Exception:
+        return None
+
+
+def _agent_id(ctx: Context, explicit: str | None = None) -> str:
+    """Resolve who is speaking, independent of which host holds the lease.
+
+    Two Claude Code windows in different projects share one _client_id, so the
+    lease cannot tell them apart. The speaker label can, which is what lets
+    them queue and sound different.
+    """
+
+    return _normalize_agent(_agent_from_url(ctx)) or _normalize_agent(explicit) or DEFAULT_AGENT
 
 
 def _drop_none(values: Mapping[str, Any]) -> dict[str, Any]:
@@ -306,12 +346,14 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
         listen_duration_max: float = 300.0,
         listen_duration_min: float = 0.5,
         trailing_silence_s: float = 1.2,
+        agent: str | None = None,
     ) -> Any:
         _listen_bounds(listen_duration_max, listen_duration_min)
         return await _invoke(
             current_engine(),
             "converse",
             client_id=_client_id(ctx),
+            agent=_agent_id(ctx, agent),
             message=message,
             wait_for_response=wait_for_response,
             voice=voice,
@@ -332,11 +374,13 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
         voice: str | None = None,
         speed: float | None = None,
         interruptible: bool = True,
+        agent: str | None = None,
     ) -> Any:
         return await _invoke(
             current_engine(),
             "speak",
             client_id=_client_id(ctx),
+            agent=_agent_id(ctx, agent),
             message=message,
             voice=voice,
             speed=speed,
@@ -354,12 +398,14 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
         listen_duration_min: float = 0.5,
         trailing_silence_s: float = 1.2,
         language: str | None = None,
+        agent: str | None = None,
     ) -> Any:
         _listen_bounds(listen_duration_max, listen_duration_min)
         return await _invoke(
             current_engine(),
             "listen",
             client_id=_client_id(ctx),
+            agent=_agent_id(ctx, agent),
             listen_duration_max=listen_duration_max,
             listen_duration_min=listen_duration_min,
             trailing_silence_s=trailing_silence_s,
@@ -379,6 +425,7 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
         seconds: float | None = None,
         target: str | None = None,
         force: bool = False,
+        agent: str | None = None,
     ) -> Any:
         mapped_action = "resume" if action == "unmute" else action
         return await _invoke(
@@ -386,6 +433,7 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
             "session",
             action=mapped_action,
             client_id=_client_id(ctx),
+            agent=_agent_id(ctx, agent),
             pause_seconds=seconds,
             target_client_id=target,
             force=force,

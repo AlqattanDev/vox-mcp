@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 from fastmcp import Client
+from fastmcp.client.transports import StreamableHttpTransport
 from httpx import ASGITransport, AsyncClient
 from mcp.types import Implementation
 
@@ -186,6 +187,99 @@ async def test_host_identity_survives_new_http_sessions_and_version_updates(tmp_
     assert owners == ["mcp:host:codex", "mcp:host:codex"]
 
 
+def _asgi_client_factory(app):
+    def factory(headers=None, timeout=None, auth=None, follow_redirects=True):
+        return AsyncClient(
+            transport=ASGITransport(app=app, client=("127.0.0.1", 50123)),
+            base_url="http://127.0.0.1",
+            headers=headers,
+            timeout=timeout,
+            auth=auth,
+            follow_redirects=follow_redirects,
+        )
+
+    return factory
+
+
+@pytest.mark.asyncio
+async def test_url_agent_param_separates_speakers_sharing_one_client_id(tmp_path: Path) -> None:
+    """Two projects, one MCP host: the URL is what tells them apart."""
+
+    engine = FakeEngine(tmp_path / "latest.wav")
+    server = create_mcp(engine)
+    app = server.http_app(path=DEFAULT_MCP_PATH, stateless_http=False)
+    factory = _asgi_client_factory(app)
+
+    async with app.router.lifespan_context(app):
+        for label in ("infra", "mobilescape"):
+            transport = StreamableHttpTransport(
+                url=f"http://127.0.0.1{DEFAULT_MCP_PATH}?agent={label}",
+                httpx_client_factory=factory,
+            )
+            async with Client(
+                transport,
+                client_info=Implementation(name="Claude Code", version="1.0"),
+            ) as client:
+                await client.call_tool("speak", {"message": f"hello from {label}"})
+
+    speaks = [arguments for name, arguments in engine.calls if name == "speak"]
+    assert [call["agent"] for call in speaks] == ["infra", "mobilescape"]
+    # The lease identity is deliberately unchanged: it still follows the host.
+    assert speaks[0]["client_id"] == speaks[1]["client_id"]
+
+
+@pytest.mark.asyncio
+async def test_url_agent_param_is_normalised(tmp_path: Path) -> None:
+    engine = FakeEngine(tmp_path / "latest.wav")
+    server = create_mcp(engine)
+    app = server.http_app(path=DEFAULT_MCP_PATH, stateless_http=False)
+    factory = _asgi_client_factory(app)
+
+    async with app.router.lifespan_context(app):
+        transport = StreamableHttpTransport(
+            url=f"http://127.0.0.1{DEFAULT_MCP_PATH}?agent=Infra%20Team%2FProd%21",
+            httpx_client_factory=factory,
+        )
+        async with Client(transport) as client:
+            await client.call_tool("speak", {"message": "hi"})
+
+    speak = next(arguments for name, arguments in engine.calls if name == "speak")
+    assert speak["agent"] == "infra-team-prod"
+
+
+@pytest.mark.asyncio
+async def test_url_agent_beats_the_tool_param(tmp_path: Path) -> None:
+    engine = FakeEngine(tmp_path / "latest.wav")
+    server = create_mcp(engine)
+    app = server.http_app(path=DEFAULT_MCP_PATH, stateless_http=False)
+    factory = _asgi_client_factory(app)
+
+    async with app.router.lifespan_context(app):
+        transport = StreamableHttpTransport(
+            url=f"http://127.0.0.1{DEFAULT_MCP_PATH}?agent=infra",
+            httpx_client_factory=factory,
+        )
+        async with Client(transport) as client:
+            await client.call_tool("speak", {"message": "hi", "agent": "spoofed"})
+
+    speak = next(arguments for name, arguments in engine.calls if name == "speak")
+    assert speak["agent"] == "infra"
+
+
+@pytest.mark.asyncio
+async def test_explicit_agent_param_is_used_without_a_url_param(tmp_path: Path) -> None:
+    engine = FakeEngine(tmp_path / "latest.wav")
+    server = create_mcp(engine)
+
+    async with Client(server) as client:
+        await client.call_tool("speak", {"message": "hi", "agent": "Mobilescape"})
+        await client.call_tool("speak", {"message": "hi"})
+
+    speaks = [arguments for name, arguments in engine.calls if name == "speak"]
+    assert speaks[0]["agent"] == "mobilescape"
+    assert speaks[1]["agent"] == "default"  # unset stays single-agent
+
+
 @pytest.mark.asyncio
 async def test_tool_arguments_are_adapted_to_engine_contract(tmp_path: Path) -> None:
     engine = FakeEngine(tmp_path / "latest.wav")
@@ -214,6 +308,7 @@ async def test_tool_arguments_are_adapted_to_engine_contract(tmp_path: Path) -> 
     assert calls["session"] == {
         "action": "pause",
         "client_id": owner,
+        "agent": "default",
         "pause_seconds": 8,
         "target_client_id": "next-host",
         "force": True,
