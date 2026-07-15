@@ -337,6 +337,38 @@ async def test_queued_converse_does_not_open_the_microphone(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_cancelling_speech_answers_the_caller(tmp_path: Path):
+    """A cancelled speak used to hang its caller forever with no response."""
+
+    engine = make_engine(tmp_path)
+    speaking, handle = await _hold_the_microphone(engine)
+
+    signalled = await engine.control("claude", "cancel")
+    assert signalled["signalled"] is True
+
+    result = await asyncio.wait_for(speaking, timeout=5)
+    assert result["status"] == "cancelled"
+    assert result["action"] == "speak"
+    assert (await engine.status())["operation"]["busy"] is False
+
+
+@pytest.mark.asyncio
+async def test_host_cancellation_still_propagates(tmp_path: Path):
+    """Only a deliberate cancel is an answer; a dropped request is not."""
+
+    engine = make_engine(tmp_path)
+    speaking, handle = await _hold_the_microphone(engine)
+
+    speaking.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await speaking
+
+    handle.release.set()
+    await asyncio.sleep(0.05)
+    assert (await engine.status())["operation"]["busy"] is False
+
+
+@pytest.mark.asyncio
 async def test_queue_transitions_are_logged(tmp_path: Path):
     engine = make_engine(tmp_path)
     holder, handle = await _hold_the_microphone(engine)

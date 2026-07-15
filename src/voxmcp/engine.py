@@ -262,9 +262,22 @@ class VoxEngine:
             try:
                 return await operation()
             except asyncio.CancelledError:
+                # Set by control(cancel) before it cancelled us, so it tells a
+                # deliberate cancel apart from the host dropping the request.
+                with self._active_lock:
+                    user_requested = self._cancel_requested
                 self._signal_cancel(manual_end=False, cancel_task=False)
                 self._return_idle_if_active()
                 self._log("turn.cancelled", client_id=client_id, action=action)
+                if user_requested:
+                    # Cancelling mid-speech used to leave the caller with no
+                    # response at all: the tool call never completed and the
+                    # agent hung. A cancel is an answer, so report it as one.
+                    return {
+                        "status": "cancelled",
+                        "action": action,
+                        "session": self.state.snapshot().to_dict(),
+                    }
                 raise
             except Exception as exc:
                 self._signal_cancel(manual_end=False, cancel_task=False)

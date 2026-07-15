@@ -26,28 +26,38 @@ upstream compatibility layer — packaged for the wheel build, not edited.
 - **Per-agent voices.** Auto-assigned from the local English Kokoro voices by a
   sha256 of the label, persisted to `~/.vox/agents.json` so they never drift.
   Hand-written entries are honoured verbatim. `default` keeps `af_sky`.
+- **Cancel answers the caller.** Cancelling mid-speech returns
+  `{"status": "cancelled"}` instead of leaving the tool call unanswered. A host
+  dropping the request still propagates `CancelledError`, as cooperative
+  cancellation requires.
 - **Observability.** `voice_session(status)` reports the active agent, the
   queue, and the caller's resolved voice; `voice_registry` lists the mapping.
   Queue transitions land in `~/.vox/state/events.jsonl`.
 
-Tests: `.venv/bin/python -m pytest tests/` — **179 passing** (147 before this
+Tests: `.venv/bin/python -m pytest tests/` — **181 passing** (147 before this
 work).
 
-## Known issue, not yet fixed
+## Wired up
 
-Cancelling a turn **while it is speaking** leaves that caller with no response:
-the engine cancels the handler task, so the MCP tool call never completes and
-the calling agent hangs. Queued turns are unaffected — they drain correctly.
+Vox is configured globally in `~/.claude.json` (no `?agent=`, so anything
+unlisted is `default` on `af_sky`). These projects have a local-scope override
+that names their speaker:
 
-This predates the queue work (verified by running the same scenario against the
-pre-change commit, which behaves identically). Fixing it means changing cancel
-semantics to return a `cancelled` result instead of propagating
-`CancelledError`, which is a deliberate design change rather than a bug fix.
+| project | agent | voice |
+|---|---|---|
+| `~/infra` | `infra` | `af_jessica` |
+| `~/fable-5/games/mobilescape` | `mobilescape` | `am_fenrir` |
+| `~/vox-mcp` | `vox` | `am_liam` |
+| `~/.claude` | `claude` | `af_bella` |
+
+Add another with, from inside the repo:
+
+```bash
+claude mcp add --scope local --transport http vox \
+  "http://127.0.0.1:8766/mcp?agent=<name>"
+```
 
 ## Next steps
 
-- Decide on the cancel-while-speaking semantics above.
-- Add `?agent=<project>` to each project's MCP config; anything unset stays
-  `default` and sounds exactly as before.
 - The old Codex output directory (`~/Documents/Codex/2026-07-10/.../vox-mcp`)
   is superseded and can be deleted.
