@@ -9,6 +9,7 @@ import pytest
 from voxmcp.audio import CaptureResult, CaptureStopReason
 from voxmcp.config import VoxConfig
 from voxmcp.engine import VoxEngine
+from voxmcp.errors import BusyError
 from voxmcp.eventlog import JsonlEventLogger
 from voxmcp.lease import LeaseManager, OperationGate
 from voxmcp.speech import SpeechResult
@@ -222,8 +223,10 @@ async def test_host_cancellation_keeps_gate_until_recorder_confirms_closed(tmp_p
             self.path = path
             self.entered = threading.Event()
             self.release = threading.Event()
+            self.entered_count = 0
 
         def capture(self, *, device=None, control=None):
+            self.entered_count += 1
             self.entered.set()
             assert self.release.wait(timeout=5)
             return CaptureResult(
@@ -251,10 +254,129 @@ async def test_host_cancellation_keeps_gate_until_recorder_confirms_closed(tmp_p
     assert status["session"]["microphone_open"] is True
     assert "still closing" in status["detail"].lower()
     assert status["operation"]["busy"] is True
-    with pytest.raises(Exception, match="already running"):
-        await engine.listen("claude")
+
+    # The queue is what protects the device now: a competing listen waits for
+    # the wedged recorder instead of opening the microphone underneath it.
+    queued = asyncio.create_task(engine.listen("claude"))
+    await asyncio.sleep(0.05)
+    assert not queued.done()
+    assert recorder.entered_count == 1  # the second turn never reached capture
+    assert (await engine.status())["operation"]["queue_depth"] == 1
+
+    queued.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await queued
 
     recorder.release.set()
     with pytest.raises(asyncio.CancelledError):
         await listening
     assert (await engine.status())["session"]["microphone_open"] is False
+
+
+class HoldingHandle:
+    """A playback handle that keeps the speakers busy until released."""
+
+    def __init__(self):
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    @property
+    def running(self):
+        return not self.release.is_set()
+
+    def wait(self):
+        self.started.set()
+        self.release.wait(timeout=5)
+        return 0
+
+    def cancel(self):
+        self.release.set()
+
+
+class HoldingPlayer:
+    def __init__(self, handle):
+        self.handle = handle
+
+    def play_file(self, *args, **kwargs):
+        return self.handle
+
+    def cancel_all(self):
+        return 0
+
+
+async def _hold_the_microphone(engine):
+    """Start a real speak turn and return once it owns the gate."""
+
+    handle = HoldingHandle()
+    engine.player = HoldingPlayer(handle)
+    task = asyncio.create_task(engine.speak("claude", "holding the mic"))
+    assert await asyncio.to_thread(handle.started.wait, 2)
+    return task, handle
+
+
+@pytest.mark.asyncio
+async def test_queued_converse_does_not_open_the_microphone(tmp_path: Path):
+    engine = make_engine(tmp_path)
+    holder, handle = await _hold_the_microphone(engine)
+
+    queued = asyncio.create_task(engine.converse("claude", "second", agent="mobilescape"))
+    await asyncio.sleep(0.05)
+
+    status = await engine.status()
+    assert status["operation"]["queue_depth"] == 1
+    # The whole point: waiting in line must not hold the device open.
+    assert status["session"]["microphone_open"] is False
+    assert engine.microphone_open is False
+
+    handle.release.set()
+    await asyncio.wait_for(holder, timeout=5)
+    await asyncio.wait_for(queued, timeout=5)
+    assert (await engine.status())["session"]["microphone_open"] is False
+
+
+@pytest.mark.asyncio
+async def test_cancel_drains_queued_turns(tmp_path: Path):
+    engine = make_engine(tmp_path)
+    holder, handle = await _hold_the_microphone(engine)
+
+    queued = [
+        asyncio.create_task(engine.converse("claude", "one", agent="infra")),
+        asyncio.create_task(engine.converse("claude", "two", agent="mobilescape")),
+    ]
+    await asyncio.sleep(0.05)
+    assert (await engine.status())["operation"]["queue_depth"] == 2
+
+    result = await engine.control("claude", "cancel")
+    assert result["queue_drained"] == 2
+
+    # Neither queued turn is left waiting for a mic that will never come.
+    for task in queued:
+        with pytest.raises(BusyError):
+            await asyncio.wait_for(task, timeout=2)
+
+    handle.release.set()
+    await asyncio.gather(holder, return_exceptions=True)  # cancel ends the active turn
+    status = await engine.status()
+    assert status["operation"]["queue_depth"] == 0
+    assert status["operation"]["busy"] is False
+
+
+@pytest.mark.asyncio
+async def test_session_stop_drains_queued_turns(tmp_path: Path):
+    engine = make_engine(tmp_path)
+    holder, handle = await _hold_the_microphone(engine)
+
+    queued = asyncio.create_task(engine.converse("claude", "queued", agent="infra"))
+    await asyncio.sleep(0.05)
+    assert (await engine.status())["operation"]["queue_depth"] == 1
+
+    await engine.session("claude", "stop")
+
+    with pytest.raises(BusyError):
+        await asyncio.wait_for(queued, timeout=2)
+
+    handle.release.set()
+    await asyncio.gather(holder, return_exceptions=True)  # stop ends the active turn
+    status = await engine.status()
+    assert status["operation"]["queue_depth"] == 0
+    assert status["operation"]["busy"] is False

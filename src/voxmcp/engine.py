@@ -78,6 +78,7 @@ class VoxEngine:
         self.compatibility = compatibility
         self.lease = lease or LeaseManager(ttl_seconds=max(30.0, config.idle_timeout_seconds))
         self.gate = gate or OperationGate()
+        self.gate.on_event = self._log_queue_event
 
         self.default_voice = os.environ.get("VOX_VOICE", "af_sky").lower()
         self.default_language = os.environ.get("VOX_LANGUAGE", "en")
@@ -212,6 +213,11 @@ class VoxEngine:
         elif snapshot.owner_id not in {None, client_id}:
             await self.lease.release(client_id, force=True)
             raise BusyError(f"Session belongs to {snapshot.owner_id}")
+
+    def _log_queue_event(self, event: str, **data: Any) -> None:
+        """Record queue transitions alongside every other voice event."""
+
+        self._log(event, **data)
 
     def _log(self, event: str, *, transcript: str | None = None, **data: Any) -> None:
         snapshot = self.state.snapshot()
@@ -724,6 +730,9 @@ class VoxEngine:
             if not administrative and not force:
                 await self._claim(client_id)
             self._signal_cancel(manual_end=False, force=True)
+            # A turn that queued before the pause would otherwise inherit the
+            # mic afterwards and speak straight through a privacy hold.
+            self.gate.drain("paused")
             if not await self._wait_for_microphone_closed():
                 raise ServiceUnavailableError("microphone is still closing; Vox remains fail-closed")
             if self.state.state is not SessionState.PAUSED:
@@ -738,6 +747,7 @@ class VoxEngine:
             self.state.resume(client_id=None)
         elif action == "stop":
             self._signal_cancel(manual_end=False, force=True)
+            self.gate.drain("stopped")
             if not await self._wait_for_microphone_closed():
                 raise ServiceUnavailableError("microphone is still closing; Vox remains fail-closed")
             if self.state.state is not SessionState.OFF:
@@ -793,7 +803,10 @@ class VoxEngine:
         action = action.lower().strip()
         if action in {"cancel", "skip_forward", "stop_audio"}:
             signal = self._signal_cancel(manual_end=False)
-            return {"status": "cancel_signalled", **signal}
+            # Cancelling only the active turn would leave the queue behind it
+            # waiting to speak, so the mic frees up and then talks anyway.
+            drained = self.gate.drain("cancelled")
+            return {"status": "cancel_signalled", "queue_drained": drained, **signal}
         if action in {"manual_end", "push_to_talk_end"}:
             signal = self._signal_cancel(manual_end=True, cancel_task=False)
             return {"status": "manual_end_signalled", **signal}
