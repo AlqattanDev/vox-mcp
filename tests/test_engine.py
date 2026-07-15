@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 import threading
 from types import SimpleNamespace
@@ -333,6 +334,52 @@ async def test_queued_converse_does_not_open_the_microphone(tmp_path: Path):
     await asyncio.wait_for(holder, timeout=5)
     await asyncio.wait_for(queued, timeout=5)
     assert (await engine.status())["session"]["microphone_open"] is False
+
+
+@pytest.mark.asyncio
+async def test_queue_transitions_are_logged(tmp_path: Path):
+    engine = make_engine(tmp_path)
+    holder, handle = await _hold_the_microphone(engine)
+
+    queued = asyncio.create_task(engine.converse("claude", "second", agent="infra"))
+    await asyncio.sleep(0.05)
+    handle.release.set()
+    await asyncio.wait_for(holder, timeout=5)
+    await asyncio.wait_for(queued, timeout=5)
+
+    events = [
+        json.loads(line)
+        for line in Path(engine.config.event_log_path).read_text().splitlines()
+        if line.strip()
+    ]
+    by_event = {event["event"]: event for event in events}
+    assert "queue.enter" in by_event
+    assert "queue.exit" in by_event
+    assert by_event["queue.enter"]["data"]["agent"] == "infra"
+    assert by_event["queue.exit"]["data"]["waited_s"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_drained_queue_is_logged(tmp_path: Path):
+    engine = make_engine(tmp_path)
+    holder, handle = await _hold_the_microphone(engine)
+
+    queued = asyncio.create_task(engine.converse("claude", "second", agent="infra"))
+    await asyncio.sleep(0.05)
+    await engine.control("claude", "cancel")
+    with pytest.raises(BusyError):
+        await asyncio.wait_for(queued, timeout=2)
+    handle.release.set()
+    await asyncio.gather(holder, return_exceptions=True)
+
+    events = [
+        json.loads(line)
+        for line in Path(engine.config.event_log_path).read_text().splitlines()
+        if line.strip()
+    ]
+    drained = next(event for event in events if event["event"] == "queue.drained")
+    assert drained["data"]["agent"] == "infra"
+    assert drained["data"]["reason"] == "cancelled"
 
 
 @pytest.mark.asyncio
