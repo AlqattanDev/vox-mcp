@@ -27,6 +27,18 @@ FALLBACK_VOICES: tuple[str, ...] = (
     "bm_george",
 )
 
+# Kokoro encodes language in the first letter of a voice id: a/b are American
+# and British English, while e/f/h/i/j/p/z are Spanish, French, Hindi, Italian,
+# Japanese, Portuguese and Mandarin. Auto-assignment must stay in English or an
+# agent ends up reading English status updates in a Mandarin voice.
+ENGLISH_PREFIXES: tuple[str, ...] = ("af_", "am_", "bf_", "bm_")
+
+
+def is_english_voice(voice: str) -> bool:
+    """True for an English Kokoro voice that is not a superseded v0 variant."""
+
+    return voice.startswith(ENGLISH_PREFIXES) and "_v0" not in voice
+
 
 class AgentVoices:
     """Maps agent labels to voices, remembering every assignment it makes."""
@@ -83,8 +95,11 @@ class AgentVoices:
         return assigned
 
     def _assign(self, label: str, available: Sequence[str] | None) -> str:
-        pool = [voice for voice in (available or FALLBACK_VOICES) if isinstance(voice, str)]
-        pool = sorted({voice for voice in pool if voice.strip()})
+        offered = [voice for voice in (available or FALLBACK_VOICES) if isinstance(voice, str)]
+        offered = sorted({voice.strip() for voice in offered if voice.strip()})
+        # An explicit mapping in agents.json is honoured verbatim; only what we
+        # pick on someone's behalf is held to English.
+        pool = [voice for voice in offered if is_english_voice(voice)] or offered
         if not pool:
             return self.default_voice
         # sha256, not hash(): Python salts str hashes per process, which would

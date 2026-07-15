@@ -2,12 +2,52 @@ from pathlib import Path
 
 import pytest
 
-from voxmcp.agents import AgentVoices, FALLBACK_VOICES
+from voxmcp.agents import AgentVoices, FALLBACK_VOICES, is_english_voice
 from voxmcp.engine import VoxEngine
 from tests.test_engine import make_engine
 
 
 POOL = ["af_sky", "af_heart", "af_bella", "am_adam", "am_michael", "bf_emma", "bm_george"]
+
+# The shape Kokoro actually serves: 9 languages, plus superseded v0 variants.
+REAL_POOL = [
+    "af_bella", "af_heart", "af_sky", "af_v0", "af_jessica", "af_nicole",
+    "am_adam", "am_michael", "am_fenrir", "am_echo",
+    "bf_emma", "bf_alice", "bf_v0emma",
+    "bm_george", "bm_fable", "bm_v0george",
+    "ef_dora", "em_alex", "ff_siwis", "hf_alpha", "hm_omega", "if_sara",
+    "im_nicola", "jf_nezumi", "jf_alpha", "jm_kumo", "pf_dora", "pm_alex",
+    "zf_xiaobei", "zf_xiaoni", "zm_yunxia", "zm_yunjian",
+]
+
+
+def test_only_english_voices_are_auto_assignable():
+    assert is_english_voice("am_michael") is True
+    assert is_english_voice("bf_emma") is True
+    # The bug: an agent read English status updates in a Mandarin voice.
+    assert is_english_voice("zm_yunxia") is False
+    assert is_english_voice("jf_nezumi") is False
+    assert is_english_voice("hm_omega") is False
+    # Superseded duplicates of the same speaker.
+    assert is_english_voice("af_v0") is False
+    assert is_english_voice("bm_v0george") is False
+
+
+def test_auto_assignment_never_picks_a_foreign_voice(tmp_path: Path):
+    voices = AgentVoices(tmp_path / "agents.json", default_voice="af_sky")
+    assigned = [
+        voices.resolve(f"project-{index}", REAL_POOL) for index in range(30)
+    ]
+    assert all(is_english_voice(voice) for voice in assigned), assigned
+
+
+def test_explicit_mapping_may_still_choose_any_voice(tmp_path: Path):
+    """A voice the user wrote down by hand is their call, not ours."""
+
+    path = tmp_path / "agents.json"
+    path.write_text('{"tokyo": "jf_nezumi"}')
+    voices = AgentVoices(path, default_voice="af_sky")
+    assert voices.resolve("tokyo", REAL_POOL) == "jf_nezumi"
 
 
 def test_default_agent_keeps_the_default_voice(tmp_path: Path):
