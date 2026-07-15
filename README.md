@@ -13,6 +13,10 @@ loopback address; Vox refuses to start if they do not.
 
 - Explicit `OFF → IDLE → LISTENING / SPEAKING → IDLE` lifecycle instead of a
   hidden state machine inside an MCP subprocess.
+- Competing audio turns queue in FIFO arrival order instead of failing, so a
+  second agent — or one agent's own next `converse` — waits its turn rather
+  than losing the reply. Waiting is bounded at 30s, and `cancel`/`stop` drain
+  the queue instead of orphaning it.
 - The microphone opens only for one bounded `listen` turn or a
   response-waiting `converse`; manual end provides push-to-talk behavior.
 - `pause`, `resume`, `stop`, replay, manual end-of-turn, and cancellation are
@@ -53,6 +57,40 @@ Quick checks after installation:
 
 The MCP tools are headed by `converse`, `speak`, `listen`, `voice_session`,
 `voice_control`, `service`, `diagnostics`, `transcribe`, and `dj`.
+
+## Multiple agents, one microphone
+
+Every Claude Code window reports the same MCP host name, so the lease cannot
+tell two projects apart — and it deliberately still does not, because keying
+the lease to the host is what lets it survive a reconnect. Instead each
+project identifies its *speaker* in its own MCP URL:
+
+```json
+{ "mcpServers": { "vox": { "url": "http://127.0.0.1:8766/mcp?agent=infra" } } }
+```
+
+Set it once per project and no agent can forget it. Callers that cannot set a
+URL may pass `agent="..."` to `speak`, `converse`, `listen`, or
+`voice_session`; the URL wins if both are present, and an unset agent is
+`default`.
+
+Each agent gets its own voice, because when a queued agent finally speaks the
+voice is how you know which project is talking. Assignments live in
+`~/.vox/agents.json`:
+
+```json
+{ "infra": "am_michael", "mobilescape": "af_bella" }
+```
+
+Edit it to pick voices yourself — a hand-written entry is honoured exactly,
+including a non-English voice. Anything unmapped is assigned automatically
+from the local English Kokoro voices, keyed off a hash of the label so it
+never drifts between restarts, and written back to the file. The `default`
+agent keeps the standard voice, so single-agent use is unchanged.
+
+`voice_session(action="status")` reports the calling agent's resolved voice,
+the active turn's agent, and the current queue; `voice_registry` lists the
+whole mapping. Queue transitions are logged to `~/.vox/state/events.jsonl`.
 
 Restart Claude Code and Codex once after activation so their MCP catalogs
 reload. The Vox daemon persists across later host restarts and updates.

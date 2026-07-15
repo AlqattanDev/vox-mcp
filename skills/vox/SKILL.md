@@ -55,8 +55,12 @@ pre-roll, and a five-minute hard utterance cap.
 - Escape/cancel ends only the current turn. It does not end voice mode.
 - Standalone “repeat that” replays cached audio without regenerating it.
 - Standalone “wait” closes the mic, waits, then opens a fresh bounded listen.
-- If Vox reports `busy`, identify the current owner and offer an explicit
-  handoff. Do not spin or retry until the MCP timeout.
+- Overlapping audio turns queue automatically in arrival order, so do not
+  serialise calls by hand or retry on your own; just make the call and wait.
+- A `BusyError` therefore means one of two things. If it names another owner,
+  the audio lease belongs to a different MCP host: offer an explicit handoff.
+  If it says the wait timed out, someone held the microphone too long — say so
+  and let the user decide. Do not spin or retry until the MCP timeout.
 
 ## Visible transcript echo
 
