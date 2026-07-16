@@ -33,6 +33,10 @@ upstream compatibility layer — packaged for the wheel build, not edited.
 - **Observability.** `voice_session(status)` reports the active agent, the
   queue, and the caller's resolved voice; `voice_registry` lists the mapping.
   Queue transitions land in `~/.vox/state/events.jsonl`.
+- **Whisper on `small`.** One server (`com.vox.whisper`, `127.0.0.1:2022`),
+  ~690 MB resident. The model path is baked into the plist from
+  `InstallerPaths` — `voicemode.env`'s `VOICEMODE_WHISPER_MODEL` is read only
+  by the vendored start script, not by the agent that serves.
 
 Tests: `.venv/bin/python -m pytest tests/` — **181 passing** (147 before this
 work).
@@ -59,5 +63,16 @@ claude mcp add --scope local --transport http vox \
 
 ## Next steps
 
+- **The installer leaves legacy plists on disk.** `install()` boots out
+  `STALE_LABELS + LEGACY_BACKEND_LABELS` but never removes their files, so
+  `RunAtLoad` resurrects them at next login — which is how two whisper servers
+  (3.2 GB) ended up running at once. Fixed here by moving
+  `com.voicemode.whisper.plist` to `~/.vox/rollback/legacy-launchagents/`; the
+  code still needs to delete, not just unload.
+- `com.voicemode.whisper-keepalive` is loaded but dead (exit 127, missing
+  script). It is in `STALE_LABELS`; costs no RAM, retries every 30s.
+- `small` is a real accuracy step down from `large-v3-turbo` on accents and
+  proper nouns. `medium` is 1.5 GB and buys little over large — if `small`
+  proves too lossy the choice is living with it or one server at 1.6 GB.
 - The old Codex output directory (`~/Documents/Codex/2026-07-10/.../vox-mcp`)
   is superseded and can be deleted.
