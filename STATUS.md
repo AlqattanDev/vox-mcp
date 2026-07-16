@@ -32,10 +32,26 @@ upstream compatibility layer — packaged for the wheel build, not edited.
 - **Observability.** `voice_session(status)` reports the active agent, the
   queue, and the caller's resolved voice; `voice_registry` lists the mapping.
   Queue transitions land in `~/.vox/state/events.jsonl`.
-- **Whisper on `small`.** One server (`com.vox.whisper`, `127.0.0.1:2022`),
-  ~690 MB resident. The model path is baked into the plist from
-  `InstallerPaths` — `voicemode.env`'s `VOICEMODE_WHISPER_MODEL` is read only
-  by the vendored start script, not by the agent that serves.
+- **Whisper on `small`.** One server (`com.vox.whisper`, `127.0.0.1:2022`).
+  The model path is baked into the plist from `InstallerPaths` —
+  `voicemode.env`'s `VOICEMODE_WHISPER_MODEL` is read only by the vendored
+  start script, not by the agent that serves.
+
+## Memory
+
+Measure with `footprint -p <pid>`, never `ps`/RSS: whisper mmaps its model and
+kokoro uses Metal unified memory, so RSS under-reports by ~10x (whisper reads
+9-52 MB in `ps` against a true 591 MB).
+
+| service | now | peak |
+|---|---|---|
+| `com.vox.kokoro` (TTS) | ~2050 MB | ~2400 MB |
+| `com.vox.whisper` (`small`) | ~590 MB | ~740 MB |
+| `com.vox.runtime` (`voxd`) | ~73 MB | ~73 MB |
+| **total** | **~2.7 GB** | **~3.2 GB** |
+
+Kokoro is the dominant cost — a PyTorch/MPS process, ~4x whisper. STT model
+choice is a rounding error next to it.
 
 Tests: `.venv/bin/python -m pytest tests/` — **181 passing** (147 before this
 work).
@@ -64,9 +80,10 @@ claude mcp add --scope local --transport http vox \
 
 - **The installer leaves legacy plists on disk.** `install()` boots out
   `STALE_LABELS + LEGACY_BACKEND_LABELS` but never removes their files, so
-  `RunAtLoad` resurrects them at next login — which is how two whisper servers
-  (3.2 GB) ended up running at once. Fixed here by moving
-  `com.voicemode.whisper.plist` to `~/.vox/rollback/legacy-launchagents/`; the
+  `RunAtLoad` resurrects them at next login. This ran duplicate whisper *and*
+  kokoro servers — the dead pair cost ~3.5 GB and served nothing (both bound
+  `0.0.0.0`, losing every connection to the `127.0.0.1` vox agent). Worked
+  around by moving both plists to `~/.vox/rollback/legacy-launchagents/`; the
   code still needs to delete, not just unload.
 - `com.voicemode.whisper-keepalive` is loaded but dead (exit 127, missing
   script). It is in `STALE_LABELS`; costs no RAM, retries every 30s.
