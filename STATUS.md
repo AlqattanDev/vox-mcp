@@ -5,10 +5,9 @@ Local-only voice runtime (Whisper STT + Kokoro TTS) exposed as an MCP server on
 
 ## Where it lives
 
-The repo is `~/vox-mcp`, pushed to the private `AlqattanDev/vox-mcp`. It used
-to run out of a Codex scratch output directory with no version control; the
-launch agent (`~/Library/LaunchAgents/com.vox.runtime.plist`, via `VOX_RUNTIME`)
-now points at `~/vox-mcp/.venv/bin/voxd`.
+The repo is `~/vox-mcp`, pushed to the private `AlqattanDev/vox-mcp`. The launch
+agent (`~/Library/LaunchAgents/com.vox.runtime.plist`, via `VOX_RUNTIME`) points
+at `~/vox-mcp/.venv/bin/voxd`.
 
 The real package is `src/voxmcp/`. The vendored `voice_mode/` tree is a frozen
 upstream compatibility layer — packaged for the wheel build, not edited.
@@ -74,5 +73,3 @@ claude mcp add --scope local --transport http vox \
 - `small` is a real accuracy step down from `large-v3-turbo` on accents and
   proper nouns. `medium` is 1.5 GB and buys little over large — if `small`
   proves too lossy the choice is living with it or one server at 1.6 GB.
-- The old Codex output directory (`~/Documents/Codex/2026-07-10/.../vox-mcp`)
-  is superseded and can be deleted.
