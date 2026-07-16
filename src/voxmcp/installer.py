@@ -124,7 +124,7 @@ class InstallerPaths:
             runtime_executable=Path(sys.executable).absolute().with_name("voxd"),
             whisper_root=whisper_root,
             whisper_binary=whisper_root / "build" / "bin" / "whisper-server",
-            whisper_model=whisper_root / "models" / "ggml-large-v3-turbo.bin",
+            whisper_model=whisper_root / "models" / "ggml-small.bin",
             kokoro_root=kokoro_root,
             kokoro_python=kokoro_root / ".venv" / "bin" / "python",
             skill_source=(
