@@ -217,6 +217,7 @@ class InstallationPlan:
     files: tuple[PlannedFile, ...]
     host_commands: tuple[PlannedCommand, ...]
     unload_labels: tuple[str, ...]
+    delete_targets: tuple[Path, ...]
     load_labels: tuple[str, ...]
     backup_targets: tuple[Path, ...]
     issues: tuple[str, ...]
@@ -235,6 +236,7 @@ class InstallationPlan:
             "files": [item.to_dict() for item in self.files],
             "host_commands": [command.to_dict() for command in self.host_commands],
             "unload_labels": list(self.unload_labels),
+            "delete_targets": [str(path) for path in self.delete_targets],
             "load_labels": list(self.load_labels),
             "backup_targets": [str(path) for path in self.backup_targets],
         }
@@ -547,6 +549,12 @@ class TransactionalInstaller:
             files=files,
             host_commands=host_commands,
             unload_labels=STALE_LABELS + LEGACY_BACKEND_LABELS,
+            # A bootout does not remove the plist. Anything left in
+            # ~/Library/LaunchAgents with RunAtLoad returns at the next login.
+            delete_targets=tuple(
+                self.paths.plist_for_label(label)
+                for label in STALE_LABELS + LEGACY_BACKEND_LABELS
+            ),
             load_labels=VOX_LABELS,
             backup_targets=backup_targets,
             issues=tuple(self._validation_issues()),
@@ -642,6 +650,18 @@ class TransactionalInstaller:
                     result = self._launchctl("bootout", f"{self._domain}/{label}")
                     commands.append(result)
                     _require_command(result, f"unload legacy service {label}")
+
+            # A bootout only stops the running job; launchd rescans
+            # ~/Library/LaunchAgents at the next login and RunAtLoad revives
+            # anything still on disk. That is how a duplicate whisper/kokoro
+            # pair came back and burned ~3.5 GB serving nothing.
+            #
+            # Deliberately NOT gated on loaded_states: an unloaded legacy plist
+            # is precisely the case that survives to the next login. Presence is
+            # the only gate, and _remove_path no-ops when absent.
+            for target in plan.delete_targets:
+                _require_under_home(target, self.paths.home, "legacy plist removal")
+                _remove_path(target)
 
             # Start backends first, then the app/runtime that consumes them.
             for label in ("com.vox.whisper", "com.vox.kokoro", "com.vox.runtime"):

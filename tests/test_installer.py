@@ -222,6 +222,13 @@ def test_dry_run_is_side_effect_free_and_lists_host_registration(tmp_path: Path)
         paths.vox_root / "logs" / "kokoro",
     )
     assert plan.unload_labels == STALE_LABELS + LEGACY_BACKEND_LABELS
+    assert plan.delete_targets == tuple(
+        paths.plist_for_label(label)
+        for label in STALE_LABELS + LEGACY_BACKEND_LABELS
+    )
+    assert plan.to_dict()["delete_targets"] == [
+        str(path) for path in plan.delete_targets
+    ]
     assert plan.load_labels == VOX_LABELS
     commands = [command.argv for command in plan.host_commands]
     assert (
@@ -462,3 +469,89 @@ def test_installer_paths_reject_targets_outside_home(tmp_path: Path) -> None:
     values["app_target"] = tmp_path / "outside" / "Vox.app"
     with pytest.raises(ValueError, match="inside"):
         InstallerPaths(**values)
+
+
+def test_every_delete_target_is_backed_up_and_spares_current_vox_plists(
+    tmp_path: Path,
+) -> None:
+    paths = make_paths(tmp_path)
+    plan = make_installer(paths).build_plan()
+
+    # The rollback-safety precondition: nothing is deleted that was not first
+    # captured in the backup snapshot.
+    assert set(plan.delete_targets) <= set(plan.backup_targets)
+    assert not set(plan.delete_targets) & {
+        paths.runtime_plist,
+        paths.whisper_plist,
+        paths.kokoro_plist,
+    }
+
+
+def test_successful_activation_deletes_legacy_plists_loaded_or_not(
+    tmp_path: Path,
+) -> None:
+    """A bootout leaves the plist behind; RunAtLoad then revives it at login."""
+
+    paths = make_paths(tmp_path)
+    loaded_label = "com.voicemode.whisper"
+    unloaded_label = "com.voicemode.kokoro"
+    for label in (loaded_label, unloaded_label):
+        plist = paths.plist_for_label(label)
+        plist.parent.mkdir(parents=True, exist_ok=True)
+        plist.write_text(f"{label} original\n", encoding="utf-8")
+    # Only one of the two is loaded; the other exists on disk untouched by launchd.
+    runner = FakeRunner(loaded={loaded_label})
+    installer = make_installer(paths, runner, health_checker=lambda url, timeout: True)
+
+    result = installer.activate(installer.build_plan(), confirm=True)
+
+    assert result.success is True
+    assert result.rolled_back is False
+    assert not paths.plist_for_label(loaded_label).exists()
+    assert not paths.plist_for_label(unloaded_label).exists()
+
+    # The unloaded plist must be deleted without ever being booted out. If the
+    # deletion is ever re-nested under the loaded_states gate, only this fails.
+    booted_out = [
+        command[2].rsplit("/", 1)[-1]
+        for command, _ in runner.calls
+        if len(command) > 2 and command[1] == "bootout"
+    ]
+    assert loaded_label in booted_out
+    assert unloaded_label not in booted_out
+
+    # The plists we just installed are not collateral damage.
+    assert paths.runtime_plist.is_file()
+    assert paths.whisper_plist.is_file()
+    assert paths.kokoro_plist.is_file()
+    assert runner.loaded == set(VOX_LABELS)
+
+    manifest = json.loads((result.backup_dir / "manifest.json").read_text())
+    assert manifest["activated"] is True
+    assert all(kwargs["shell"] is False for _, kwargs in runner.calls)
+
+
+def test_activation_failure_restores_deleted_legacy_plists(tmp_path: Path) -> None:
+    paths = make_paths(tmp_path)
+    loaded_label = "com.voicemode.whisper"
+    unloaded_label = "com.voicemode.kokoro"
+    originals = {}
+    for label in (loaded_label, unloaded_label):
+        plist = paths.plist_for_label(label)
+        plist.parent.mkdir(parents=True, exist_ok=True)
+        plist.write_text(f"{label} original\n", encoding="utf-8")
+        originals[label] = plist.read_bytes()
+    # Fail the last bootstrap, so the failure lands after the deletion loop.
+    runner = FakeRunner(loaded={loaded_label}, fail_bootstrap={"com.vox.runtime"})
+    installer = make_installer(paths, runner, health_checker=lambda url, timeout: True)
+
+    result = installer.activate(installer.build_plan(), confirm=True)
+
+    assert result.success is False
+    assert result.rolled_back is True
+    for label, original in originals.items():
+        assert paths.plist_for_label(label).read_bytes() == original
+    # The loaded one is bootstrapped again from the restored file; restoring the
+    # bytes must happen before launchd is asked to load them back.
+    assert runner.loaded == {loaded_label}
+    assert all(kwargs["shell"] is False for _, kwargs in runner.calls)

@@ -36,12 +36,21 @@ upstream compatibility layer — packaged for the wheel build, not edited.
   The model path is baked into the plist from `InstallerPaths` —
   `voicemode.env`'s `VOICEMODE_WHISPER_MODEL` is read only by the vendored
   start script, not by the agent that serves.
+- **The installer removes legacy plists, it does not just unload them.**
+  `plan.delete_targets` lists every `STALE_LABELS + LEGACY_BACKEND_LABELS` plist
+  and `activate()` deletes each one after booting the job out, so launchd's
+  login rescan cannot revive it via `RunAtLoad`. The delete is gated on file
+  presence, never on `loaded` — an unloaded plist is exactly the one that
+  survives to the next login. Every delete target is a subset of
+  `backup_targets`, so an activation failure restores the files and their loaded
+  state; `test_activation_failure_restores_deleted_legacy_plists` holds that
+  line. Dry-run `vox install` prints the doomed paths.
 
 ## Memory
 
 Measure with `footprint -p <pid>`, never `ps`/RSS: whisper mmaps its model and
-kokoro uses Metal unified memory, so RSS under-reports by ~10x (whisper reads
-9-52 MB in `ps` against a true 591 MB).
+kokoro uses Metal unified memory, so RSS under-reports by up to 65x (whisper
+reads 9 MB in `ps` against a true 591 MB).
 
 | service | now | peak |
 |---|---|---|
@@ -53,8 +62,7 @@ kokoro uses Metal unified memory, so RSS under-reports by ~10x (whisper reads
 Kokoro is the dominant cost — a PyTorch/MPS process, ~4x whisper. STT model
 choice is a rounding error next to it.
 
-Tests: `.venv/bin/python -m pytest tests/` — **181 passing** (147 before this
-work).
+Tests: `.venv/bin/python -m pytest tests/` — **184 passing**.
 
 ## Wired up
 
@@ -78,15 +86,10 @@ claude mcp add --scope local --transport http vox \
 
 ## Next steps
 
-- **The installer leaves legacy plists on disk.** `install()` boots out
-  `STALE_LABELS + LEGACY_BACKEND_LABELS` but never removes their files, so
-  `RunAtLoad` resurrects them at next login. This ran duplicate whisper *and*
-  kokoro servers — the dead pair cost ~3.5 GB and served nothing (both bound
-  `0.0.0.0`, losing every connection to the `127.0.0.1` vox agent). Worked
-  around by moving both plists to `~/.vox/rollback/legacy-launchagents/`; the
-  code still needs to delete, not just unload.
-- `com.voicemode.whisper-keepalive` is loaded but dead (exit 127, missing
-  script). It is in `STALE_LABELS`; costs no RAM, retries every 30s.
 - `small` is a real accuracy step down from `large-v3-turbo` on accents and
   proper nouns. `medium` is 1.5 GB and buys little over large — if `small`
-  proves too lossy the choice is living with it or one server at 1.6 GB.
+  proves too lossy the choice is living with it or one server at ~1.6 GB
+  (`ggml-large-v3-turbo.bin` is still on disk; revert `InstallerPaths` and the
+  live plist).
+- Kokoro is the only remaining lever worth pulling on memory (~2.1 GB of a
+  2.8 GB stack). Nothing is in flight on it.
