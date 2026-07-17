@@ -1,0 +1,13 @@
+{
+  "slug": "vox",
+  "title": "Vox",
+  "tagline": "Local shared voice for every agent on your Mac — one mic, many voices, no cloud STT.",
+  "kind": "landing",
+  "repo": "https://github.com/AlqattanDev/vox-mcp",
+  "thumb": "/vox/thumb.png",
+  "accent": "#2DD4BF",
+  "order": 15,
+  "hidden": false,
+  "showcase": "public",
+  "tags": ["mcp", "voice", "local", "macos", "agents"]
+}

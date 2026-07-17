@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en" style="--accent:#2DD4BF">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Vox — local shared voice for agents</title>
+  <style>
+    body { margin: 0; font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #23251d; background: #e5e7e0; }
+    .sc-window { max-width: 880px; margin: 2rem auto; background: #fdfdf8; }
+    .sc-body { padding: 2rem 1.5rem; }
+  </style>
+  <link rel="stylesheet" href="/_showcase/style.css" />
+</head>
+<body class="sc-desk">
+  <main class="sc-window">
+    <header class="sc-titlebar">
+      <div class="sc-titlebar-dots"><span></span></div>
+      <span class="sc-titlebar-name">vox.mdx</span>
+      <div class="sc-titlebar-end">
+        <span class="sc-accent-dot" aria-hidden="true"></span>
+        <a class="sc-close" href="https://exidex.dev/" aria-label="Close — back to the desktop">×</a>
+      </div>
+    </header>
+
+    <div class="sc-body">
+      <p class="sc-kicker">Product · local MCP · macOS</p>
+      <h1 class="sc-title">Vox</h1>
+      <p class="sc-tagline">Local shared voice for every agent on your Mac — <span class="sc-marker">one mic, many voices</span>, no cloud STT.</p>
+
+      <figure class="sc-hero" style="margin:1.5rem 0">
+        <img src="/vox/thumb.png" alt="Vox — shared waveform with multiple agent nodes" width="1376" height="768" style="width:100%;height:auto;border-radius:12px;display:block" />
+      </figure>
+
+      <div class="sc-pills">
+        <span class="sc-pill">Whisper + Kokoro local</span>
+        <span class="sc-pill">Shared session</span>
+        <span class="sc-pill">FIFO queue</span>
+        <span class="sc-pill">Menu bar</span>
+      </div>
+
+      <h2>What it does</h2>
+      <p>Vox is a persistent local voice runtime exposed as an MCP server. Claude, Codex, Grok, Fable — any host on the machine — can speak and listen through the same session. Each agent keeps its own voice. Hardware is serialized by a queue, not by exclusive ownership theater.</p>
+
+      <h2>Working today</h2>
+      <ul>
+        <li><strong>Shared session</strong> — nobody “owns” the mic; agents wait their turn</li>
+        <li><strong>Per-agent voices</strong> via <code>?agent=</code> and <code>~/.vox/agents.json</code></li>
+        <li><strong>Talk / Narrate / Dictate</strong> IO modes from the status panel</li>
+        <li><strong>Finished STT survives host cancel</strong> — undelivered recovery</li>
+        <li>Mic opens only for a bounded listen; never ambient recording</li>
+        <li>Loud-room endpointing so the mic doesn’t stick open forever</li>
+      </ul>
+
+      <h2>Stack</h2>
+      <p>Python · MCP HTTP · Whisper.cpp · Kokoro · Swift menu bar · launchd</p>
+
+      <h2>Why it exists</h2>
+      <p>Agent voice was either a paid cloud pipe or a flaky exclusive lease that made multi-agent work feel broken. Vox is the local shared runtime: private, queue-fair, and boring enough to trust for real work.</p>
+
+      <p class="sc-footer">Private source · Mac-local · no cloud speech endpoints</p>
+    </div>
+  </main>
+</body>
+</html>
