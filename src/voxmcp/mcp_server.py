@@ -313,7 +313,7 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
                 pause_seconds=seconds,
                 **options,
             )
-        if action in {"start", "stop", "pause", "mute"}:
+        if action in {"start", "stop", "pause", "mute", "cycle_mode", "set_mode", "mode"}:
             return await _invoke(
                 current_engine(),
                 "session",
@@ -414,18 +414,35 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
 
     @server.tool(
         name="voice_session",
-        description="Start, stop, pause, resume, mute, inspect, or hand off a voice session.",
+        description=(
+            "Shared voice session controls: start/stop/pause, status, io mode "
+            "(talk|narrate|dictate), claim undelivered transcript. Session is "
+            "shared — no exclusive owner; audio queues FIFO. handoff/takeover "
+            "are legacy no-ops."
+        ),
         annotations=LOCAL_ACTION,
     )
     async def voice_session(
         ctx: Context,
         action: Literal[
-            "start", "stop", "pause", "resume", "mute", "unmute", "status", "handoff", "takeover"
+            "start",
+            "stop",
+            "pause",
+            "resume",
+            "mute",
+            "unmute",
+            "status",
+            "handoff",
+            "takeover",
+            "set_mode",
+            "cycle_mode",
+            "claim_undelivered",
         ],
         seconds: float | None = None,
         target: str | None = None,
         force: bool = False,
         agent: str | None = None,
+        mode: str | None = None,
     ) -> Any:
         mapped_action = "resume" if action == "unmute" else action
         return await _invoke(
@@ -437,6 +454,7 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
             pause_seconds=seconds,
             target_client_id=target,
             force=force,
+            mode=mode,
         )
 
     @server.tool(
@@ -762,6 +780,8 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
             "mute",
             "unmute",
             "status",
+            "cycle_mode",
+            "set_mode",
         }
         if action not in allowed:
             return JSONResponse({"ok": False, "error": "unsupported_action"}, status_code=400)

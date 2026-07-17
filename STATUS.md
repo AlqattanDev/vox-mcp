@@ -1,93 +1,53 @@
 # Vox MCP — status
 
-Local-only voice runtime (Whisper STT + Kokoro TTS) exposed as an MCP server on
-`127.0.0.1:8766`. Multiple agents call it concurrently all day.
+Local-only voice runtime (Whisper STT + Kokoro TTS) on `127.0.0.1:8766`.
+**Shared session** — no exclusive owner. Grok, Fable, Claude, Codex all join
+the same session; each keeps its own agent voice; audio is FIFO-queued only.
 
 ## Where it lives
 
-The repo is `~/vox-mcp`, pushed to the private `AlqattanDev/vox-mcp`. The launch
-agent (`~/Library/LaunchAgents/com.vox.runtime.plist`, via `VOX_RUNTIME`) points
-at `~/vox-mcp/.venv/bin/voxd`.
-
-The real package is `src/voxmcp/`. The vendored `voice_mode/` tree is a frozen
-upstream compatibility layer — packaged for the wheel build, not edited.
+Repo `~/vox-mcp` → private `AlqattanDev/vox-mcp`. Launch agent
+`com.vox.runtime` runs `~/Applications/Vox.app` → `~/vox-mcp/.venv/bin/voxd`.
+Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
 
 ## What works
 
-- **Concurrent agents queue.** Overlapping audio turns wait their turn in FIFO
-  order instead of raising `BusyError`, bounded at 30s. `cancel`, `stop`, and
-  `pause` drain the queue. Verified live: two agents called at the same instant,
-  one spoke at +4.4s and the other at +7.8s, neither failed.
-- **Per-project identity.** `?agent=<name>` in the MCP URL names the speaker,
-  independent of the host-keyed lease (which still follows the host so it
-  survives reconnects). `agent="..."` works as a tool param for callers that
-  cannot set a URL.
-- **Per-agent voices.** Auto-assigned from the local English Kokoro voices by a
-  sha256 of the label, persisted to `~/.vox/agents.json` so they never drift.
-  Hand-written entries are honoured verbatim. `default` keeps `af_sky`.
-- **Cancel answers the caller.** Cancelling mid-speech returns
-  `{"status": "cancelled"}` instead of leaving the tool call unanswered. A host
-  dropping the request still propagates `CancelledError`, as cooperative
-  cancellation requires.
-- **Observability.** `voice_session(status)` reports the active agent, the
-  queue, and the caller's resolved voice; `voice_registry` lists the mapping.
-  Queue transitions land in `~/.vox/state/events.jsonl`.
-- **Whisper on `small`.** One server (`com.vox.whisper`, `127.0.0.1:2022`).
-  The model path is baked into the plist from `InstallerPaths` —
-  `voicemode.env`'s `VOICEMODE_WHISPER_MODEL` is read only by the vendored
-  start script, not by the agent that serves.
-- **Loud rooms endpoint instead of recording forever.** The adaptive noise
-  floor used to learn only from non-speech frames, so ambient above the
-  threshold (fan, AC, music) read as endless speech and every listen ran to the
-  5-minute cap. Now a frame the WebRTC VAD rejects always feeds the floor at the
-  normal rate, and VAD-accepted frames drift it up slowly
-  (`noise_rise_smoothing`, ~20s time constant) as a backstop when the VAD is
-  fooled. Real speech is safe: inter-word gaps pull the floor back down.
-  Limitation: audible background music still degrades listening — the VAD votes
-  speech on music, so only the slow backstop applies. Silence the room or
-  expect ~25s turns.
-- **Takeover always kills the previous turn.** Same-owner `takeover` used to
-  skip cancel, so a stuck listen kept the operation gate while session state
-  looked idle — every new converse queued 30s and timed out (the multi-terminal
-  "still listening / nothing works" loop). Takeover now always signals cancel,
-  drains the queue, waits for the mic to close, then claims. `force` only
-  gates the lease against a live foreign owner.
-- **Status-bar Stop timeout.** The menu-bar control client waited only 2s while
-  stop/pause can take up to ~3s for mic close server-side, so Stop looked like
-  a no-op. Control requests now allow 6s.
-- **The installer removes legacy plists, it does not just unload them.**
-  `plan.delete_targets` lists every `STALE_LABELS + LEGACY_BACKEND_LABELS` plist
-  and `activate()` deletes each one after booting the job out, so launchd's
-  login rescan cannot revive it via `RunAtLoad`. The delete is gated on file
-  presence, never on `loaded` — an unloaded plist is exactly the one that
-  survives to the next login. Every delete target is a subset of
-  `backup_targets`, so an activation failure restores the files and their loaded
-  state; `test_activation_failure_restores_deleted_legacy_plists` holds that
-  line. Dry-run `vox install` prints the doomed paths.
+- **Shared session (no ownership).** `LeaseManager` records `last_actor` only.
+  `_claim` never raises “belongs to…”. Handoff/takeover are legacy: takeover
+  cancels the active turn + drains the queue; handoff is a shared no-op.
+  BusyError means queue timeout or privacy pause — not another agent “owns”
+  voice.
+- **Concurrent agents queue.** FIFO, 30s wait bound. Cancel/stop/pause drain.
+- **Per-agent voices.** `?agent=` / `agent=` + `~/.vox/agents.json`.
+- **Cancel answers the caller.** Mid-speech cancel returns `status: cancelled`.
+- **Finished STT survives host drop.** `~/.vox/state/last_heard.json` is
+  written the instant Whisper finishes. Host `CancelledError` after STT
+  returns the transcript (`delivered_via: cancel_recovery`).
+  `voice_session(claim_undelivered)` one-shots recovery. Status/health expose
+  `undelivered_heard` (no full transcript on health).
+- **IO modes.** `talk` (default, both) · `narrate` (agent speaks, no mic) ·
+  `dictate` (listen only, TTS skipped). Panel cycles; `voice_session`
+  `set_mode` / `cycle_mode`; persisted in `~/.vox/state/io_mode`.
+- **Menu bar.** Mode cycle + Stop/Start + Cancel this turn. Restart / Open
+  folder / Pause under **More…**. Control HTTP timeout 6s (matches mic close).
+- **Loud rooms endpoint.** Adaptive floor + `noise_rise_smoothing` backstop.
+  Music still degrades VAD (Silero later).
+- **Whisper `small`.** One server `com.vox.whisper` `:2022`.
+- **No empty logs theater.** Installer does not create `~/.vox/logs/*`.
+  Process stdout/stderr → `/dev/null`. Audit trail: `~/.vox/state/events.jsonl`.
 
 ## Memory
 
-Measure with `footprint -p <pid>`, never `ps`/RSS: whisper mmaps its model and
-kokoro uses Metal unified memory, so RSS under-reports by up to 65x (whisper
-reads 9 MB in `ps` against a true 591 MB).
-
 | service | now | peak |
 |---|---|---|
-| `com.vox.kokoro` (TTS) | ~2050 MB | ~2400 MB |
+| `com.vox.kokoro` | ~2050 MB | ~2400 MB |
 | `com.vox.whisper` (`small`) | ~590 MB | ~740 MB |
-| `com.vox.runtime` (`voxd`) | ~73 MB | ~73 MB |
+| `com.vox.runtime` | ~73 MB | ~73 MB |
 | **total** | **~2.7 GB** | **~3.2 GB** |
 
-Kokoro is the dominant cost — a PyTorch/MPS process, ~4x whisper. STT model
-choice is a rounding error next to it.
+Tests: `.venv/bin/python -m pytest tests/` — **191 passing**.
 
-Tests: `.venv/bin/python -m pytest tests/` — **186 passing**.
-
-## Wired up
-
-Vox is configured globally in `~/.claude.json` (no `?agent=`, so anything
-unlisted is `default` on `af_sky`). These projects have a local-scope override
-that names their speaker:
+## Wired agents
 
 | project | agent | voice |
 |---|---|---|
@@ -96,8 +56,6 @@ that names their speaker:
 | `~/vox-mcp` | `vox` | `am_liam` |
 | `~/.claude` | `claude` | `af_bella` |
 
-Add another with, from inside the repo:
-
 ```bash
 claude mcp add --scope local --transport http vox \
   "http://127.0.0.1:8766/mcp?agent=<name>"
@@ -105,14 +63,8 @@ claude mcp add --scope local --transport http vox \
 
 ## Next steps
 
-- `small` is a real accuracy step down from `large-v3-turbo` on accents and
-  proper nouns. `medium` is 1.5 GB and buys little over large — if `small`
-  proves too lossy the choice is living with it or one server at ~1.6 GB
-  (`ggml-large-v3-turbo.bin` is still on disk; revert `InstallerPaths` and the
-  live plist).
-- Kokoro is the only remaining lever worth pulling on memory (~2.1 GB of a
-  2.8 GB stack). Nothing is in flight on it.
-- webrtcvad votes speech on music and some broadband noise, at every
-  aggressiveness, at 48k and 16k alike. A Silero VAD (whisper.cpp already ships
-  `silero` models and a `download-vad-model.sh`) would endpoint through music
-  properly; that is the next real upgrade to listening.
+- Silero VAD for music-proof endpointing.
+- If `small` is too lossy on accents: revert model path to
+  `ggml-large-v3-turbo.bin` (~1.6 GB).
+- Kokoro memory is the only large remaining cost lever.
+- System-wide dictation (Wispr replacement) is out of scope for this runtime.

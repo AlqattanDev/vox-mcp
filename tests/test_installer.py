@@ -216,11 +216,7 @@ def test_dry_run_is_side_effect_free_and_lists_host_registration(tmp_path: Path)
     assert before == after
     assert runner.calls == []
     assert plan.safe_to_activate is True
-    assert plan.directories == (
-        paths.vox_root / "logs" / "runtime",
-        paths.vox_root / "logs" / "whisper",
-        paths.vox_root / "logs" / "kokoro",
-    )
+    assert plan.directories == ()
     assert plan.unload_labels == STALE_LABELS + LEGACY_BACKEND_LABELS
     assert plan.delete_targets == tuple(
         paths.plist_for_label(label)
@@ -428,7 +424,7 @@ def test_fake_activation_failure_automatically_rolls_back_everything(
     assert not paths.app_target.exists()
     assert not paths.claude_skill_target.exists()
     assert not paths.codex_skill_target.exists()
-    assert all(directory.is_dir() for directory in installer.build_plan().directories)
+    assert installer.build_plan().directories == ()
     assert runner.loaded == originally_loaded
     assert all(kwargs["shell"] is False for _, kwargs in runner.calls)
 

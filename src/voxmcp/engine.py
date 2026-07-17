@@ -13,6 +13,7 @@ import secrets
 import tempfile
 import threading
 import time
+import uuid
 from dataclasses import replace
 from pathlib import Path
 from collections.abc import Awaitable, Callable
@@ -36,12 +37,15 @@ from .errors import BusyError, PrivacyError, ServiceUnavailableError, VoxError
 from .eventlog import JsonlEventLogger, read_events
 from .intents import classify_spoken_intent
 from .agents import AgentVoices, FALLBACK_VOICES
+from .last_heard import LastHeardStore
 from .lease import DEFAULT_AGENT, LeaseManager, OperationGate
 from .models import SessionState, SpokenIntent, StopReason
 from .services import ServiceSupervisor
 from .speech import LocalSpeechClient, SpeechResult, synthesize_with_macos_say
 from .state import IllegalStateTransition, VoiceStateMachine
 from .storage import AudioStore
+
+IO_MODES = ("talk", "narrate", "dictate")
 
 
 def _default_home() -> Path:
@@ -80,6 +84,9 @@ class VoxEngine:
         self.lease = lease or LeaseManager(ttl_seconds=max(30.0, config.idle_timeout_seconds))
         self.gate = gate or OperationGate()
         self.gate.on_event = self._log_queue_event
+        self.last_heard = LastHeardStore(Path(config.state_dir) / "last_heard.json")
+        self._io_mode_path = Path(config.state_dir) / "io_mode"
+        self._io_mode = self._load_io_mode()
 
         self.default_voice = os.environ.get("VOX_VOICE", "af_sky").lower()
         self.agent_voices = AgentVoices(home / "agents.json", default_voice=self.default_voice)
@@ -98,12 +105,17 @@ class VoxEngine:
         self._cancel_requested = False
         self._microphone_active = False
         self._microphone_closing = False
+        self._pending_heard: dict[str, Any] | None = None
+        self._pending_turn_id: str | None = None
+        self._pending_agent: str | None = None
         self._audio_tempdir: tempfile.TemporaryDirectory[str] | None = None
 
     @classmethod
     def default(cls) -> "VoxEngine":
         home = _default_home()
-        for directory in (home, home / "state", home / "logs"):
+        # state holds events + last_heard; do not create empty logs/* theater
+        # (launchd stdout/stderr are /dev/null by design).
+        for directory in (home, home / "state"):
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
             try:
                 directory.chmod(0o700)
@@ -200,9 +212,13 @@ class VoxEngine:
             pass
 
     async def _claim(self, client_id: str, *, start: bool = True) -> None:
-        result = await self.lease.claim(client_id)
-        if not result.get("claimed"):
-            raise BusyError(f"Audio belongs to {result.get('owner_id', 'another client')}")
+        """Join the shared session. Never excludes another host.
+
+        Audio exclusivity is the OperationGate FIFO only. owner_id / lease
+        last_actor are diagnostics (who spoke last), not permission gates.
+        """
+
+        await self.lease.claim(client_id)
         snapshot = self.state.snapshot()
         if start and snapshot.state is SessionState.OFF:
             self.state.start(client_id)
@@ -213,9 +229,6 @@ class VoxEngine:
             except Exception:
                 self.state.stop(StopReason.ERROR, client_id=None)
                 self.state.start(client_id)
-        elif snapshot.owner_id not in {None, client_id}:
-            await self.lease.release(client_id, force=True)
-            raise BusyError(f"Session belongs to {snapshot.owner_id}")
 
     def _log_queue_event(self, event: str, **data: Any) -> None:
         """Record queue transitions alongside every other voice event."""
@@ -246,6 +259,37 @@ class VoxEngine:
             self._playback = None
             self._cancel_requested = False
 
+    def _load_io_mode(self) -> str:
+        try:
+            value = self._io_mode_path.read_text().strip().lower()
+        except OSError:
+            return "talk"
+        return value if value in IO_MODES else "talk"
+
+    def _save_io_mode(self, mode: str) -> str:
+        if mode not in IO_MODES:
+            raise VoxError(f"Unknown io mode: {mode}")
+        self._io_mode_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self._io_mode_path.with_suffix(".tmp")
+        temporary.write_text(mode + "\n")
+        temporary.chmod(0o600)
+        os.replace(temporary, self._io_mode_path)
+        self._io_mode = mode
+        return mode
+
+    def _set_pending_heard(self, heard: dict[str, Any], turn_id: str) -> None:
+        with self._active_lock:
+            self._pending_heard = heard
+            self._pending_turn_id = turn_id
+
+    def _take_pending_heard(self) -> tuple[dict[str, Any] | None, str | None]:
+        with self._active_lock:
+            heard = self._pending_heard
+            turn_id = self._pending_turn_id
+            self._pending_heard = None
+            self._pending_turn_id = None
+            return heard, turn_id
+
     async def _run_operation(
         self,
         client_id: str,
@@ -259,27 +303,64 @@ class VoxEngine:
             raise PrivacyError("Voice session is paused; resume it before using audio")
         async with self.gate.operation(client_id, action, agent=agent or DEFAULT_AGENT):
             self._set_active(client_id)
+            with self._active_lock:
+                self._pending_agent = agent or DEFAULT_AGENT
             try:
-                return await operation()
+                result = await operation()
+                _, turn_id = self._take_pending_heard()
+                if turn_id:
+                    self.last_heard.mark_delivered(turn_id)
+                return result
             except asyncio.CancelledError:
                 # Set by control(cancel) before it cancelled us, so it tells a
                 # deliberate cancel apart from the host dropping the request.
                 with self._active_lock:
                     user_requested = self._cancel_requested
+                pending_heard, turn_id = self._take_pending_heard()
                 self._signal_cancel(manual_end=False, cancel_task=False)
                 self._return_idle_if_active()
                 self._log("turn.cancelled", client_id=client_id, action=action)
+                if pending_heard is not None and not user_requested:
+                    # Host dropped the tool after STT finished. Return the
+                    # transcript so the agent still hears the user.
+                    if turn_id:
+                        self.last_heard.mark_delivered(turn_id)
+                    payload: dict[str, Any] = {
+                        "status": "completed",
+                        "delivered_via": "cancel_recovery",
+                        "action": action,
+                        "session": self.state.snapshot().to_dict(),
+                    }
+                    if action == "converse":
+                        payload["heard"] = pending_heard
+                        payload["spoken"] = {"status": "completed"}
+                    else:
+                        payload.update(pending_heard)
+                    self._log(
+                        "turn.recovered",
+                        client_id=client_id,
+                        action=action,
+                        turn_id=turn_id,
+                    )
+                    return payload
                 if user_requested:
                     # Cancelling mid-speech used to leave the caller with no
                     # response at all: the tool call never completed and the
                     # agent hung. A cancel is an answer, so report it as one.
+                    # last_heard stays undelivered for explicit recovery.
                     return {
                         "status": "cancelled",
                         "action": action,
                         "session": self.state.snapshot().to_dict(),
+                        "undelivered_heard": (
+                            self.last_heard.undelivered().public()
+                            if self.last_heard.undelivered() is not None
+                            else {"present": False}
+                        ),
                     }
                 raise
             except Exception as exc:
+                self._take_pending_heard()
                 self._signal_cancel(manual_end=False, cancel_task=False)
                 self._mark_error(exc)
                 self._log(
@@ -291,6 +372,8 @@ class VoxEngine:
                 raise
             finally:
                 self._clear_active()
+                with self._active_lock:
+                    self._pending_agent = None
 
     def _return_idle_if_active(self) -> None:
         with self._active_lock:
@@ -587,6 +670,18 @@ class VoxEngine:
                 }
 
             transcript = transcription.text or ""
+            turn_id = uuid.uuid4().hex
+            with self._active_lock:
+                pending_agent = self._pending_agent
+            self.last_heard.write(
+                transcript=transcript,
+                reason=capture.reason.value,
+                session_id=self.state.snapshot().session_id,
+                client_id=client_id,
+                agent=pending_agent,
+                turn_id=turn_id,
+                delivered=False,
+            )
             intent = classify_spoken_intent(transcript)
             if intent.intent is SpokenIntent.REPEAT and repeats < repeat_limit:
                 repeats += 1
@@ -622,6 +717,7 @@ class VoxEngine:
                     "stt_ms": transcription.elapsed_ms,
                 },
                 "capture": _capture_dict(capture),
+                "turn_id": turn_id,
             }
             if intent.intent is SpokenIntent.STOP:
                 self.state.stop(StopReason.USER_REQUEST, client_id=client_id)
@@ -635,6 +731,8 @@ class VoxEngine:
                 if intent.intent is not SpokenIntent.NONE:
                     result["control"] = {"action": intent.intent.value}
             result["session"] = self.state.snapshot().to_dict()
+            # Durable before the tool returns so host cancel cannot erase it.
+            self._set_pending_heard(result, turn_id)
             return result
 
     async def converse(
@@ -653,20 +751,34 @@ class VoxEngine:
         agent: str | None = None,
         **_: Any,
     ) -> dict[str, Any]:
+        mode = self._io_mode
+        # Session io_mode is the panel/user preference; it wins over the caller's
+        # wait_for_response when it forces narrate (no mic) or dictate (no TTS).
+        effective_wait = wait_for_response and mode != "narrate"
+        skip_speak = mode == "dictate"
+
         async def operation() -> dict[str, Any]:
             # Resolved inside the turn, not before it: resolving first would let
             # voice-lookup latency decide queue order instead of arrival order.
             # An explicit voice= always wins over the agent's assigned voice.
-            spoken = await self._speak_locked(
-                client_id,
-                message,
-                voice=voice or await self._agent_voice(agent),
-                speed=speed,
-                instructions=instructions,
-                interruptible=True,
-            )
-            result: dict[str, Any] = {"spoken": spoken}
-            if wait_for_response and spoken.get("status") != "cancelled":
+            if skip_speak:
+                spoken = {
+                    "status": "skipped",
+                    "reason": "io_mode_dictate",
+                    "backend": None,
+                    "elapsed_ms": 0,
+                }
+            else:
+                spoken = await self._speak_locked(
+                    client_id,
+                    message,
+                    voice=voice or await self._agent_voice(agent),
+                    speed=speed,
+                    instructions=instructions,
+                    interruptible=True,
+                )
+            result: dict[str, Any] = {"spoken": spoken, "io_mode": mode}
+            if effective_wait and spoken.get("status") != "cancelled":
                 result["heard"] = await self._listen_locked(
                     client_id,
                     listen_duration_max=listen_duration_max,
@@ -675,7 +787,9 @@ class VoxEngine:
                     language=language,
                 )
             result["status"] = (
-                result.get("heard", {}).get("status") if wait_for_response else spoken.get("status")
+                result.get("heard", {}).get("status")
+                if effective_wait
+                else spoken.get("status")
             )
             result["session"] = self.state.snapshot().to_dict()
             return result
@@ -695,6 +809,13 @@ class VoxEngine:
         **_: Any,
     ) -> dict[str, Any]:
         async def operation() -> dict[str, Any]:
+            if self._io_mode == "dictate":
+                return {
+                    "status": "skipped",
+                    "reason": "io_mode_dictate",
+                    "io_mode": self._io_mode,
+                    "session": self.state.snapshot().to_dict(),
+                }
             result = await self._speak_locked(
                 client_id,
                 message,
@@ -703,7 +824,7 @@ class VoxEngine:
                 instructions=instructions,
                 interruptible=interruptible,
             )
-            return {**result, "session": self.state.snapshot().to_dict()}
+            return {**result, "io_mode": self._io_mode, "session": self.state.snapshot().to_dict()}
 
         return await self._run_operation(client_id, "speak", operation, agent=agent)
 
@@ -740,12 +861,47 @@ class VoxEngine:
         target_client_id: str | None = None,
         force: bool = False,
         agent: str | None = None,
-        **_: Any,
+        mode: str | None = None,
+        **kwargs: Any,
     ) -> dict[str, Any]:
+        del kwargs
         action = action.lower().strip()
         administrative = client_id == "http-control"
         if action == "status":
             return await self._status_for_agent(agent)
+        if action in {"set_mode", "mode"}:
+            selected = str(mode or "").strip().lower()
+            if not selected:
+                raise VoxError("set_mode requires mode=talk|narrate|dictate")
+            self._save_io_mode(selected)
+            self._log(
+                "session.set_mode",
+                client_id=client_id,
+                agent=agent or DEFAULT_AGENT,
+                mode=selected,
+            )
+            return await self._status_for_agent(agent)
+        if action == "cycle_mode":
+            idx = IO_MODES.index(self._io_mode) if self._io_mode in IO_MODES else 0
+            selected = IO_MODES[(idx + 1) % len(IO_MODES)]
+            self._save_io_mode(selected)
+            self._log(
+                "session.cycle_mode",
+                client_id=client_id,
+                agent=agent or DEFAULT_AGENT,
+                mode=selected,
+            )
+            return await self._status_for_agent(agent)
+        if action == "claim_undelivered":
+            claimed = self.last_heard.claim()
+            payload = await self._status_for_agent(agent)
+            if claimed is None:
+                payload["undelivered_heard"] = {"present": False}
+                payload["claimed_heard"] = None
+            else:
+                payload["undelivered_heard"] = {"present": False}
+                payload["claimed_heard"] = claimed.public(include_transcript=True)
+            return payload
         if action == "start":
             if administrative:
                 if self.state.state is SessionState.OFF:
@@ -782,28 +938,27 @@ class VoxEngine:
             # surface may close the microphone and release stale ownership.
             await self.lease.release(client_id, force=True)
         elif action == "handoff":
+            # Shared session: no exclusive ownership to transfer. Optionally
+            # record the target as last actor for diagnostics.
             if not target_client_id:
                 raise VoxError("handoff requires target_client_id")
             target_client_id = _canonical_client_id(target_client_id)
-            lease_status = await self.lease.status()
-            if lease_status.get("owner_id") != client_id:
-                raise BusyError("Only the current owner can hand off voice")
-            # Hardware is quiet before ownership changes. The target claims on
-            # its next call; the old durable session is intentionally closed.
-            self._signal_cancel(manual_end=False, force=True)
-            if not await self._wait_for_microphone_closed():
-                raise ServiceUnavailableError("cannot hand off while the microphone is still closing")
             result = await self.lease.handoff(client_id, target_client_id)
-            if not result.get("success"):
-                raise BusyError("Voice ownership changed before handoff completed")
-            if self.state.state is not SessionState.OFF:
-                self.state.stop(StopReason.OWNER_DISCONNECTED, client_id=None)
-            return {"status": "handoff_pending", "handoff": result}
+            self._log("session.handoff", client_id=client_id, agent=agent or DEFAULT_AGENT)
+            payload = await self._status_for_agent(agent)
+            payload.update(
+                {
+                    "status": "shared",
+                    "detail": "shared session: no exclusive handoff; queue serializes audio",
+                    "handoff": result,
+                }
+            )
+            return payload
         elif action == "takeover":
-            # Always kill in-flight audio. Same-owner takeover used to skip
-            # cancel, leave the capture holding the operation gate, and report
-            # idle while every new turn sat in the queue for 30s and died.
-            # force only gates the lease claim against a live foreign owner.
+            # Shared session: "takeover" means cancel whatever is holding the
+            # mic and drain the queue so this client can speak next — not
+            # steal exclusive ownership (there is none).
+            del force
             self._signal_cancel(manual_end=False, force=True)
             self.gate.drain("takeover")
             if not await self._wait_for_microphone_closed():
@@ -811,12 +966,17 @@ class VoxEngine:
                     "cannot take over while the previous microphone turn is still closing"
                 )
             self._return_idle_if_active()
-            claim = await self.lease.claim(client_id, force=force)
-            if not claim.get("claimed"):
-                raise BusyError("takeover requires force=true while another owner is active")
-            if self.state.state is not SessionState.OFF:
-                self.state.stop(StopReason.OWNER_DISCONNECTED, client_id=None)
-            self.state.start(client_id)
+            await self.lease.claim(client_id)
+            if self.state.state is SessionState.OFF:
+                self.state.start(client_id)
+            elif self.state.state is SessionState.ERROR:
+                try:
+                    self.state.recover(client_id=client_id)
+                except Exception:
+                    self.state.stop(StopReason.ERROR, client_id=None)
+                    self.state.start(client_id)
+            elif self.state.state is SessionState.PAUSED:
+                self.state.resume(client_id=None)
         else:
             raise VoxError(f"Unknown voice session action: {action}")
         self._log(f"session.{action}", client_id=client_id, agent=agent or DEFAULT_AGENT)
@@ -1176,6 +1336,7 @@ class VoxEngine:
             detail = "Microphone is still closing; Vox is fail-closed to new audio turns"
         elif microphone_open:
             detail = "Listening for one bounded turn"
+        undelivered = self.last_heard.undelivered()
         return {
             "status": "ok",
             "state": self.state.state.value,
@@ -1185,6 +1346,10 @@ class VoxEngine:
             "operation": await self.gate.status(),
             "storage": self.store.status(),
             "local_only": True,
+            "io_mode": self._io_mode,
+            "undelivered_heard": (
+                undelivered.public() if undelivered is not None else {"present": False}
+            ),
         }
 
     @property
@@ -1195,6 +1360,7 @@ class VoxEngine:
     async def health(self) -> dict[str, Any]:
         status = await self.status()
         session = status["session"]
+        undelivered = status.get("undelivered_heard") or {"present": False}
         return {
             "status": "ok",
             "state": status["state"],
@@ -1207,6 +1373,12 @@ class VoxEngine:
             # instead of looking like a crash.
             "last_stop_reason": session["last_stop_reason"],
             "idle_deadline_at": session["idle_deadline_at"],
+            "io_mode": status.get("io_mode", "talk"),
+            "undelivered_heard": {
+                "present": bool(undelivered.get("present")),
+                "age_s": undelivered.get("age_s"),
+                "char_count": undelivered.get("char_count"),
+            },
         }
 
 

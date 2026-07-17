@@ -13,11 +13,11 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
     private let stateLabel = NSTextField(labelWithString: "Starting Vox…")
     private let detailLabel = NSTextField(wrappingLabelWithString: "Waiting for the local runtime")
     private let microphoneLabel = NSTextField(labelWithString: "Microphone: checking")
-    private let primaryButton = NSButton(title: "Start voice session", target: nil, action: nil)
-    private let stopButton = NSButton(title: "Stop", target: nil, action: nil)
-    private let cancelButton = NSButton(title: "Cancel current turn", target: nil, action: nil)
-    private let restartButton = NSButton(title: "Restart runtime", target: nil, action: nil)
-    private let activityButton = NSButton(title: "Open Vox activity", target: nil, action: nil)
+    private let modeLabel = NSTextField(labelWithString: "Mode: Talk")
+    private let modeButton = NSButton(title: "Cycle mode", target: nil, action: nil)
+    private let stopButton = NSButton(title: "Stop voice", target: nil, action: nil)
+    private let cancelButton = NSButton(title: "Cancel this turn", target: nil, action: nil)
+    private let moreButton = NSButton(title: "More…", target: nil, action: nil)
 
     private var runtime: Process?
     private var timer: Timer?
@@ -31,6 +31,7 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
     private var actionNotice: String?
     private var microphoneOpen = false
     private var lastStopReason: String?
+    private var ioMode = "talk"
     private let baseURL = URL(string: "http://127.0.0.1:8766")!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -89,27 +90,22 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
         detailLabel.textColor = .secondaryLabelColor
         detailLabel.maximumNumberOfLines = 3
         microphoneLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        modeLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
 
-        for button in [primaryButton, stopButton, cancelButton, restartButton, activityButton] {
+        for button in [modeButton, stopButton, cancelButton, moreButton] {
             button.target = self
             button.bezelStyle = .rounded
         }
-        primaryButton.action = #selector(primaryAction)
+        modeButton.action = #selector(cycleMode)
         stopButton.action = #selector(stopSession)
         cancelButton.action = #selector(cancelTurn)
-        restartButton.action = #selector(restartRuntime)
-        activityButton.action = #selector(openActivity)
+        moreButton.action = #selector(showMoreMenu)
 
-        let sessionRow = NSStackView(views: [primaryButton, stopButton])
+        let sessionRow = NSStackView(views: [modeButton, stopButton])
         sessionRow.orientation = .horizontal
         sessionRow.distribution = .fillEqually
         sessionRow.spacing = 8
         sessionRow.translatesAutoresizingMaskIntoConstraints = false
-        let utilityRow = NSStackView(views: [restartButton, activityButton])
-        utilityRow.orientation = .horizontal
-        utilityRow.distribution = .fillEqually
-        utilityRow.spacing = 8
-        utilityRow.translatesAutoresizingMaskIntoConstraints = false
 
         let divider = NSBox()
         divider.boxType = .separator
@@ -118,10 +114,11 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
         stack.addArrangedSubview(stateLabel)
         stack.addArrangedSubview(detailLabel)
         stack.addArrangedSubview(microphoneLabel)
+        stack.addArrangedSubview(modeLabel)
         stack.addArrangedSubview(divider)
         stack.addArrangedSubview(sessionRow)
         stack.addArrangedSubview(cancelButton)
-        stack.addArrangedSubview(utilityRow)
+        stack.addArrangedSubview(moreButton)
 
         root.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -131,10 +128,11 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
             stack.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -14),
             detailLabel.widthAnchor.constraint(equalToConstant: 322),
             microphoneLabel.widthAnchor.constraint(equalTo: detailLabel.widthAnchor),
+            modeLabel.widthAnchor.constraint(equalTo: detailLabel.widthAnchor),
             divider.widthAnchor.constraint(equalTo: detailLabel.widthAnchor),
             sessionRow.widthAnchor.constraint(equalTo: detailLabel.widthAnchor),
             cancelButton.widthAnchor.constraint(equalTo: detailLabel.widthAnchor),
-            utilityRow.widthAnchor.constraint(equalTo: detailLabel.widthAnchor),
+            moreButton.widthAnchor.constraint(equalTo: detailLabel.widthAnchor),
         ])
         panelController.view = root
         popover.contentViewController = panelController
@@ -292,6 +290,7 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
                 self.microphoneOpen = (payload["microphone_open"] as? Bool) ?? false
                 self.detail = (payload["detail"] as? String) ?? "Local-only runtime connected"
                 self.lastStopReason = payload["last_stop_reason"] as? String
+                self.ioMode = (payload["io_mode"] as? String) ?? self.ioMode
                 self.updatePresentation()
             }
         }.resume()
@@ -318,21 +317,29 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
         detailLabel.stringValue = panelDetail()
         microphoneLabel.stringValue = microphoneOpen
             ? "Microphone: listening now"
-            : "Microphone: closed — Vox never records in the background"
+            : "Microphone: closed — never records in the background"
+        modeLabel.stringValue = "Mode: \(modeTitle(ioMode)) — Talk both · Narrate agent only · Dictate you only"
 
         let activeTurn = ["listening", "speaking", "processing"].contains(normalized)
-        if normalized == "off" || normalized == "offline" || normalized == "error" {
-            primaryButton.title = "Start voice session"
-        } else if normalized == "paused" {
-            primaryButton.title = "Resume voice session"
-        } else {
-            primaryButton.title = "Pause voice session"
-        }
-        primaryButton.isEnabled = !controlInFlight && normalized != "offline" && normalized != "error"
+        modeButton.title = "Mode: \(modeTitle(ioMode))"
+        modeButton.isEnabled = !controlInFlight && normalized != "offline"
         stopButton.isEnabled = !controlInFlight && !["off", "offline", "error"].contains(normalized)
+        // Off/paused: Stop becomes Start for one-tap session open.
+        if normalized == "off" || normalized == "paused" || normalized == "error" {
+            stopButton.title = normalized == "paused" ? "Resume voice" : "Start voice"
+        } else {
+            stopButton.title = "Stop voice"
+        }
         cancelButton.isEnabled = !controlInFlight && activeTurn
-        restartButton.isEnabled = !controlInFlight
-        activityButton.isEnabled = true
+        moreButton.isEnabled = !controlInFlight
+    }
+
+    private func modeTitle(_ mode: String) -> String {
+        switch mode.lowercased() {
+        case "narrate": return "Narrate"
+        case "dictate": return "Dictate"
+        default: return "Talk"
+        }
     }
 
     private func panelDetail() -> String {
@@ -385,25 +392,60 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
 
     private func successNotice(for action: String) -> String {
         switch action {
-        case "start": return "Voice session is ready. The microphone remains closed until Codex or Claude asks to listen."
+        case "start": return "Voice session ready. Shared — any agent may use it. Mic closed until a turn listens."
         case "pause": return "Voice session paused. The microphone is closed."
-        case "resume": return "Voice session resumed and ready. The microphone remains closed until a voice turn starts."
-        case "cancel": return "Current voice turn cancelled. The microphone is closing."
-        case "stop": return "Voice mode stopped. The microphone is closed."
+        case "resume": return "Voice session resumed. Shared queue; mic still closed until a turn listens."
+        case "cancel": return "Current turn cancelled. Mic closing."
+        case "stop": return "Voice stopped. Microphone closed."
+        case "cycle_mode": return "Mode cycled. Talk = both · Narrate = agent speaks · Dictate = you only."
         default: return "Vox control applied."
         }
     }
 
-    @objc private func primaryAction() {
+    @objc private func cycleMode() {
+        sendControl("cycle_mode", notice: "Cycling Talk → Narrate → Dictate…")
+    }
+
+    @objc private func cancelTurn() { sendControl("cancel", notice: "Cancelling current turn…") }
+
+    @objc private func stopSession() {
         switch state.lowercased() {
-        case "off", "offline", "error": sendControl("start", notice: "Starting a voice session…")
-        case "paused": sendControl("resume", notice: "Resuming voice session…")
-        default: sendControl("pause", notice: "Pausing voice session and closing the microphone…")
+        case "off", "offline", "error":
+            sendControl("start", notice: "Starting voice session…")
+        case "paused":
+            sendControl("resume", notice: "Resuming voice session…")
+        default:
+            sendControl("stop", notice: "Stopping voice…")
         }
     }
 
-    @objc private func cancelTurn() { sendControl("cancel", notice: "Cancelling current voice turn…") }
-    @objc private func stopSession() { sendControl("stop", notice: "Stopping voice mode…") }
+    @objc private func showMoreMenu() {
+        let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "Start / resume session", action: #selector(startOrResume), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Pause (privacy hold)", action: #selector(pauseSession), keyEquivalent: ""))
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "Restart runtime", action: #selector(restartRuntime), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Open Vox folder", action: #selector(openActivity), keyEquivalent: ""))
+        for item in menu.items where item.action != nil {
+            item.target = self
+        }
+        if let event = NSApp.currentEvent {
+            NSMenu.popUpContextMenu(menu, with: event, for: moreButton)
+        } else {
+            menu.popUp(positioning: nil, at: NSPoint(x: 0, y: moreButton.bounds.height), in: moreButton)
+        }
+    }
+
+    @objc private func startOrResume() {
+        switch state.lowercased() {
+        case "paused": sendControl("resume", notice: "Resuming…")
+        default: sendControl("start", notice: "Starting…")
+        }
+    }
+
+    @objc private func pauseSession() {
+        sendControl("pause", notice: "Pausing and closing the microphone…")
+    }
 
     @objc private func pauseBeforeSleep() {
         actionNotice = "Pausing before sleep and closing the microphone…"

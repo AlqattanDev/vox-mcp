@@ -36,35 +36,50 @@ trailing-silence timeout are separate.
 
 | User intent | Effect |
 |---|---|
-| “Stop voice mode” / “switch to text” | Ends the session, stops audio, closes mic, releases ownership |
+| “Stop voice mode” / “switch to text” | Ends the session, stops audio, closes mic |
 | “Pause voice mode” / “mute” | Keeps the session but blocks new listening and closes the mic |
 | “Resume voice mode” | Returns a paused session to `IDLE`; it still does not listen until asked |
-| Vox status-panel Start / resume | Makes Vox ready; it does not open the microphone |
-| Vox status-panel Pause / Stop / Cancel | Pauses the session, ends it, or cancels only the active turn; each closes the microphone |
+| Panel Mode cycle | Talk (both) → Narrate (agent only) → Dictate (you only) |
+| Panel Stop / Start | Ends session or opens shared session; never exclusive ownership |
+| Panel Cancel this turn | Cancels only the active speak/listen; session stays up |
 | “Repeat that” | Replays cached audio; Kokoro is not called again |
 | “Wait” / “give me a second” | Closes the mic, waits, then listens again |
-| Escape or `voice_control(cancel)` | Cancels only the current speak/listen turn; voice mode remains active |
+| Escape or `voice_control(cancel)` | Cancels only the current turn; voice mode remains active |
 | Manual end-of-turn | Closes the current recording immediately and transcribes what was captured |
 
 Spoken controls are recognized only as short standalone utterances. A long
 dictation containing the words “stop voice mode” is treated as content, not a
 control command.
 
-## Ownership and handoff
+## Shared session (no exclusive owner)
 
-One runtime owns the hardware, so Claude Code and Codex cannot speak over each
-other or race PortAudio. The first client to start/use a session receives a
-lease. Another client gets a structured `busy` response immediately instead
-of waiting until its MCP timeout. Identity comes from the stable MCP host name,
-not a temporary HTTP session ID, so reconnects and host upgrades reclaim the
-same lease. The owner can explicitly hand off; an idle lease expires after ten
-minutes. Global `stop` is owner-independent and releases stale ownership.
+Nobody owns the voice session. Grok, Fable, Claude, Codex — and any other MCP
+host — join the **same** session. Each agent keeps its own Kokoro voice via
+`?agent=` / `agents.json`. Hardware is serialized only by the **FIFO
+OperationGate**: if someone is speaking or listening, others wait, then go.
 
-The microphone closes when an active request is cancelled even while the
-stable host lease is retained. The onset timeout and hard turn cap still apply
-if a client disappears without transport shutdown. This is the privacy-safe
-distinction between “the conversation can recover” and “the computer keeps
-listening.”
+- `BusyError` means the queue wait timed out or the session is paused — not
+  “another agent owns voice.”
+- `handoff` / `takeover` are legacy: takeover cancels the active turn and drains
+  the queue; handoff is a shared no-op.
+- Global `stop` / panel Stop / sleep pause close the mic for everyone (privacy).
+
+## IO modes
+
+| Mode | Agent speaks | Mic opens | Use |
+|---|---|---|---|
+| `talk` (default) | yes | yes after TTS | Normal conversation |
+| `narrate` | yes | no | Agent talks; user types |
+| `dictate` | no | yes | User talks; agent does not TTS |
+
+Set via panel cycle, `voice_session(set_mode|cycle_mode)`, or `POST /control`.
+
+## Undelivered transcript recovery
+
+When Whisper finishes, Vox writes `~/.vox/state/last_heard.json` before the
+tool returns. If the MCP host cancels after STT, the runtime returns the
+transcript with `delivered_via: cancel_recovery`. Agents can also call
+`voice_session(claim_undelivered)` or `transcribe(latest=true)`.
 
 ## Failure behavior
 

@@ -137,6 +137,8 @@ async def test_server_shutdown_calls_engine_audio_cleanup(tmp_path: Path) -> Non
 
 @pytest.mark.asyncio
 async def test_host_identity_survives_new_http_sessions_and_version_updates(tmp_path: Path) -> None:
+    """Host name is stable across reconnects; a second host joins shared, not busy."""
+
     class LeaseEngine(FakeEngine):
         def __init__(self, latest_audio_path: Path) -> None:
             super().__init__(latest_audio_path)
@@ -144,17 +146,15 @@ async def test_host_identity_survives_new_http_sessions_and_version_updates(tmp_
 
         async def session(self, *, client_id: str, action: str, **_kwargs: Any) -> Any:
             claim = await self.lease.claim(client_id)
-            if not claim["claimed"]:
-                raise BusyError(f"Audio belongs to {claim['owner_id']}")
+            assert claim["claimed"] is True
             self.calls.append(("session", {"client_id": client_id, "action": action}))
-            return {"status": "ok"}
+            return {"status": "ok", "lease": claim}
 
         async def listen(self, *, client_id: str, **_kwargs: Any) -> Any:
             claim = await self.lease.claim(client_id)
-            if not claim["claimed"]:
-                raise BusyError(f"Audio belongs to {claim['owner_id']}")
+            assert claim["claimed"] is True
             self.calls.append(("listen", {"client_id": client_id}))
-            return {"status": "completed"}
+            return {"status": "completed", "lease": claim}
 
     engine = LeaseEngine(tmp_path / "latest.wav")
     server = create_mcp(engine)
@@ -175,16 +175,11 @@ async def test_host_identity_survives_new_http_sessions_and_version_updates(tmp_
         server,
         client_info=Implementation(name="Claude Code", version="1.0"),
     ) as competitor:
-        busy = await competitor.call_tool("listen", {})
+        shared = await competitor.call_tool("listen", {})
 
-    assert busy.data == {
-        "status": "error",
-        "error_type": "BusyError",
-        "message": "Audio belongs to mcp:host:codex",
-        "recoverable": True,
-    }
-    owners = [arguments["client_id"] for _name, arguments in engine.calls]
-    assert owners == ["mcp:host:codex", "mcp:host:codex"]
+    assert shared.data["status"] == "completed"
+    clients = [arguments["client_id"] for _name, arguments in engine.calls]
+    assert clients == ["mcp:host:codex", "mcp:host:codex", "mcp:host:claude-code"]
 
 
 def _asgi_client_factory(app):

@@ -27,8 +27,12 @@ class ClientLease:
     def public(self, *, now: float | None = None) -> dict[str, object]:
         current = time.time() if now is None else now
         return {
-            "owned": True,
-            "owner_id": self.owner_id,
+            # Shared session: nobody exclusively owns voice. last_actor is
+            # diagnostics only; the OperationGate is the only serializer.
+            "owned": False,
+            "shared": True,
+            "last_actor": self.owner_id,
+            "owner_id": self.owner_id,  # alias for older status readers
             "age_seconds": max(0, round(current - self.acquired_at, 3)),
             "expires_in_seconds": max(0, round(self.expires_at - current, 3)),
             "reconnect_grace": (
@@ -41,6 +45,12 @@ class ClientLease:
 
 
 class LeaseManager:
+    """Tracks last actor / idle bookkeeping. Does not exclude other clients.
+
+    Audio exclusivity is the OperationGate FIFO only: if someone is speaking
+    or listening, others wait, then go — each in their own agent voice.
+    """
+
     def __init__(
         self,
         *,
@@ -55,45 +65,50 @@ class LeaseManager:
         self._lock = asyncio.Lock()
 
     async def claim(self, client_id: str, *, force: bool = False) -> dict[str, object]:
+        del force  # Shared mode: force is meaningless; everyone may join.
         now = self.clock()
         async with self._lock:
             self._expire(now)
-            lease = self._lease
-            if lease is None:
-                self._lease = ClientLease(
-                    owner_id=client_id,
-                    acquired_at=now,
-                    heartbeat_at=now,
-                    expires_at=now + self.ttl_seconds,
-                )
-                return {"claimed": True, **self._lease.public(now=now)}
-            if lease.owner_id == client_id:
-                lease.heartbeat_at = now
-                lease.expires_at = now + self.ttl_seconds
-                lease.reconnect_until = None
-                return {"claimed": True, "existing": True, **lease.public(now=now)}
-            if lease.reserved_for == client_id or force:
-                previous = lease.owner_id
-                self._lease = ClientLease(
-                    owner_id=client_id,
-                    acquired_at=now,
-                    heartbeat_at=now,
-                    expires_at=now + self.ttl_seconds,
-                )
-                return {"claimed": True, "previous_owner": previous, **self._lease.public(now=now)}
-            return {"claimed": False, "busy": True, **lease.public(now=now)}
+            previous = self._lease.owner_id if self._lease is not None else None
+            if self._lease is not None and self._lease.owner_id == client_id:
+                self._lease.heartbeat_at = now
+                self._lease.expires_at = now + self.ttl_seconds
+                self._lease.reconnect_until = None
+                self._lease.reserved_for = None
+                return {
+                    "claimed": True,
+                    "existing": True,
+                    "shared": True,
+                    **self._lease.public(now=now),
+                }
+            self._lease = ClientLease(
+                owner_id=client_id,
+                acquired_at=now,
+                heartbeat_at=now,
+                expires_at=now + self.ttl_seconds,
+            )
+            result: dict[str, object] = {
+                "claimed": True,
+                "shared": True,
+                **self._lease.public(now=now),
+            }
+            if previous is not None and previous != client_id:
+                result["previous_actor"] = previous
+            return result
 
     async def require(self, client_id: str, *, auto_claim: bool = True) -> None:
-        result = await self.claim(client_id) if auto_claim else await self.status()
-        if result.get("owner_id") != client_id:
-            raise BusyError(f"Audio is owned by {result.get('owner_id', 'another client')}")
+        # Shared session: requiring the "lease" only records the actor.
+        if auto_claim:
+            await self.claim(client_id)
 
     async def heartbeat(self, client_id: str) -> bool:
         now = self.clock()
         async with self._lock:
             self._expire(now)
-            if self._lease is None or self._lease.owner_id != client_id:
+            if self._lease is None:
                 return False
+            # Any participant may refresh idle bookkeeping.
+            self._lease.owner_id = client_id
             self._lease.heartbeat_at = now
             self._lease.expires_at = now + self.ttl_seconds
             self._lease.reconnect_until = None
@@ -102,7 +117,11 @@ class LeaseManager:
     async def disconnect(self, client_id: str) -> bool:
         now = self.clock()
         async with self._lock:
-            if self._lease is None or self._lease.owner_id != client_id:
+            if self._lease is None:
+                return False
+            # Shared session: one client leaving does not tear down bookkeeping
+            # unless they were the last recorded actor.
+            if self._lease.owner_id != client_id:
                 return False
             self._lease.reconnect_until = now + self.reconnect_grace_seconds
             self._lease.expires_at = min(
@@ -115,32 +134,32 @@ class LeaseManager:
             if self._lease is None:
                 return True
             if not force and self._lease.owner_id != client_id:
-                return False
+                # Shared: non-force release by a non-actor is a no-op success
+                # so stop/cleanup paths do not fail across hosts.
+                return True
             self._lease = None
             return True
 
     async def handoff(self, client_id: str, target_id: str) -> dict[str, object]:
-        now = self.clock()
-        async with self._lock:
-            self._expire(now)
-            if self._lease is None or self._lease.owner_id != client_id:
-                return {"success": False, "reason": "not_owner"}
-            self._lease.reserved_for = target_id
-            self._lease.expires_at = min(
-                self._lease.expires_at, now + self.reconnect_grace_seconds
-            )
-            return {
-                "success": True,
-                "from": client_id,
-                "reserved_for": target_id,
-                "expires_in_seconds": self.reconnect_grace_seconds,
-            }
+        # Ownership handoff is obsolete. Record the target as last actor so
+        # older clients that still call handoff do not error.
+        del client_id
+        claimed = await self.claim(target_id)
+        return {
+            "success": True,
+            "shared": True,
+            "from": claimed.get("previous_actor"),
+            "reserved_for": target_id,
+            "note": "shared session: no exclusive handoff; queue serializes audio",
+        }
 
     async def status(self) -> dict[str, object]:
         now = self.clock()
         async with self._lock:
             self._expire(now)
-            return self._lease.public(now=now) if self._lease else {"owned": False}
+            if self._lease is None:
+                return {"owned": False, "shared": True}
+            return self._lease.public(now=now)
 
     def _expire(self, now: float) -> None:
         if self._lease is not None and self._lease.expires_at <= now:

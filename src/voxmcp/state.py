@@ -339,11 +339,9 @@ class VoiceStateMachine:
     expire_lease = expire_if_idle
 
     def _assert_owner(self, client_id: str | None) -> None:
-        owner = self._snapshot.owner_id
-        if owner is not None and client_id is not None and owner != client_id:
-            raise SessionOwnershipError(
-                f"session is owned by a different client ({owner!r})"
-            )
+        # Shared session: owner_id is last_actor for diagnostics only.
+        # Any client may drive transitions; the OperationGate serializes audio.
+        del client_id
 
     def _heartbeat_locked(self, client_id: str | None) -> StateSnapshot:
         now = float(self._clock())
@@ -354,7 +352,8 @@ class VoiceStateMachine:
         )
         candidate = replace(
             self._snapshot,
-            owner_id=self._snapshot.owner_id or client_id,
+            # last actor for events/status; never used to exclude a client
+            owner_id=client_id if client_id is not None else self._snapshot.owner_id,
             revision=self._snapshot.revision + 1,
             updated_at=now,
             last_activity_at=now,

@@ -542,10 +542,9 @@ class TransactionalInstaller:
         )
         return InstallationPlan(
             generated_at=_iso(self._now()),
-            directories=tuple(
-                self.paths.vox_root / "logs" / service
-                for service in ("runtime", "whisper", "kokoro")
-            ),
+            # No logs/* dirs: launchd stdout/stderr are /dev/null on purpose.
+            # Audit trail is ~/.vox/state/events.jsonl only.
+            directories=(),
             files=files,
             host_commands=host_commands,
             unload_labels=STALE_LABELS + LEGACY_BACKEND_LABELS,

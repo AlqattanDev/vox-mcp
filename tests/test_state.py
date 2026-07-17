@@ -9,7 +9,7 @@ import pytest
 from voxmcp.models import SessionState, StopReason
 from voxmcp.state import (
     IllegalStateTransition,
-    SessionOwnershipError,
+
     VoiceStateMachine,
     read_snapshot,
 )
@@ -135,12 +135,15 @@ def test_idle_expiry_only_applies_in_idle(tmp_path: Path) -> None:
     assert machine.snapshot().last_stop_reason is StopReason.IDLE_TIMEOUT
 
 
-def test_owner_is_enforced_when_adapter_supplies_client_id(tmp_path: Path) -> None:
+def test_shared_session_allows_any_client_to_drive_turns(tmp_path: Path) -> None:
+    """Shared session: owner_id is last_actor only; other hosts may use the mic."""
+
     machine = VoiceStateMachine(snapshot_path=tmp_path / "state.json")
     machine.start("claude-session")
 
-    with pytest.raises(SessionOwnershipError):
-        machine.begin_listening(client_id="codex-session")
+    machine.begin_listening(client_id="codex-session")
+    assert machine.state is SessionState.LISTENING
+    machine.cancel_turn(client_id="codex-session")
     assert machine.state is SessionState.IDLE
 
 

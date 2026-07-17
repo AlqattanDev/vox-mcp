@@ -113,24 +113,29 @@ async def test_no_speech_is_bounded_and_keeps_session(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_competing_client_gets_busy_without_waiting(tmp_path: Path):
+async def test_competing_client_shares_session_and_queues(tmp_path: Path):
+    """Two hosts share one session; the second waits on the gate, not BusyError."""
+
     engine = make_engine(tmp_path)
     await engine.session("claude", "start")
-    with pytest.raises(Exception, match="belongs|owned|Audio"):
-        await engine.listen("codex")
+    result = await engine.listen("codex")
+    assert result["status"] in {"completed", "no_speech"}
+    assert (await engine.status())["lease"]["shared"] is True
 
 
 @pytest.mark.asyncio
-async def test_global_stop_releases_a_stale_owner(tmp_path: Path):
+async def test_global_stop_from_any_client(tmp_path: Path):
     engine = make_engine(tmp_path)
     await engine.session("claude", "start")
 
     stopped = await engine.session("codex", "stop")
 
     assert stopped["state"] == "off"
-    assert (await engine.lease.status()) == {"owned": False}
+    lease = await engine.lease.status()
+    assert lease.get("owned") is False
+    assert lease.get("shared") is True
     restarted = await engine.session("codex", "start")
-    assert restarted["lease"]["owner_id"] == "codex"
+    assert restarted["lease"]["last_actor"] == "codex"
 
 
 @pytest.mark.asyncio
@@ -154,7 +159,7 @@ async def test_survey_playback_failure_returns_partial_and_cleans_state(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_handoff_alias_is_canonical_and_claimable_after_reconnect(tmp_path: Path):
+async def test_handoff_is_shared_and_does_not_exclude(tmp_path: Path):
     engine = make_engine(tmp_path)
     await engine.session("mcp:host:claude-code", "start")
 
@@ -164,9 +169,30 @@ async def test_handoff_alias_is_canonical_and_claimable_after_reconnect(tmp_path
         target_client_id="codex",
     )
 
-    assert pending["handoff"]["reserved_for"] == "mcp:host:codex"
-    claimed = await engine.session("mcp:host:codex", "start")
-    assert claimed["lease"]["owner_id"] == "mcp:host:codex"
+    assert pending["status"] == "shared"
+    assert pending["handoff"]["shared"] is True
+    # Both hosts can still use the session without takeover.
+    spoken = await engine.speak("mcp:host:claude-code", "still here")
+    assert spoken["status"] == "completed"
+    spoken2 = await engine.speak("mcp:host:codex", "me too")
+    assert spoken2["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_two_hosts_converse_in_queue_order(tmp_path: Path):
+    engine = make_engine(tmp_path)
+    holder, handle = await _hold_the_microphone(engine)
+
+    second = asyncio.create_task(engine.speak("codex", "after you", agent="mobilescape"))
+    await asyncio.sleep(0.05)
+    status = await engine.status()
+    assert status["operation"]["queue_depth"] == 1
+
+    handle.release.set()
+    await asyncio.wait_for(holder, timeout=5)
+    result = await asyncio.wait_for(second, timeout=5)
+    assert result["status"] == "completed"
+    assert (await engine.status())["operation"]["busy"] is False
 
 
 @pytest.mark.asyncio
@@ -506,11 +532,7 @@ class HoldingRecorder:
 
 @pytest.mark.asyncio
 async def test_takeover_cancels_stuck_listen_and_unblocks_next_turn(tmp_path: Path):
-    """Same-owner takeover used to leave the capture holding the gate.
-
-    Session looked idle; the next converse queued for 30s and timed out — the
-    multi-terminal 'listening forever then nothing works' failure mode.
-    """
+    """Takeover cancels whoever holds the mic and drains the queue (shared session)."""
 
     engine = make_engine(tmp_path)
     holding = HoldingRecorder(engine.store.latest_stt)
@@ -519,8 +541,7 @@ async def test_takeover_cancels_stuck_listen_and_unblocks_next_turn(tmp_path: Pa
     listening = asyncio.create_task(engine.listen("claude"))
     assert await asyncio.to_thread(holding.started.wait, 2)
 
-    # Same owner reclaims the session while the mic is still open.
-    status = await engine.session("claude", "takeover")
+    status = await engine.session("codex", "takeover")
     assert status["state"] == "idle"
     assert status["session"]["microphone_open"] is False
     assert holding.saw_cancel is True
@@ -529,11 +550,87 @@ async def test_takeover_cancels_stuck_listen_and_unblocks_next_turn(tmp_path: Pa
     assert result["status"] == "cancelled"
     assert result["reason"] == "cancelled"
 
-    # Restore a normal recorder for the follow-up; the hold was only the stuck turn.
     engine.recorder = FakeRecorder(engine.store.latest_stt)
 
-    # Gate must be free: a new turn must not queue or time out.
     assert (await engine.status())["operation"]["busy"] is False
-    follow_up = await asyncio.wait_for(engine.converse("claude", "hi again"), timeout=2)
+    follow_up = await asyncio.wait_for(engine.converse("codex", "hi again"), timeout=2)
     assert follow_up["spoken"]["status"] == "completed"
     assert follow_up["session"]["state"] == "idle"
+
+
+@pytest.mark.asyncio
+async def test_io_modes_narrate_and_dictate(tmp_path: Path):
+    engine = make_engine(tmp_path)
+    await engine.session("claude", "set_mode", mode="narrate")
+    narrate = await engine.converse("claude", "story only")
+    assert narrate["spoken"]["status"] == "completed"
+    assert "heard" not in narrate or narrate.get("heard") is None
+    assert narrate["io_mode"] == "narrate"
+
+    await engine.session("claude", "set_mode", mode="dictate")
+    spoken = await engine.speak("claude", "should skip")
+    assert spoken["status"] == "skipped"
+    dictated = await engine.converse("claude", "ignored tts")
+    assert dictated["spoken"]["status"] == "skipped"
+    assert dictated["heard"]["status"] == "completed"
+    assert dictated["heard"]["transcript"] == "hello world"
+
+    await engine.session("claude", "set_mode", mode="talk")
+
+
+@pytest.mark.asyncio
+async def test_last_heard_persists_and_claim_undelivered(tmp_path: Path):
+    engine = make_engine(tmp_path)
+    result = await engine.listen("claude")
+    assert result["status"] == "completed"
+    # Normal delivery marks delivered.
+    assert engine.last_heard.undelivered() is None
+    assert engine.last_heard.read() is not None
+    assert engine.last_heard.read().delivered is True
+
+    # Simulate undelivered: write fresh record.
+    engine.last_heard.write(
+        transcript="lost words",
+        reason="trailing_silence",
+        session_id="s1",
+        client_id="claude",
+        agent="default",
+        turn_id="t1",
+        delivered=False,
+    )
+    status = await engine.status()
+    assert status["undelivered_heard"]["present"] is True
+    claimed = await engine.session("claude", "claim_undelivered")
+    assert claimed["claimed_heard"]["transcript"] == "lost words"
+    assert engine.last_heard.undelivered() is None
+
+
+@pytest.mark.asyncio
+async def test_host_cancel_after_stt_returns_transcript(tmp_path: Path):
+    """Host CancelledError after STT still returns the finished transcript."""
+
+    engine = make_engine(tmp_path)
+
+    async def operation():
+        heard = {
+            "status": "completed",
+            "transcript": "recovered speech",
+            "turn_id": "abc",
+        }
+        engine.last_heard.write(
+            transcript="recovered speech",
+            reason="trailing_silence",
+            session_id="s",
+            client_id="claude",
+            agent="default",
+            turn_id="abc",
+            delivered=False,
+        )
+        engine._set_pending_heard(heard, "abc")
+        raise asyncio.CancelledError()
+
+    result = await engine._run_operation("claude", "listen", operation)
+    assert result["status"] == "completed"
+    assert result["delivered_via"] == "cancel_recovery"
+    assert result["transcript"] == "recovered speech"
+    assert engine.last_heard.undelivered() is None

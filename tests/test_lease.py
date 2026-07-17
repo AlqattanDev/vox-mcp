@@ -7,22 +7,32 @@ from voxmcp.lease import LeaseManager, OperationGate
 
 
 @pytest.mark.asyncio
-async def test_lease_is_immediately_busy_for_other_client():
+async def test_lease_is_shared_everyone_joins():
+    """Nobody exclusively owns voice; claim always succeeds and records last_actor."""
+
     lease = LeaseManager()
-    assert (await lease.claim("claude"))["claimed"] is True
+    first = await lease.claim("claude")
+    assert first["claimed"] is True
+    assert first["shared"] is True
+    assert first["owned"] is False
+    assert first["last_actor"] == "claude"
+
     other = await lease.claim("codex")
-    assert other["claimed"] is False
-    assert other["owner_id"] == "claude"
+    assert other["claimed"] is True
+    assert other["shared"] is True
+    assert other["last_actor"] == "codex"
+    assert other.get("previous_actor") == "claude"
 
 
 @pytest.mark.asyncio
-async def test_handoff_reserves_lease_for_target():
+async def test_handoff_is_shared_noop_that_records_target():
     lease = LeaseManager()
     await lease.claim("claude")
-    assert (await lease.handoff("claude", "codex"))["success"] is True
-    claimed = await lease.claim("codex")
-    assert claimed["claimed"] is True
-    assert claimed["previous_owner"] == "claude"
+    result = await lease.handoff("claude", "codex")
+    assert result["success"] is True
+    assert result["shared"] is True
+    status = await lease.status()
+    assert status["last_actor"] == "codex"
 
 
 @pytest.mark.asyncio
