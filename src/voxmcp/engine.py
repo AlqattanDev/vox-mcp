@@ -800,13 +800,17 @@ class VoxEngine:
                 self.state.stop(StopReason.OWNER_DISCONNECTED, client_id=None)
             return {"status": "handoff_pending", "handoff": result}
         elif action == "takeover":
-            if force:
-                self._signal_cancel(manual_end=False, force=True)
-                if not await self._wait_for_microphone_closed():
-                    raise ServiceUnavailableError(
-                        "cannot take over while the previous microphone turn is still closing"
-                    )
-                self._return_idle_if_active()
+            # Always kill in-flight audio. Same-owner takeover used to skip
+            # cancel, leave the capture holding the operation gate, and report
+            # idle while every new turn sat in the queue for 30s and died.
+            # force only gates the lease claim against a live foreign owner.
+            self._signal_cancel(manual_end=False, force=True)
+            self.gate.drain("takeover")
+            if not await self._wait_for_microphone_closed():
+                raise ServiceUnavailableError(
+                    "cannot take over while the previous microphone turn is still closing"
+                )
+            self._return_idle_if_active()
             claim = await self.lease.claim(client_id, force=force)
             if not claim.get("claimed"):
                 raise BusyError("takeover requires force=true while another owner is active")

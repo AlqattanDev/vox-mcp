@@ -460,3 +460,80 @@ async def test_session_stop_drains_queued_turns(tmp_path: Path):
     status = await engine.status()
     assert status["operation"]["queue_depth"] == 0
     assert status["operation"]["busy"] is False
+
+
+class HoldingRecorder:
+    """Blocks inside capture until cancelled or released — models a stuck listen."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.saw_cancel = False
+
+    def capture(self, *, device=None, control=None):
+        self.started.set()
+        while not self.release.wait(timeout=0.02):
+            if control is not None and control.cancelled:
+                self.saw_cancel = True
+                return CaptureResult(
+                    samples=np.array([], dtype=np.float32),
+                    sample_rate=16000,
+                    reason=CaptureStopReason.CANCELLED,
+                    speech_detected=False,
+                    elapsed_s=1,
+                    audio_duration_s=0,
+                    speech_duration_s=0,
+                    trailing_silence_s=0,
+                    noise_floor_dbfs=-60.0,
+                    latest_wav_path=None,
+                )
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_bytes(b"RIFF" + b"0" * 64)
+        return CaptureResult(
+            samples=np.ones(160, dtype=np.float32),
+            sample_rate=16000,
+            reason=CaptureStopReason.TRAILING_SILENCE,
+            speech_detected=True,
+            elapsed_s=1,
+            audio_duration_s=1,
+            speech_duration_s=0.5,
+            trailing_silence_s=1.2,
+            noise_floor_dbfs=-60.0,
+            latest_wav_path=self.path,
+        )
+
+
+@pytest.mark.asyncio
+async def test_takeover_cancels_stuck_listen_and_unblocks_next_turn(tmp_path: Path):
+    """Same-owner takeover used to leave the capture holding the gate.
+
+    Session looked idle; the next converse queued for 30s and timed out — the
+    multi-terminal 'listening forever then nothing works' failure mode.
+    """
+
+    engine = make_engine(tmp_path)
+    holding = HoldingRecorder(engine.store.latest_stt)
+    engine.recorder = holding
+
+    listening = asyncio.create_task(engine.listen("claude"))
+    assert await asyncio.to_thread(holding.started.wait, 2)
+
+    # Same owner reclaims the session while the mic is still open.
+    status = await engine.session("claude", "takeover")
+    assert status["state"] == "idle"
+    assert status["session"]["microphone_open"] is False
+    assert holding.saw_cancel is True
+
+    result = await asyncio.wait_for(listening, timeout=2)
+    assert result["status"] == "cancelled"
+    assert result["reason"] == "cancelled"
+
+    # Restore a normal recorder for the follow-up; the hold was only the stuck turn.
+    engine.recorder = FakeRecorder(engine.store.latest_stt)
+
+    # Gate must be free: a new turn must not queue or time out.
+    assert (await engine.status())["operation"]["busy"] is False
+    follow_up = await asyncio.wait_for(engine.converse("claude", "hi again"), timeout=2)
+    assert follow_up["spoken"]["status"] == "completed"
+    assert follow_up["session"]["state"] == "idle"

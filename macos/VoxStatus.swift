@@ -350,7 +350,10 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
         updatePresentation()
         var request = URLRequest(url: baseURL.appendingPathComponent("control"))
         request.httpMethod = "POST"
-        request.timeoutInterval = 2.0
+        // Stop/pause wait up to ~3s for the mic to close server-side. A 2s
+        // client timeout made Stop look broken while the runtime was still
+        // finishing the privacy shutdown.
+        request.timeoutInterval = 6.0
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("status-bar", forHTTPHeaderField: "X-Vox-Control-Source")
         if let token = try? String(contentsOf: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".vox/control.token"), encoding: .utf8) {

@@ -46,6 +46,15 @@ upstream compatibility layer — packaged for the wheel build, not edited.
   Limitation: audible background music still degrades listening — the VAD votes
   speech on music, so only the slow backstop applies. Silence the room or
   expect ~25s turns.
+- **Takeover always kills the previous turn.** Same-owner `takeover` used to
+  skip cancel, so a stuck listen kept the operation gate while session state
+  looked idle — every new converse queued 30s and timed out (the multi-terminal
+  "still listening / nothing works" loop). Takeover now always signals cancel,
+  drains the queue, waits for the mic to close, then claims. `force` only
+  gates the lease against a live foreign owner.
+- **Status-bar Stop timeout.** The menu-bar control client waited only 2s while
+  stop/pause can take up to ~3s for mic close server-side, so Stop looked like
+  a no-op. Control requests now allow 6s.
 - **The installer removes legacy plists, it does not just unload them.**
   `plan.delete_targets` lists every `STALE_LABELS + LEGACY_BACKEND_LABELS` plist
   and `activate()` deletes each one after booting the job out, so launchd's
