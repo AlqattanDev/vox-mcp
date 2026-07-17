@@ -97,6 +97,7 @@ class CaptureConfig:
     minimum_speech_dbfs: float = -48.0
     speech_margin_db: float = 9.0
     noise_smoothing: float = 0.95
+    noise_rise_smoothing: float = 0.999
     queue_capacity_frames: int = 512
     source_stall_timeout_s: float = 2.0
     save_latest: bool = True
@@ -127,6 +128,8 @@ class CaptureConfig:
             raise ValueError("speech_margin_db must be in (0, 40]")
         if not 0 <= self.noise_smoothing < 1.0:
             raise ValueError("noise_smoothing must be in [0, 1)")
+        if not 0 <= self.noise_rise_smoothing < 1.0:
+            raise ValueError("noise_rise_smoothing must be in [0, 1)")
         if self.queue_capacity_frames < 2:
             raise ValueError("queue_capacity_frames must be at least 2")
         if self.source_stall_timeout_s <= 0:
@@ -347,10 +350,22 @@ class AdaptiveCaptureState:
             # A very strong transient may be clipped speech that VAD missed.
             is_speech = energy_speech and dbfs >= threshold + 12.0
 
-        if not is_speech:
+        if not is_speech or vad_vote is False:
+            # The VAD calling a loud frame non-speech is the signature of a
+            # droning room (fan, AC).  Let the floor keep learning it at the
+            # normal rate even when raw energy trips the threshold; otherwise a
+            # room whose ambient starts above the threshold reads as endless
+            # speech and the turn can never endpoint.
             alpha = self.config.noise_smoothing
             self.noise_floor_dbfs = alpha * self.noise_floor_dbfs + (1.0 - alpha) * dbfs
-            self.noise_floor_dbfs = max(-96.0, min(-3.0, self.noise_floor_dbfs))
+        elif dbfs > self.noise_floor_dbfs:
+            # Speech-accepted frames still lift the floor, only very slowly:
+            # real speech has inter-word gaps that pull it back down, while a
+            # sustained drone that fools the VAD eventually reads as the new
+            # silence so the turn can endpoint.
+            alpha = self.config.noise_rise_smoothing
+            self.noise_floor_dbfs = alpha * self.noise_floor_dbfs + (1.0 - alpha) * dbfs
+        self.noise_floor_dbfs = max(-96.0, min(-3.0, self.noise_floor_dbfs))
         return is_speech
 
     def feed(self, samples: Any) -> FrameDecision:

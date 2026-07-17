@@ -160,6 +160,42 @@ def test_noise_floor_adapts_without_promoting_stationary_noise() -> None:
     assert decision.speech_started is True
 
 
+def test_loud_drone_the_vad_rejects_endpoints_instead_of_recording_forever() -> None:
+    # A fan/AC room whose ambient sits above the threshold: raw energy trips
+    # the detector but the VAD keeps voting non-speech.  The floor must learn
+    # the drone so the turn endpoints instead of running to max_duration.
+    state = AdaptiveCaptureState(1_000, config(), lambda _samples, _sr: False)
+
+    decision = None
+    for _ in range(40):
+        decision = state.feed(frame(0.05))
+        if state.finished:
+            break
+
+    assert decision is not None
+    assert decision.stop_reason is CaptureStopReason.TRAILING_SILENCE
+    assert state.elapsed_s < 0.8
+
+
+def test_sustained_drone_that_fools_the_vad_still_endpoints() -> None:
+    # Even when the VAD wrongly votes speech on a constant drone, the slow
+    # upward floor drift must eventually read it as the new silence.
+    state = AdaptiveCaptureState(
+        1_000,
+        config(noise_rise_smoothing=0.9),
+        lambda _samples, _sr: True,
+    )
+
+    decision = None
+    for _ in range(80):
+        decision = state.feed(frame(0.05))
+        if state.finished:
+            break
+
+    assert decision is not None
+    assert decision.stop_reason is CaptureStopReason.TRAILING_SILENCE
+
+
 def test_cancel_discards_partial_audio_but_manual_end_preserves_it() -> None:
     cancelled = CaptureControl()
 

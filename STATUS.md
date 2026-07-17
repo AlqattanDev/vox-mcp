@@ -36,6 +36,16 @@ upstream compatibility layer — packaged for the wheel build, not edited.
   The model path is baked into the plist from `InstallerPaths` —
   `voicemode.env`'s `VOICEMODE_WHISPER_MODEL` is read only by the vendored
   start script, not by the agent that serves.
+- **Loud rooms endpoint instead of recording forever.** The adaptive noise
+  floor used to learn only from non-speech frames, so ambient above the
+  threshold (fan, AC, music) read as endless speech and every listen ran to the
+  5-minute cap. Now a frame the WebRTC VAD rejects always feeds the floor at the
+  normal rate, and VAD-accepted frames drift it up slowly
+  (`noise_rise_smoothing`, ~20s time constant) as a backstop when the VAD is
+  fooled. Real speech is safe: inter-word gaps pull the floor back down.
+  Limitation: audible background music still degrades listening — the VAD votes
+  speech on music, so only the slow backstop applies. Silence the room or
+  expect ~25s turns.
 - **The installer removes legacy plists, it does not just unload them.**
   `plan.delete_targets` lists every `STALE_LABELS + LEGACY_BACKEND_LABELS` plist
   and `activate()` deletes each one after booting the job out, so launchd's
@@ -62,7 +72,7 @@ reads 9 MB in `ps` against a true 591 MB).
 Kokoro is the dominant cost — a PyTorch/MPS process, ~4x whisper. STT model
 choice is a rounding error next to it.
 
-Tests: `.venv/bin/python -m pytest tests/` — **184 passing**.
+Tests: `.venv/bin/python -m pytest tests/` — **186 passing**.
 
 ## Wired up
 
@@ -93,3 +103,7 @@ claude mcp add --scope local --transport http vox \
   live plist).
 - Kokoro is the only remaining lever worth pulling on memory (~2.1 GB of a
   2.8 GB stack). Nothing is in flight on it.
+- webrtcvad votes speech on music and some broadband noise, at every
+  aggressiveness, at 48k and 16k alike. A Silero VAD (whisper.cpp already ships
+  `silero` models and a `download-vad-model.sh`) would endpoint through music
+  properly; that is the next real upgrade to listening.
