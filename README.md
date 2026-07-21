@@ -25,7 +25,8 @@ loopback address; Vox refuses to start if they do not.
   no hard-coded 24 kHz device assumption.
 - Watchdog health probes and bounded restart/retry for local Whisper/Kokoro.
 - A click-to-open macOS status panel with explicit start, pause/resume,
-  cancel, stop, restart, and local activity controls. It states whether the
+  **I'm done talking** (close and transcribe the current recording), cancel,
+  stop, restart, and local activity controls. It states whether the
   microphone is actually open and explains an automatic idle stop.
 - Frozen dependency lock and direct venv launcher. No `uvx --refresh`, no code
   download, and no version drift at MCP startup.

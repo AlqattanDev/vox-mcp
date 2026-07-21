@@ -16,6 +16,7 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
     private let modeLabel = NSTextField(labelWithString: "Mode: Talk")
     private let modeButton = NSButton(title: "Cycle mode", target: nil, action: nil)
     private let stopButton = NSButton(title: "Stop voice", target: nil, action: nil)
+    private let endTurnButton = NSButton(title: "I'm done talking", target: nil, action: nil)
     private let cancelButton = NSButton(title: "Cancel this turn", target: nil, action: nil)
     private let moreButton = NSButton(title: "More…", target: nil, action: nil)
 
@@ -92,12 +93,13 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
         microphoneLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
         modeLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
 
-        for button in [modeButton, stopButton, cancelButton, moreButton] {
+        for button in [modeButton, stopButton, endTurnButton, cancelButton, moreButton] {
             button.target = self
             button.bezelStyle = .rounded
         }
         modeButton.action = #selector(cycleMode)
         stopButton.action = #selector(stopSession)
+        endTurnButton.action = #selector(endTurn)
         cancelButton.action = #selector(cancelTurn)
         moreButton.action = #selector(showMoreMenu)
 
@@ -117,6 +119,7 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
         stack.addArrangedSubview(modeLabel)
         stack.addArrangedSubview(divider)
         stack.addArrangedSubview(sessionRow)
+        stack.addArrangedSubview(endTurnButton)
         stack.addArrangedSubview(cancelButton)
         stack.addArrangedSubview(moreButton)
 
@@ -131,6 +134,7 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
             modeLabel.widthAnchor.constraint(equalTo: detailLabel.widthAnchor),
             divider.widthAnchor.constraint(equalTo: detailLabel.widthAnchor),
             sessionRow.widthAnchor.constraint(equalTo: detailLabel.widthAnchor),
+            endTurnButton.widthAnchor.constraint(equalTo: detailLabel.widthAnchor),
             cancelButton.widthAnchor.constraint(equalTo: detailLabel.widthAnchor),
             moreButton.widthAnchor.constraint(equalTo: detailLabel.widthAnchor),
         ])
@@ -304,7 +308,7 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
         case "speaking": title = "Vox Speaking"
         case "processing": title = "Vox Processing"
         case "paused": title = "Vox Paused"
-        case "idle": title = "Vox Ready"
+        case "idle": title = "Vox Ready · Mic Off"
         case "off": title = "Vox Off"
         case "offline": title = "Vox Offline"
         case "error": title = "Vox Error"
@@ -331,6 +335,9 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
             stopButton.title = "Stop voice"
         }
         cancelButton.isEnabled = !controlInFlight && activeTurn
+        // Unlike Cancel, this preserves the recording and sends it straight to
+        // local transcription. It is meaningful only while the user is speaking.
+        endTurnButton.isEnabled = !controlInFlight && normalized == "listening"
         moreButton.isEnabled = !controlInFlight
     }
 
@@ -396,6 +403,7 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
         case "pause": return "Voice session paused. The microphone is closed."
         case "resume": return "Voice session resumed. Shared queue; mic still closed until a turn listens."
         case "cancel": return "Current turn cancelled. Mic closing."
+        case "end_turn": return "Got it. Recording closed; transcribing what you said."
         case "stop": return "Voice stopped. Microphone closed."
         case "cycle_mode": return "Mode cycled. Talk = both · Narrate = agent speaks · Dictate = you only."
         default: return "Vox control applied."
@@ -407,6 +415,10 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func cancelTurn() { sendControl("cancel", notice: "Cancelling current turn…") }
+
+    @objc private func endTurn() {
+        sendControl("end_turn", notice: "Got it. Closing recording and transcribing…")
+    }
 
     @objc private func stopSession() {
         switch state.lowercased() {

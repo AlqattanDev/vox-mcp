@@ -28,8 +28,10 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
 - **IO modes.** `talk` (default, both) · `narrate` (agent speaks, no mic) ·
   `dictate` (listen only, TTS skipped). Panel cycles; `voice_session`
   `set_mode` / `cycle_mode`; persisted in `~/.vox/state/io_mode`.
-- **Menu bar.** Mode cycle + Stop/Start + Cancel this turn. Restart / Open
-  folder / Pause under **More…**. Control HTTP timeout 6s (matches mic close).
+- **Menu bar.** `Vox Ready · Mic Off` makes the idle privacy state explicit.
+  Mode cycle + Stop/Start + **I'm done talking** (preserve and transcribe the
+  current recording) + Cancel this turn. Restart / Open folder / Pause under
+  **More…**. Control HTTP timeout 6s (matches mic close).
 - **Loud rooms endpoint.** Adaptive floor + `noise_rise_smoothing` backstop.
   Music still degrades VAD (Silero later).
 - **Whisper `small`.** One server `com.vox.whisper` `:2022`.

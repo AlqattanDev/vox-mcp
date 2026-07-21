@@ -41,6 +41,7 @@ trailing-silence timeout are separate.
 | “Resume voice mode” | Returns a paused session to `IDLE`; it still does not listen until asked |
 | Panel Mode cycle | Talk (both) → Narrate (agent only) → Dictate (you only) |
 | Panel Stop / Start | Ends session or opens shared session; never exclusive ownership |
+| Panel **I'm done talking** | Closes the current recording and transcribes it; keeps the spoken message |
 | Panel Cancel this turn | Cancels only the active speak/listen; session stays up |
 | “Repeat that” | Replays cached audio; Kokoro is not called again |
 | “Wait” / “give me a second” | Closes the mic, waits, then listens again |
