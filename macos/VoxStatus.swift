@@ -40,9 +40,9 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
         configurePanel()
         guard let button = statusItem.button else { return }
         button.target = self
-        button.action = #selector(togglePanel)
+        button.action = #selector(statusItemClicked)
         button.sendAction(on: [.leftMouseUp, .rightMouseUp])
-        button.toolTip = "Vox local voice controls"
+        button.toolTip = "Vox — click to stop listening when the mic is live; right-click for controls"
         updatePresentation()
 
         requestMicrophonePermission(startRuntimeAfterward: true)
@@ -65,7 +65,9 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
             name: NSWorkspace.screensDidSleepNotification,
             object: nil
         )
-        timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+        // Poll fast so the menu-bar glyph tracks the real mic state almost
+        // instantly instead of lagging a second behind what the mic is doing.
+        timer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
             self?.refreshStatus()
         }
         refreshStatus()
@@ -142,6 +144,21 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
         popover.contentViewController = panelController
         popover.behavior = .transient
         popover.animates = true
+    }
+
+    // A left-click while the mic is live ends the turn immediately — the fix for
+    // "I can stop talking but you can't stop listening." It preserves what was
+    // said and sends it to transcription (unlike Cancel, which discards). A
+    // right-click (or a click when the mic is closed) opens the controls panel.
+    @objc private func statusItemClicked() {
+        let event = NSApp.currentEvent
+        let rightClick = event?.type == .rightMouseUp
+            || (event?.modifierFlags.contains(.control) ?? false)
+        if !rightClick, microphoneOpen, !controlInFlight {
+            endTurn()
+            return
+        }
+        togglePanel()
     }
 
     @objc private func togglePanel() {
@@ -314,8 +331,10 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
         case "error": title = "Vox Error"
         default: title = "Vox Starting"
         }
-        statusItem.button?.title = title
-        statusItem.button?.toolTip = panelDetail()
+        applyStatusGlyph(normalized: normalized, title: title)
+        statusItem.button?.toolTip = microphoneOpen
+            ? "Mic is LIVE — click to stop listening. \(panelDetail())"
+            : panelDetail()
 
         stateLabel.stringValue = title
         detailLabel.stringValue = panelDetail()
@@ -325,6 +344,9 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
         modeLabel.stringValue = "Mode: \(modeTitle(ioMode)) — Talk both · Narrate agent only · Dictate you only"
 
         let activeTurn = ["listening", "speaking", "processing"].contains(normalized)
+        // Surface the contextual action right on the "done" button so the panel
+        // leads with what matters now: stop listening while the mic is live.
+        endTurnButton.title = microphoneOpen ? "Stop listening (keep what I said)" : "I'm done talking"
         modeButton.title = "Mode: \(modeTitle(ioMode))"
         modeButton.isEnabled = !controlInFlight && normalized != "offline"
         stopButton.isEnabled = !controlInFlight && !["off", "offline", "error"].contains(normalized)
@@ -339,6 +361,44 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
         // local transcription. It is meaningful only while the user is speaking.
         endTurnButton.isEnabled = !controlInFlight && normalized == "listening"
         moreButton.isEnabled = !controlInFlight
+    }
+
+    // The menu-bar item is a glanceable glyph, not a wordy string. It shows a
+    // red mic ONLY when the microphone is genuinely capturing (driven by the
+    // runtime's microphone_open truth, never by stale session state), which is
+    // the whole fix for "it always looks like it's listening."
+    private func applyStatusGlyph(normalized: String, title: String) {
+        guard let button = statusItem.button else { return }
+        let symbol: String
+        if microphoneOpen {
+            symbol = "mic.fill"
+        } else {
+            switch normalized {
+            case "speaking": symbol = "waveform"
+            case "processing": symbol = "waveform.badge.mic"
+            case "paused": symbol = "pause.circle"
+            case "idle": symbol = "mic.slash"
+            case "off": symbol = "mic.slash.circle"
+            case "offline", "error": symbol = "exclamationmark.triangle"
+            default: symbol = "waveform.circle"
+            }
+        }
+        let config = NSImage.SymbolConfiguration(pointSize: 15, weight: .semibold)
+        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)?
+            .withSymbolConfiguration(config)
+        image?.isTemplate = true
+        if let image {
+            button.image = image
+            button.imagePosition = .imageOnly
+            button.title = ""
+        } else {
+            // Fall back to text if the SF Symbol is unavailable on this OS.
+            button.image = nil
+            button.title = title
+        }
+        // Template images adopt this tint; nil lets the menu bar pick its own
+        // adaptive color so idle/closed states never read as "hot."
+        button.contentTintColor = microphoneOpen ? NSColor.systemRed : nil
     }
 
     private func modeTitle(_ mode: String) -> String {
@@ -357,7 +417,7 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
         return detail
     }
 
-    private func sendControl(_ action: String, notice: String) {
+    private func sendControl(_ action: String, notice: String, extra: [String: Any] = [:]) {
         guard !controlInFlight else { return }
         controlInFlight = true
         actionNotice = notice
@@ -373,7 +433,9 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
         if let token = try? String(contentsOf: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".vox/control.token"), encoding: .utf8) {
             request.setValue(token.trimmingCharacters(in: .whitespacesAndNewlines), forHTTPHeaderField: "X-Vox-Token")
         }
-        request.httpBody = try? JSONSerialization.data(withJSONObject: ["action": action])
+        var payload: [String: Any] = ["action": action]
+        payload.merge(extra) { _, new in new }
+        request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
         URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -414,6 +476,11 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
         sendControl("cycle_mode", notice: "Cycling Talk → Narrate → Dictate…")
     }
 
+    @objc private func selectMode(_ sender: NSMenuItem) {
+        guard let mode = sender.representedObject as? String else { return }
+        sendControl("set_mode", notice: "Switching to \(modeTitle(mode))…", extra: ["mode": mode])
+    }
+
     @objc private func cancelTurn() { sendControl("cancel", notice: "Cancelling current turn…") }
 
     @objc private func endTurn() {
@@ -433,6 +500,19 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showMoreMenu() {
         let menu = NSMenu()
+        // Jump straight to a mode instead of cycling through all three. A tick
+        // marks the current one.
+        for (mode, label) in [
+            ("talk", "Talk — both of us speak"),
+            ("narrate", "Narrate — I speak, you type"),
+            ("dictate", "Dictate — you speak, I type"),
+        ] {
+            let item = NSMenuItem(title: label, action: #selector(selectMode(_:)), keyEquivalent: "")
+            item.representedObject = mode
+            item.state = ioMode.lowercased() == mode ? .on : .off
+            menu.addItem(item)
+        }
+        menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Start / resume session", action: #selector(startOrResume), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Pause (privacy hold)", action: #selector(pauseSession), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
