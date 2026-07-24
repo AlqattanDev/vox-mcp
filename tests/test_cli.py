@@ -178,9 +178,9 @@ def test_speak_listen_and_converse_preserve_explicit_options() -> None:
             "message": "No reply needed",
             "wait_for_response": False,
             "voice": "af_river",
-            "listen_duration_max": 300.0,
+            "listen_duration_max": 75.0,
             "listen_duration_min": 0.5,
-            "trailing_silence_s": 1.2,
+            "trailing_silence_s": 1.6,
         },
     )
 

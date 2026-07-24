@@ -291,7 +291,7 @@ def create_cli(
         function = click.option(
             "--trailing-silence-s",
             type=click.FloatRange(min=0.1, max=10.0),
-            default=1.2,
+            default=1.6,
             show_default=True,
         )(function)
         function = click.option(
@@ -303,7 +303,7 @@ def create_cli(
         return click.option(
             "--listen-duration-max",
             type=click.FloatRange(min=0.1, max=300.0),
-            default=300.0,
+            default=75.0,
             show_default=True,
         )(function)
 
@@ -338,7 +338,7 @@ def create_cli(
     @click.option(
         "--trailing-silence-s",
         type=click.FloatRange(min=0.1, max=10.0),
-        default=1.2,
+        default=1.6,
         show_default=True,
     )
     @click.option(
@@ -350,7 +350,7 @@ def create_cli(
     @click.option(
         "--listen-duration-max",
         type=click.FloatRange(min=0.1, max=300.0),
-        default=300.0,
+        default=75.0,
         show_default=True,
     )
     def converse_command(

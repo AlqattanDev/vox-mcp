@@ -33,6 +33,7 @@ from .audio import (
 from .compat import LegacyCompatibility
 from .config import VoxConfig
 from .diagnostics import static_diagnostics
+from .earcons import earcons_enabled, ensure_earcons
 from .errors import BusyError, PrivacyError, ServiceUnavailableError, VoxError
 from .eventlog import JsonlEventLogger, read_events
 from .intents import classify_spoken_intent
@@ -95,6 +96,8 @@ class VoxEngine:
         self.default_wait_seconds = float(os.environ.get("VOX_WAIT_SECONDS", "60"))
         self.input_device: int | str | None = os.environ.get("VOX_INPUT_DEVICE")
         self.volume = min(1.0, max(0.0, float(os.environ.get("VOX_VOLUME", "1"))))
+        self._earcons_enabled = earcons_enabled()
+        self._earcon_paths: tuple[Path, Path] | None = None
 
         self._active_lock = threading.RLock()
         self._active_task: asyncio.Task[Any] | None = None
@@ -135,9 +138,9 @@ class VoxEngine:
         store = AudioStore(audio_root, replay_items=8, ttl_hours=24)
         capture = CaptureConfig(
             onset_timeout_s=float(os.environ.get("VOX_ONSET_TIMEOUT_SECONDS", "15")),
-            trailing_silence_s=float(os.environ.get("VOX_TRAILING_SILENCE_SECONDS", "1.2")),
+            trailing_silence_s=float(os.environ.get("VOX_TRAILING_SILENCE_SECONDS", "1.6")),
             min_duration_s=float(os.environ.get("VOX_MIN_UTTERANCE_SECONDS", "0.5")),
-            max_duration_s=float(os.environ.get("VOX_MAX_UTTERANCE_SECONDS", "300")),
+            max_duration_s=float(os.environ.get("VOX_MAX_UTTERANCE_SECONDS", "75")),
             pre_roll_s=float(os.environ.get("VOX_PRE_ROLL_SECONDS", "0.3")),
             latest_wav_path=store.latest_stt,
             save_latest=True,
@@ -525,6 +528,41 @@ class VoxEngine:
             "audio_path": str(replay_path),
         }
 
+    def _earcon_files(self) -> tuple[Path, Path] | None:
+        if not self._earcons_enabled:
+            return None
+        if self._earcon_paths is None:
+            try:
+                self._earcon_paths = ensure_earcons(self.home / "assets")
+            except Exception:
+                # A cue is a courtesy; failing to synthesize it must never keep
+                # the microphone from opening.
+                self._earcons_enabled = False
+                return None
+        return self._earcon_paths
+
+    async def _play_listen_start_cue(self) -> None:
+        cues = self._earcon_files()
+        if cues is None:
+            return
+        try:
+            # Blocking and off the loop, *before* the mic opens, so the tone can
+            # never bleed into the recording.
+            await asyncio.to_thread(
+                self.player.play_file, cues[0], volume=self.volume, blocking=True
+            )
+        except Exception:
+            pass
+
+    def _play_listen_stop_cue(self) -> None:
+        cues = self._earcon_files()
+        if cues is None:
+            return
+        try:
+            self.player.play_file(cues[1], volume=self.volume, blocking=False)
+        except Exception:
+            pass
+
     async def _capture_once(
         self,
         client_id: str,
@@ -534,6 +572,7 @@ class VoxEngine:
     ) -> tuple[CaptureResult, SpeechResult | None]:
         self.state.begin_listening(client_id=client_id)
         self._log("listening.started", client_id=client_id)
+        await self._play_listen_start_cue()
         control = CaptureControl()
         with self._active_lock:
             self._capture_control = control
@@ -551,6 +590,9 @@ class VoxEngine:
             with self._active_lock:
                 self._microphone_active = False
                 self._microphone_closing = False
+            # Mark the mic closed in every path (normal, cancel, interrupt,
+            # error) so the user always hears when the window ends.
+            self._play_listen_stop_cue()
 
         future.add_done_callback(microphone_closed)
         try:
@@ -558,7 +600,11 @@ class VoxEngine:
         except asyncio.CancelledError:
             with self._active_lock:
                 self._microphone_closing = True
-            control.cancel()
+            # A transport/host drop is NOT a deliberate user cancel: preserve the
+            # captured speech and let the recorder persist it to the recovery wav
+            # so a crash mid-utterance is never lost (transcribe(latest=true) /
+            # claim_undelivered can retrieve it).
+            control.interrupt()
             # Never release the operation gate while a recorder thread may
             # still own CoreAudio. Repeated transport cancellation is ignored
             # until the hardware worker confirms closure. A wedged driver
@@ -568,7 +614,7 @@ class VoxEngine:
                 try:
                     await asyncio.shield(future)
                 except asyncio.CancelledError:
-                    control.cancel()
+                    control.interrupt()
                     continue
                 except Exception:
                     break

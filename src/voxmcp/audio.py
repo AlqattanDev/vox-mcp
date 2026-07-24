@@ -66,6 +66,11 @@ class CaptureStopReason(str, Enum):
     MAX_DURATION = "max_duration"
     MANUAL_END = "manual_end"
     CANCELLED = "cancelled"
+    # A host/transport drop (crash, session teardown) — NOT a deliberate user
+    # cancel. The captured speech is preserved and written to the recovery wav
+    # so a mid-utterance interruption is never lost, unlike CANCELLED which
+    # discards audio on purpose for privacy.
+    INTERRUPTED = "interrupted"
     SOURCE_ENDED = "source_ended"
     DEVICE_ERROR = "device_error"
 
@@ -87,9 +92,9 @@ class CaptureConfig:
     """Endpointing and persistence settings for one recording."""
 
     onset_timeout_s: float = 15.0
-    trailing_silence_s: float = 1.2
+    trailing_silence_s: float = 1.6
     min_duration_s: float = 0.5
-    max_duration_s: float = 300.0
+    max_duration_s: float = 75.0
     pre_roll_s: float = 0.3
     speech_start_s: float = 0.06
     frame_ms: int = 20
@@ -184,6 +189,7 @@ class CaptureControl:
     def __init__(self) -> None:
         self._cancel = threading.Event()
         self._manual_end = threading.Event()
+        self._interrupt = threading.Event()
 
     def cancel(self) -> None:
         """Cancel the turn and discard audio captured by this call."""
@@ -195,6 +201,15 @@ class CaptureControl:
 
         self._manual_end.set()
 
+    def interrupt(self) -> None:
+        """Stop for a host/transport drop, preserving audio for recovery.
+
+        Unlike ``cancel``, this is not a deliberate user discard: the captured
+        speech is kept and persisted so a crash mid-utterance can be recovered.
+        """
+
+        self._interrupt.set()
+
     @property
     def cancelled(self) -> bool:
         return self._cancel.is_set()
@@ -202,6 +217,10 @@ class CaptureControl:
     @property
     def manual_end_requested(self) -> bool:
         return self._manual_end.is_set()
+
+    @property
+    def interrupted(self) -> bool:
+        return self._interrupt.is_set()
 
 
 def _as_mono_float32(samples: Any) -> FloatAudio:
@@ -584,6 +603,9 @@ class AudioRecorder:
             if control.cancelled:
                 state.stop(CaptureStopReason.CANCELLED)
                 break
+            if control.interrupted:
+                state.stop(CaptureStopReason.INTERRUPTED)
+                break
             if control.manual_end_requested:
                 state.stop(CaptureStopReason.MANUAL_END)
                 break
@@ -593,6 +615,8 @@ class AudioRecorder:
         if not state.finished:
             if control.cancelled:
                 state.stop(CaptureStopReason.CANCELLED)
+            elif control.interrupted:
+                state.stop(CaptureStopReason.INTERRUPTED)
             elif control.manual_end_requested:
                 state.stop(CaptureStopReason.MANUAL_END)
             else:
@@ -664,6 +688,9 @@ class AudioRecorder:
                 while not state.finished:
                     if control.cancelled:
                         state.stop(CaptureStopReason.CANCELLED)
+                        break
+                    if control.interrupted:
+                        state.stop(CaptureStopReason.INTERRUPTED)
                         break
                     if control.manual_end_requested:
                         state.stop(CaptureStopReason.MANUAL_END)

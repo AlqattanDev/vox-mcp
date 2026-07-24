@@ -52,9 +52,9 @@ def speech_vote(samples: np.ndarray, _sample_rate: int) -> bool:
 def test_capture_config_enforces_safety_bounds() -> None:
     defaults = CaptureConfig(save_latest=False, latest_wav_path=None)
     assert defaults.onset_timeout_s == 15.0
-    assert defaults.trailing_silence_s == 1.2
+    assert defaults.trailing_silence_s == 1.6
     assert defaults.min_duration_s == 0.5
-    assert defaults.max_duration_s == 300.0
+    assert defaults.max_duration_s == 75.0
     assert defaults.pre_roll_s == 0.3
 
     with pytest.raises(ValueError, match="onset_timeout"):
@@ -226,6 +226,35 @@ def test_cancel_discards_partial_audio_but_manual_end_preserves_it() -> None:
     assert result.reason is CaptureStopReason.MANUAL_END
     assert result.speech_detected is True
     assert result.audio_duration_s == pytest.approx(0.08)
+
+
+def test_interrupt_preserves_audio_and_persists_recovery_wav(tmp_path: Path) -> None:
+    # A host/transport drop (not a deliberate user cancel) must keep the speech
+    # and write it to the recovery wav so a mid-utterance crash is recoverable.
+    recovery = tmp_path / "latest.wav"
+    interrupted = CaptureControl()
+
+    def interrupted_frames() -> Any:
+        for index in range(10):
+            if index == 4:
+                interrupted.interrupt()
+            yield frame(0.2)
+
+    recorder = AudioRecorder(
+        config(
+            speech_start_s=0.02,
+            trailing_silence_s=1.0,
+            save_latest=True,
+            latest_wav_path=recovery,
+        ),
+        speech_classifier=speech_vote,
+    )
+    result = recorder.capture_from_frames(interrupted_frames(), 1_000, control=interrupted)
+    assert result.reason is CaptureStopReason.INTERRUPTED
+    assert result.speech_detected is True
+    assert result.samples.size > 0  # unlike CANCELLED, audio is kept
+    assert result.latest_wav_path == recovery
+    assert recovery.is_file() and recovery.stat().st_size > 44
 
 
 def test_atomic_latest_wav_is_private_and_overwritten(tmp_path: Path) -> None:

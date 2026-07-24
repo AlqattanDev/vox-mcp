@@ -343,9 +343,9 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
         wait_for_response: bool = True,
         voice: str | None = None,
         speed: float | None = None,
-        listen_duration_max: float = 300.0,
+        listen_duration_max: float = 75.0,
         listen_duration_min: float = 0.5,
-        trailing_silence_s: float = 1.2,
+        trailing_silence_s: float = 1.6,
         agent: str | None = None,
     ) -> Any:
         _listen_bounds(listen_duration_max, listen_duration_min)
@@ -394,9 +394,9 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
     )
     async def listen(
         ctx: Context,
-        listen_duration_max: float = 300.0,
+        listen_duration_max: float = 75.0,
         listen_duration_min: float = 0.5,
-        trailing_silence_s: float = 1.2,
+        trailing_silence_s: float = 1.6,
         language: str | None = None,
         agent: str | None = None,
     ) -> Any:
