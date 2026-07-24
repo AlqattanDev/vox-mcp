@@ -80,9 +80,11 @@ Tests: `.venv/bin/python -m pytest tests/` — **197 passing**.
 agent's last reply aloud (no mic); `/listen` opens the mic for one utterance
 without arming a persistent session.
 
-**After menu-bar changes, rebuild + reinstall the app** (the runtime restarts):
-`zsh scripts/build_macos_app.sh` then the install step. The Python runtime
-changes take effect on the next `com.vox.runtime` restart.
+**Deploy after any change:** `zsh scripts/install_macos_app.sh`. It builds,
+installs to `~/Applications/Vox.app` **cleanly** (removes the old app first —
+`cp -R` into an existing dir nests the app and leaves launchd running the stale
+binary), guards against nesting, and restarts `com.vox.runtime`. The editable
+Python runtime picks up code changes on that restart.
 
 ## Wired agents
 
