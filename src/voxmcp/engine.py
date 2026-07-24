@@ -48,6 +48,32 @@ from .storage import AudioStore
 
 IO_MODES = ("talk", "narrate", "dictate")
 
+_SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?…])\s+")
+
+
+def split_for_tts(text: str, *, min_chunk: int = 60, min_total: int = 140) -> list[str]:
+    """Split a reply into sentence spans for streamed speech.
+
+    Short replies stay whole (nothing to gain, and one clip is cleaner). Longer
+    replies split only on real sentence boundaries — never mid-sentence — and
+    fragments shorter than ``min_chunk`` fold into the previous span so the
+    audio never sounds choppy. A single long run-on sentence returns as one span.
+    """
+
+    stripped = text.strip()
+    if len(stripped) < min_total:
+        return [stripped]
+    chunks: list[str] = []
+    for part in _SENTENCE_BOUNDARY.split(stripped):
+        part = part.strip()
+        if not part:
+            continue
+        if chunks and len(chunks[-1]) < min_chunk:
+            chunks[-1] = f"{chunks[-1]} {part}"
+        else:
+            chunks.append(part)
+    return chunks or [stripped]
+
 
 def _default_home() -> Path:
     return Path(os.environ.get("VOX_HOME", "~/.vox")).expanduser()
@@ -98,6 +124,12 @@ class VoxEngine:
         self.volume = min(1.0, max(0.0, float(os.environ.get("VOX_VOLUME", "1"))))
         self._earcons_enabled = earcons_enabled()
         self._earcon_paths: tuple[Path, Path] | None = None
+        self._stream_tts = os.environ.get("VOX_STREAM_TTS", "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
 
         self._active_lock = threading.RLock()
         self._active_task: asyncio.Task[Any] | None = None
@@ -484,19 +516,45 @@ class VoxEngine:
             pass
         self.state.begin_speaking(client_id=client_id)
         self._log("tts.started", client_id=client_id, chars=len(message))
+
+        chunks = split_for_tts(message) if self._stream_tts else [message]
+        if len(chunks) <= 1:
+            return await self._speak_single(
+                client_id, message, voice=voice, speed=speed,
+                instructions=instructions, interruptible=interruptible,
+            )
+        return await self._speak_streaming(
+            client_id, chunks, voice=voice, speed=speed,
+            instructions=instructions, interruptible=interruptible,
+        )
+
+    async def _render_tts(
+        self,
+        text: str,
+        *,
+        voice: str | None,
+        speed: float,
+        instructions: str | None,
+    ) -> tuple[Path, SpeechResult]:
+        """Synthesize one span, fall back to the OS voice, and commit it."""
+
         destination = self.store.new_work_path("tts")
         try:
-            speech_result = await self.speech.synthesize(
-                message,
+            result = await self.speech.synthesize(
+                text,
                 destination,
                 voice=(voice or self.default_voice).lower(),
                 speed=speed,
                 instructions=instructions,
             )
         except ServiceUnavailableError:
-            speech_result = await synthesize_with_macos_say(message, destination)
+            result = await synthesize_with_macos_say(text, destination)
+        replay_path = self.store.commit_tts(Path(result.path or destination))
+        return replay_path, result
 
-        replay_path = self.store.commit_tts(Path(speech_result.path or destination))
+    async def _play_and_wait(self, replay_path: Path, *, interruptible: bool) -> bool:
+        """Play one committed clip; return True if it finished, False if cancelled."""
+
         handle = self.player.play_file(replay_path, volume=self.volume, blocking=False)
         with self._active_lock:
             self._playback = handle
@@ -506,26 +564,111 @@ class VoxEngine:
             cancelled = self._cancel_requested
             self._playback = None
             self._playback_interruptible = True
-        if cancelled or return_code < 0:
+        return not (cancelled or return_code < 0)
+
+    async def _speak_single(
+        self,
+        client_id: str,
+        message: str,
+        *,
+        voice: str | None,
+        speed: float,
+        instructions: str | None,
+        interruptible: bool,
+    ) -> dict[str, Any]:
+        replay_path, result = await self._render_tts(
+            message, voice=voice, speed=speed, instructions=instructions
+        )
+        if not await self._play_and_wait(replay_path, interruptible=interruptible):
+            self._return_idle_if_active()
+            return {"status": "cancelled", "backend": result.backend, "elapsed_ms": result.elapsed_ms}
+        self.state.complete_turn(client_id=client_id)
+        self._log(
+            "tts.completed",
+            client_id=client_id,
+            backend=result.backend,
+            elapsed_ms=result.elapsed_ms,
+        )
+        return {
+            "status": "completed",
+            "backend": result.backend,
+            "fallback": result.fallback,
+            "elapsed_ms": result.elapsed_ms,
+            "audio_path": str(replay_path),
+        }
+
+    async def _speak_streaming(
+        self,
+        client_id: str,
+        chunks: list[str],
+        *,
+        voice: str | None,
+        speed: float,
+        instructions: str | None,
+        interruptible: bool,
+    ) -> dict[str, Any]:
+        """Speak sentence-by-sentence so playback starts after the first span.
+
+        The next span synthesizes while the current one plays, so time-to-first
+        audio is synth(first sentence) instead of synth(whole response).
+        """
+
+        first_backend: str | None = None
+        first_replay: Path | None = None
+        fallback_any = False
+        elapsed_ms = 0
+        cancelled = False
+        pending: asyncio.Task[tuple[Path, SpeechResult]] | None = asyncio.create_task(
+            self._render_tts(chunks[0], voice=voice, speed=speed, instructions=instructions)
+        )
+        for index in range(len(chunks)):
+            assert pending is not None
+            try:
+                replay_path, result = await pending
+            except asyncio.CancelledError:
+                cancelled = True
+                break
+            if first_backend is None:
+                first_backend, first_replay = result.backend, replay_path
+            fallback_any = fallback_any or result.fallback
+            elapsed_ms += result.elapsed_ms
+            # Start the next span synthesizing before we block on this playback.
+            pending = (
+                asyncio.create_task(
+                    self._render_tts(
+                        chunks[index + 1], voice=voice, speed=speed, instructions=instructions
+                    )
+                )
+                if index + 1 < len(chunks)
+                else None
+            )
+            if not await self._play_and_wait(replay_path, interruptible=interruptible):
+                cancelled = True
+                if pending is not None:
+                    pending.cancel()
+                    await asyncio.gather(pending, return_exceptions=True)
+                break
+        if cancelled:
             self._return_idle_if_active()
             return {
                 "status": "cancelled",
-                "backend": speech_result.backend,
-                "elapsed_ms": speech_result.elapsed_ms,
+                "backend": first_backend or "kokoro",
+                "elapsed_ms": elapsed_ms,
             }
         self.state.complete_turn(client_id=client_id)
         self._log(
             "tts.completed",
             client_id=client_id,
-            backend=speech_result.backend,
-            elapsed_ms=speech_result.elapsed_ms,
+            backend=first_backend,
+            elapsed_ms=elapsed_ms,
+            chunks=len(chunks),
         )
         return {
             "status": "completed",
-            "backend": speech_result.backend,
-            "fallback": speech_result.fallback,
-            "elapsed_ms": speech_result.elapsed_ms,
-            "audio_path": str(replay_path),
+            "backend": first_backend,
+            "fallback": fallback_any,
+            "elapsed_ms": elapsed_ms,
+            "audio_path": str(first_replay) if first_replay is not None else None,
         }
 
     def _earcon_files(self) -> tuple[Path, Path] | None:

@@ -634,3 +634,67 @@ async def test_host_cancel_after_stt_returns_transcript(tmp_path: Path):
     assert result["delivered_via"] == "cancel_recovery"
     assert result["transcript"] == "recovered speech"
     assert engine.last_heard.undelivered() is None
+
+
+def test_split_for_tts_streams_sentences_but_keeps_short_and_runon_whole() -> None:
+    from voxmcp.engine import split_for_tts
+
+    # Short replies stay whole — nothing to stream.
+    assert split_for_tts("Done.") == ["Done."]
+
+    # A long multi-sentence reply splits on sentence boundaries.
+    long_reply = (
+        "The endpointing is fixed now and the mic no longer cuts you off. "
+        "I also added the earcons you asked for so you hear the window open. "
+        "The status bar shows a red mic only when it is truly listening."
+    )
+    chunks = split_for_tts(long_reply)
+    assert len(chunks) == 3
+    assert chunks[0].startswith("The endpointing")
+    assert "".join(chunks).replace(" ", "") == long_reply.replace(" ", "")
+
+    # A single long run-on sentence is never split mid-sentence.
+    runon = "yeah " * 60
+    assert split_for_tts(runon) == [runon.strip()]
+
+
+class CountingSpeech(FakeSpeech):
+    def __init__(self) -> None:
+        self.spans: list[str] = []
+
+    async def synthesize(self, text, destination, **kwargs):
+        self.spans.append(text)
+        return await super().synthesize(text, destination, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_speak_streams_each_sentence_and_completes(tmp_path: Path):
+    engine = make_engine(tmp_path)
+    counting = CountingSpeech()
+    engine.speech = counting
+    long_reply = (
+        "The endpointing is fixed now and the mic no longer cuts you off. "
+        "I also added the earcons you asked for so you hear the window open. "
+        "The status bar shows a red mic only when it is truly listening."
+    )
+    result = await engine.speak("claude", long_reply)
+    assert result["status"] == "completed"
+    assert result["audio_path"] is not None
+    # Each sentence was synthesized and played as its own streamed span.
+    assert len(counting.spans) == 3
+
+
+@pytest.mark.asyncio
+async def test_speak_streaming_disabled_synthesizes_once(tmp_path: Path):
+    engine = make_engine(tmp_path)
+    engine._stream_tts = False
+    counting = CountingSpeech()
+    engine.speech = counting
+    long_reply = (
+        "The endpointing is fixed now and the mic no longer cuts you off. "
+        "I also added the earcons you asked for so you hear the window open. "
+        "The status bar shows a red mic only when it is truly listening."
+    )
+    result = await engine.speak("claude", long_reply)
+    assert result["status"] == "completed"
+    assert len(counting.spans) == 1
