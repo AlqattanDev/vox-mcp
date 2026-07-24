@@ -2,28 +2,77 @@ import AppKit
 import AVFoundation
 import Foundation
 
+/// A live scrolling waveform of the microphone level. Fed one 0..1 sample per
+/// status poll; it keeps a short rolling history and draws it as centred bars,
+/// so the panel visibly reacts to your voice instead of showing dead text.
+final class LevelMeterView: NSView {
+    private var history: [CGFloat] = Array(repeating: 0, count: 34)
+    /// Whether the mic is live. Idle draws a calm baseline in a muted colour;
+    /// active draws in the system accent so it reads as "hearing you."
+    var active = false { didSet { needsDisplay = true } }
+
+    override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: 30) }
+    override var isFlipped: Bool { false }
+
+    /// Push the newest loudness sample and scroll the waveform left.
+    func push(_ level: CGFloat) {
+        let clamped = max(0, min(1, level))
+        history.removeFirst()
+        history.append(clamped)
+        needsDisplay = true
+    }
+
+    /// Flatten the waveform (used when the mic closes) without a jarring jump.
+    func settle() {
+        history = history.map { $0 * 0.5 }
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let count = history.count
+        guard count > 0, bounds.width > 0 else { return }
+        let gap: CGFloat = 3
+        let barWidth = max(2, (bounds.width - gap * CGFloat(count - 1)) / CGFloat(count))
+        let midY = bounds.midY
+        let maxHalf = bounds.height / 2 - 1
+        let color = active ? NSColor.controlAccentColor : NSColor.tertiaryLabelColor
+        color.setFill()
+        for (index, sample) in history.enumerated() {
+            // A small floor keeps a visible resting waveform instead of a blank
+            // strip; real signal lifts the bars well above it.
+            let half = max(1.5, sample * maxHalf)
+            let x = CGFloat(index) * (barWidth + gap)
+            let rect = NSRect(x: x, y: midY - half, width: barWidth, height: half * 2)
+            NSBezierPath(roundedRect: rect, xRadius: barWidth / 2, yRadius: barWidth / 2).fill()
+        }
+    }
+}
+
 /// The menu-bar companion is deliberately a session controller, not a hidden
 /// always-listening recorder. A click opens this panel; the microphone only
 /// opens when an MCP conversation explicitly starts a bounded listen.
-final class VoxAppDelegate: NSObject, NSApplicationDelegate {
+final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let popover = NSPopover()
     private let panelController = NSViewController()
 
-    private let stateLabel = NSTextField(labelWithString: "Starting Vox…")
+    private let statusDot = NSView()
+    private let heroNameLabel = NSTextField(labelWithString: "Vox")
+    private let stateBadgeLabel = NSTextField(labelWithString: "Starting")
+    private let meterView = LevelMeterView()
     private let detailLabel = NSTextField(wrappingLabelWithString: "Waiting for the local runtime")
-    private let microphoneLabel = NSTextField(labelWithString: "Microphone: checking")
-    private let modeLabel = NSTextField(labelWithString: "Mode: Talk")
-    private let talkButton = NSButton(title: "Talk", target: nil, action: nil)
-    private let narrateButton = NSButton(title: "Narrate", target: nil, action: nil)
-    private let dictateButton = NSButton(title: "Dictate", target: nil, action: nil)
-    private let noteButton = NSButton(title: "Speak a note to the agent", target: nil, action: nil)
-    private let endTurnButton = NSButton(title: "Stop listening", target: nil, action: nil)
-    private let repeatButton = NSButton(title: "Repeat last speech", target: nil, action: nil)
+    private let modeControl = NSSegmentedControl(
+        labels: ["Talk", "Narrate", "Dictate"],
+        trackingMode: .selectOne,
+        target: nil,
+        action: nil
+    )
+    private let primaryButton = NSButton(title: "Leave a note", target: nil, action: nil)
+    private let repeatButton = NSButton(title: "Repeat", target: nil, action: nil)
     private let moreButton = NSButton(title: "More…", target: nil, action: nil)
-    private var notePending = false
     private var agents: [String] = []
     private var notesWaiting: [String] = []
+    private var micLevel: CGFloat = 0
 
     private var runtime: Process?
     private var timer: Timer?
@@ -48,6 +97,15 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
         button.action = #selector(statusItemClicked)
         button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         button.toolTip = "Vox — click to stop listening when the mic is live; right-click for controls"
+        // Re-bake the glyph colour whenever the system switches light/dark, read
+        // from the authoritative AppleInterfaceStyle change broadcast (the app's
+        // own effectiveAppearance is unreliable for an accessory app on Tahoe).
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(systemAppearanceChanged),
+            name: NSNotification.Name("AppleInterfaceThemeChangedNotification"),
+            object: nil
+        )
         updatePresentation()
 
         requestMicrophonePermission(startRuntimeAfterward: true)
@@ -81,62 +139,87 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         quitting = true
         timer?.invalidate()
+        DistributedNotificationCenter.default().removeObserver(self)
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         stopChildRuntime()
     }
 
+    @objc private func systemAppearanceChanged() {
+        DispatchQueue.main.async { [weak self] in self?.updatePresentation() }
+    }
+
+    // While the panel is open, poll fast enough that the waveform reads as live;
+    // when it closes, drop back to the lighter glyph-tracking cadence.
+    private func setPollInterval(_ interval: TimeInterval) {
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            self?.refreshStatus()
+        }
+    }
+
     private func configurePanel() {
-        let root = NSView(frame: NSRect(x: 0, y: 0, width: 350, height: 0))
+        let contentWidth: CGFloat = 288
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: contentWidth + 28, height: 0))
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 10
+        stack.spacing = 12
         stack.translatesAutoresizingMaskIntoConstraints = false
 
-        stateLabel.font = NSFont.systemFont(ofSize: 15, weight: .semibold)
+        // Hero row: a state dot, the product name, and a right-aligned state word.
+        statusDot.translatesAutoresizingMaskIntoConstraints = false
+        statusDot.wantsLayer = true
+        statusDot.layer?.cornerRadius = 4
+        heroNameLabel.font = NSFont.systemFont(ofSize: 15, weight: .bold)
+        stateBadgeLabel.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        stateBadgeLabel.textColor = .secondaryLabelColor
+        let heroSpacer = NSView()
+        heroSpacer.translatesAutoresizingMaskIntoConstraints = false
+        let heroRow = NSStackView(views: [statusDot, heroNameLabel, heroSpacer, stateBadgeLabel])
+        heroRow.orientation = .horizontal
+        heroRow.alignment = .centerY
+        heroRow.spacing = 8
+        heroRow.translatesAutoresizingMaskIntoConstraints = false
+        heroSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        meterView.translatesAutoresizingMaskIntoConstraints = false
+
         detailLabel.font = NSFont.systemFont(ofSize: 12)
         detailLabel.textColor = .secondaryLabelColor
-        detailLabel.maximumNumberOfLines = 3
-        microphoneLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
-        modeLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        detailLabel.maximumNumberOfLines = 2
 
-        let modeButtons = [talkButton, narrateButton, dictateButton]
-        for (index, button) in modeButtons.enumerated() {
+        modeControl.segmentDistribution = .fillEqually
+        modeControl.translatesAutoresizingMaskIntoConstraints = false
+        modeControl.target = self
+        modeControl.action = #selector(modeChanged)
+
+        primaryButton.target = self
+        primaryButton.bezelStyle = .rounded
+        primaryButton.controlSize = .large
+        primaryButton.translatesAutoresizingMaskIntoConstraints = false
+
+        for button in [repeatButton, moreButton] {
             button.target = self
             button.bezelStyle = .rounded
-            button.setButtonType(.pushOnPushOff)
-            button.tag = index
-            button.action = #selector(selectModeButton(_:))
+            button.controlSize = .regular
+            button.translatesAutoresizingMaskIntoConstraints = false
         }
-        for button in [noteButton, endTurnButton, repeatButton, moreButton] {
-            button.target = self
-            button.bezelStyle = .rounded
-        }
-        noteButton.action = #selector(leaveNote)
-        endTurnButton.action = #selector(endTurn)
+        repeatButton.image = NSImage(systemSymbolName: "arrow.counterclockwise", accessibilityDescription: "Repeat")
+        repeatButton.imagePosition = .imageLeading
         repeatButton.action = #selector(repeatLast)
         moreButton.action = #selector(showMoreMenu)
+        let footer = NSStackView(views: [repeatButton, moreButton])
+        footer.orientation = .horizontal
+        footer.distribution = .fillEqually
+        footer.spacing = 8
+        footer.translatesAutoresizingMaskIntoConstraints = false
 
-        let modeRow = NSStackView(views: modeButtons)
-        modeRow.orientation = .horizontal
-        modeRow.distribution = .fillEqually
-        modeRow.spacing = 6
-        modeRow.translatesAutoresizingMaskIntoConstraints = false
-
-        let divider = NSBox()
-        divider.boxType = .separator
-        divider.translatesAutoresizingMaskIntoConstraints = false
-
-        stack.addArrangedSubview(stateLabel)
+        stack.addArrangedSubview(heroRow)
+        stack.addArrangedSubview(meterView)
         stack.addArrangedSubview(detailLabel)
-        stack.addArrangedSubview(microphoneLabel)
-        stack.addArrangedSubview(modeLabel)
-        stack.addArrangedSubview(modeRow)
-        stack.addArrangedSubview(divider)
-        stack.addArrangedSubview(noteButton)
-        stack.addArrangedSubview(endTurnButton)
-        stack.addArrangedSubview(repeatButton)
-        stack.addArrangedSubview(moreButton)
+        stack.addArrangedSubview(modeControl)
+        stack.addArrangedSubview(primaryButton)
+        stack.addArrangedSubview(footer)
 
         root.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -144,20 +227,28 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
             stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -14),
             stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 14),
             stack.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -14),
-            detailLabel.widthAnchor.constraint(equalToConstant: 322),
-            microphoneLabel.widthAnchor.constraint(equalTo: detailLabel.widthAnchor),
-            modeLabel.widthAnchor.constraint(equalTo: detailLabel.widthAnchor),
-            modeRow.widthAnchor.constraint(equalTo: detailLabel.widthAnchor),
-            divider.widthAnchor.constraint(equalTo: detailLabel.widthAnchor),
-            noteButton.widthAnchor.constraint(equalTo: detailLabel.widthAnchor),
-            endTurnButton.widthAnchor.constraint(equalTo: detailLabel.widthAnchor),
-            repeatButton.widthAnchor.constraint(equalTo: detailLabel.widthAnchor),
-            moreButton.widthAnchor.constraint(equalTo: detailLabel.widthAnchor),
+            statusDot.widthAnchor.constraint(equalToConstant: 8),
+            statusDot.heightAnchor.constraint(equalToConstant: 8),
+            heroRow.widthAnchor.constraint(equalToConstant: contentWidth),
+            meterView.widthAnchor.constraint(equalTo: heroRow.widthAnchor),
+            meterView.heightAnchor.constraint(equalToConstant: 30),
+            detailLabel.widthAnchor.constraint(equalTo: heroRow.widthAnchor),
+            modeControl.widthAnchor.constraint(equalTo: heroRow.widthAnchor),
+            primaryButton.widthAnchor.constraint(equalTo: heroRow.widthAnchor),
+            footer.widthAnchor.constraint(equalTo: heroRow.widthAnchor),
         ])
         panelController.view = root
         popover.contentViewController = panelController
         popover.behavior = .transient
         popover.animates = true
+        popover.delegate = self
+    }
+
+    // Clicking outside dismisses a transient popover without routing through
+    // togglePanel; drop back to the light poll cadence here so the fast
+    // waveform polling never keeps running with the panel closed.
+    func popoverDidClose(_ notification: Notification) {
+        setPollInterval(0.4)
     }
 
     // A left-click while the mic is live ends the turn immediately — the fix for
@@ -179,9 +270,11 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
         guard let button = statusItem.button else { return }
         if popover.isShown {
             popover.performClose(nil)
+            setPollInterval(0.4)
         } else {
             updatePresentation()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            setPollInterval(0.08)
             refreshStatus()
         }
     }
@@ -323,15 +416,12 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
                 }
                 self.state = (payload["state"] as? String) ?? (payload["status"] as? String) ?? "online"
                 self.microphoneOpen = (payload["microphone_open"] as? Bool) ?? false
+                self.micLevel = CGFloat((payload["mic_level"] as? Double) ?? 0)
                 self.detail = (payload["detail"] as? String) ?? "Local-only runtime connected"
                 self.lastStopReason = payload["last_stop_reason"] as? String
                 self.ioMode = (payload["io_mode"] as? String) ?? self.ioMode
-                if let undelivered = payload["undelivered_heard"] as? [String: Any] {
-                    self.notePending = (undelivered["present"] as? Bool) ?? false
-                }
                 self.agents = (payload["agents"] as? [String]) ?? self.agents
                 self.notesWaiting = (payload["notes_waiting"] as? [String]) ?? []
-                self.notePending = !self.notesWaiting.isEmpty
                 self.updatePresentation()
             }
         }.resume()
@@ -356,34 +446,120 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
             ? "Mic is LIVE — click to stop listening. \(panelDetail())"
             : panelDetail()
 
-        stateLabel.stringValue = title
-        detailLabel.stringValue = panelDetail()
-        microphoneLabel.stringValue = microphoneOpen
-            ? "Microphone: listening now"
-            : "Microphone: closed — never records in the background"
-        modeLabel.stringValue = "Mode: \(modeTitle(ioMode)) — Talk both · Narrate agent only · Dictate you only"
-
-        // Mode buttons: the active one stays pushed in; one tap switches.
-        let currentMode = ioMode.lowercased()
-        for (button, mode) in [(talkButton, "talk"), (narrateButton, "narrate"), (dictateButton, "dictate")] {
-            button.state = currentMode == mode ? .on : .off
-            button.isEnabled = !controlInFlight && normalized != "offline"
+        // Hero row: a coloured dot + one state word instead of a wall of labels.
+        let badge: String
+        let accent: NSColor
+        if microphoneOpen {
+            badge = "Listening"; accent = .systemRed
+        } else {
+            switch normalized {
+            case "speaking": badge = "Speaking"; accent = .systemBlue
+            case "processing": badge = "Thinking"; accent = .systemBlue
+            case "paused": badge = "Paused"; accent = .systemOrange
+            case "idle": badge = "Ready"; accent = .systemGreen
+            case "off": badge = "Off"; accent = .tertiaryLabelColor
+            case "offline", "error": badge = "Offline"; accent = .systemRed
+            default: badge = "Starting"; accent = .systemGray
+            }
         }
-        // Leave a note only when the session is idle (mic free) — the gate would
-        // otherwise queue it behind whatever the agent is doing.
-        noteButton.isEnabled = !controlInFlight && normalized == "idle"
-        endTurnButton.title = microphoneOpen ? "Stop listening — keep what I said" : "Stop listening"
-        endTurnButton.isEnabled = !controlInFlight && normalized == "listening"
-        // Replay the agent's last clip — for when you missed it. The runtime
-        // no-ops if there is nothing to replay yet.
+        statusDot.layer?.backgroundColor = accent.cgColor
+        stateBadgeLabel.stringValue = badge
+        stateBadgeLabel.textColor = microphoneOpen ? .systemRed : .secondaryLabelColor
+
+        // Live waveform: reacts to the real mic level while listening; settles
+        // to a calm baseline the instant the mic closes.
+        meterView.active = microphoneOpen
+        if microphoneOpen {
+            meterView.push(micLevel)
+        } else {
+            meterView.settle()
+        }
+
+        detailLabel.stringValue = meterCaption(normalized)
+
+        // Modes as one native segmented control; the active segment is selected.
+        modeControl.selectedSegment = ["talk", "narrate", "dictate"].firstIndex(of: ioMode.lowercased()) ?? 0
+        modeControl.isEnabled = !controlInFlight && normalized != "offline"
+
+        applyPrimaryButton(normalized: normalized)
         repeatButton.isEnabled = !controlInFlight && !["offline", "off"].contains(normalized)
         moreButton.isEnabled = !controlInFlight
     }
 
-    // The menu-bar item is a glanceable glyph, not a wordy string. It shows a
-    // red mic ONLY when the microphone is genuinely capturing (driven by the
-    // runtime's microphone_open truth, never by stale session state), which is
-    // the whole fix for "it always looks like it's listening."
+    // A short, human caption under the waveform — what Vox is doing right now,
+    // not a paragraph. Falls back to the runtime detail for errors/notices.
+    private func meterCaption(_ normalized: String) -> String {
+        if let actionNotice { return actionNotice }
+        if !notesWaiting.isEmpty {
+            let targets = notesWaiting.map { $0 == "*" ? "any agent" : $0 }.joined(separator: ", ")
+            return "Note waiting for \(targets)"
+        }
+        if microphoneOpen { return "Hearing you…" }
+        switch normalized {
+        case "speaking": return "Speaking…"
+        case "processing": return "Thinking…"
+        case "paused": return "Paused — mic closed"
+        case "idle": return "Ready · mic off · \(modeTitle(ioMode))"
+        case "off": return state.lowercased() == "off" && lastStopReason == "idle_timeout"
+            ? "Stopped after 10 idle minutes" : "Vox is off"
+        case "offline", "error": return detail
+        default: return detail
+        }
+    }
+
+    // One contextual primary action instead of a stack of always-visible
+    // buttons: Stop when the mic is hot, start/resume when Vox is down, and
+    // Leave a note when it is idle and free to take one.
+    private func applyPrimaryButton(normalized: String) {
+        let symbol: String
+        let text: String
+        let color: NSColor
+        let selector: Selector
+        var enabled = !controlInFlight
+        if microphoneOpen {
+            symbol = "stop.fill"; text = "Stop listening"; color = .systemRed
+            selector = #selector(endTurn)
+        } else {
+            switch normalized {
+            case "off", "offline", "error":
+                symbol = "power"; text = "Turn Vox on"; color = .controlAccentColor
+                selector = #selector(toggleSession)
+            case "paused":
+                symbol = "play.fill"; text = "Resume Vox"; color = .controlAccentColor
+                selector = #selector(toggleSession)
+            default:
+                symbol = "square.and.pencil"; text = "Leave a note"; color = .controlAccentColor
+                selector = #selector(leaveNote)
+                // A note needs the mic free; only offer it when Vox is idle.
+                enabled = enabled && normalized == "idle"
+            }
+        }
+        primaryButton.action = selector
+        primaryButton.bezelColor = color
+        primaryButton.image = NSImage(systemSymbolName: symbol, accessibilityDescription: text)
+        primaryButton.imagePosition = .imageLeading
+        primaryButton.attributedTitle = NSAttributedString(
+            string: text,
+            attributes: [
+                .foregroundColor: NSColor.white,
+                .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
+            ]
+        )
+        primaryButton.contentTintColor = .white
+        primaryButton.isEnabled = enabled
+    }
+
+    // The menu-bar glyph shows a red mic ONLY when the microphone is genuinely
+    // capturing (driven by the runtime's microphone_open truth, never stale
+    // session state).
+    //
+    // The colour is BAKED INTO THE IMAGE PIXELS (a non-template, palette-tinted
+    // symbol) rather than left to the system to tint. On macOS Tahoe an
+    // accessory (LSUIElement) app's effectiveAppearance can resolve to Aqua
+    // even in Dark mode, so both template auto-tint and contentTintColor paint
+    // the glyph black and it vanishes on the dark menu bar. We read the real
+    // system setting (AppleInterfaceStyle) and colour the pixels ourselves, so
+    // nothing downstream can re-tint it wrong.
     private func applyStatusGlyph(normalized: String, title: String) {
         guard let button = statusItem.button else { return }
         let symbol: String
@@ -400,10 +576,16 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
             default: symbol = "waveform.circle"
             }
         }
+        let darkMenuBar = UserDefaults.standard.string(forKey: "AppleInterfaceStyle")?
+            .lowercased() == "dark"
+        let glyphColor: NSColor = microphoneOpen
+            ? .systemRed
+            : (darkMenuBar ? .white : .black)
         let config = NSImage.SymbolConfiguration(pointSize: 15, weight: .semibold)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [glyphColor]))
         let image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)?
             .withSymbolConfiguration(config)
-        image?.isTemplate = true
+        image?.isTemplate = false
         if let image {
             button.image = image
             button.imagePosition = .imageOnly
@@ -413,9 +595,7 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
             button.image = nil
             button.title = title
         }
-        // Template images adopt this tint; nil lets the menu bar pick its own
-        // adaptive color so idle/closed states never read as "hot."
-        button.contentTintColor = microphoneOpen ? NSColor.systemRed : nil
+        button.contentTintColor = nil
     }
 
     private func modeTitle(_ mode: String) -> String {
@@ -495,8 +675,8 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc private func selectModeButton(_ sender: NSButton) {
-        let mode = ["talk", "narrate", "dictate"][max(0, min(2, sender.tag))]
+    @objc private func modeChanged() {
+        let mode = ["talk", "narrate", "dictate"][max(0, min(2, modeControl.selectedSegment))]
         sendControl("set_mode", notice: "Switching to \(modeTitle(mode))…", extra: ["mode": mode])
     }
 
@@ -534,9 +714,9 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
         any.target = self
         menu.addItem(any)
         if let event = NSApp.currentEvent {
-            NSMenu.popUpContextMenu(menu, with: event, for: noteButton)
+            NSMenu.popUpContextMenu(menu, with: event, for: primaryButton)
         } else {
-            menu.popUp(positioning: nil, at: NSPoint(x: 0, y: noteButton.bounds.height), in: noteButton)
+            menu.popUp(positioning: nil, at: NSPoint(x: 0, y: primaryButton.bounds.height), in: primaryButton)
         }
     }
 

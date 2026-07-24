@@ -44,16 +44,24 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
 - **IO modes.** `talk` (default, both) · `narrate` (agent speaks, no mic) ·
   `dictate` (listen only, TTS skipped). Panel cycles; `voice_session`
   `set_mode` / `cycle_mode`; persisted in `~/.vox/state/io_mode`.
-- **Menu bar (adaptive).** A glanceable SF Symbol glyph, not a text string:
-  a **red mic only when `microphone_open` is truly set** (never off stale
-  session state), so idle/speaking never read as "hot." **Left-click while the
-  mic is live ends the turn**; right-click / mic-closed click opens the panel.
-  Polls every 0.4s so the glyph never lags.
-- **Decluttered panel.** Mode is three buttons (Talk / Narrate / Dictate, active
-  one pushed in). One turn action: **Stop listening**. **Repeat last speech**
-  replays the agent's last clip. The old Stop / Start / Resume / Pause / Cancel
-  pile-up collapsed to one contextual **Turn Vox off/on** in **More…**, with
-  **Restart Vox** as the sole recovery. Sleep/inactivity auto-pause unchanged.
+- **Menu bar glyph (baked colour).** A glanceable SF Symbol: a **red mic only
+  when `microphone_open` is truly set**, so idle/speaking never read as "hot."
+  **Left-click while the mic is live ends the turn**; right-click / mic-closed
+  click opens the panel. The glyph colour is **painted into the image pixels**
+  (non-template, palette-tinted from `AppleInterfaceStyle`), not left to the
+  system to tint — on macOS Tahoe an accessory app's `effectiveAppearance`
+  resolves to Aqua even in Dark mode, so template auto-tint *and*
+  `contentTintColor` both paint it black and it vanishes on the dark bar. Re-baked
+  on the `AppleInterfaceThemeChangedNotification` light/dark switch.
+- **Premium panel (state-driven).** A **hero row** (state dot + "Vox" + one state
+  word) over a **live waveform** (`LevelMeterView`) that reacts to your real mic
+  level — the runtime reports `mic_level` (0..1, derived from capture dBFS) over
+  `/health`, and the panel polls at 0.08s while open (0.4s closed) so the bars
+  move as you speak. Modes are one **segmented control** (Talk / Narrate /
+  Dictate). **One contextual primary button**: *Stop listening* (red) when the
+  mic is hot, *Turn Vox on* / *Resume Vox* when it's down, *Leave a note* when
+  idle. Repeat + More… shrink to a small footer. `More…` holds the
+  Turn-off/Restart/Open-folder controls. Sleep/inactivity auto-pause unchanged.
 - **Addressed notes (`note` control / panel button).** Speak one utterance
   without waiting for an agent to open the mic. The button first pops an agent
   picker (each agent = a project/voice); the note is **addressed to that agent**
@@ -78,7 +86,7 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
 | `com.vox.runtime` | ~73 MB | ~73 MB |
 | **total** | **~2.7 GB** | **~3.2 GB** |
 
-Tests: `.venv/bin/python -m pytest tests/` — **197 passing**.
+Tests: `.venv/bin/python -m pytest tests/` — **203 passing**.
 
 **Slash commands** (in `~/.claude/commands/`, global): `/speak` reads the
 agent's last reply aloud (no mic); `/listen` opens the mic for one utterance

@@ -1637,6 +1637,12 @@ class VoxEngine:
         status = await self.status()
         session = status["session"]
         undelivered = status.get("undelivered_heard") or {"present": False}
+        with self._active_lock:
+            mic_active = self._microphone_active
+            control = self._capture_control
+        # Live loudness for the menu-bar waveform; 0 whenever the mic is closed
+        # so a stale value can never make the meter look like it is hearing you.
+        mic_level = control.level if (mic_active and control is not None) else 0.0
         return {
             "status": "ok",
             "state": status["state"],
@@ -1644,6 +1650,7 @@ class VoxEngine:
             "version": "0.1.0",
             "local_only": True,
             "microphone_open": session["microphone_open"],
+            "mic_level": round(mic_level, 3),
             # Kept deliberately compact and transcript-free for the native
             # status panel. This makes an automatic idle stop explainable
             # instead of looking like a crash.

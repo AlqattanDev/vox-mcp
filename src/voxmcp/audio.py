@@ -190,6 +190,28 @@ class CaptureControl:
         self._cancel = threading.Event()
         self._manual_end = threading.Event()
         self._interrupt = threading.Event()
+        self._level = 0.0
+        self._level_lock = threading.Lock()
+
+    def publish_level(self, dbfs: float) -> None:
+        """Record the latest frame loudness for the menu-bar meter.
+
+        dBFS runs from near-silence (~-96) to full-scale (0); speech sits
+        around -30..-10.  Map it to a 0..1 value where -60 dBFS reads as a
+        flat baseline so the waveform only lifts when there is real signal.
+        """
+
+        level = (dbfs + 60.0) / 60.0
+        level = 0.0 if level < 0.0 else 1.0 if level > 1.0 else level
+        with self._level_lock:
+            self._level = level
+
+    @property
+    def level(self) -> float:
+        """The latest 0..1 mic loudness published by the capture loop."""
+
+        with self._level_lock:
+            return self._level
 
     def cancel(self) -> None:
         """Cancel the turn and discard audio captured by this call."""
@@ -609,7 +631,7 @@ class AudioRecorder:
             if control.manual_end_requested:
                 state.stop(CaptureStopReason.MANUAL_END)
                 break
-            state.feed(frame)
+            control.publish_level(state.feed(frame).dbfs)
             if state.finished:
                 break
         if not state.finished:
@@ -718,6 +740,7 @@ class AudioRecorder:
                         state.stop(CaptureStopReason.DEVICE_ERROR)
                         break
                     decision = state.feed(item)
+                    control.publish_level(decision.dbfs)
                     if decision.speech_started:
                         speech_started_at = self._clock()
         except Exception as exc:

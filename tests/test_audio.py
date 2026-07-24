@@ -228,6 +228,36 @@ def test_cancel_discards_partial_audio_but_manual_end_preserves_it() -> None:
     assert result.audio_duration_s == pytest.approx(0.08)
 
 
+def test_publish_level_maps_dbfs_to_meter_range() -> None:
+    control = CaptureControl()
+    assert control.level == 0.0
+    control.publish_level(-96.0)  # silence floor
+    assert control.level == 0.0
+    control.publish_level(0.0)  # full scale
+    assert control.level == pytest.approx(1.0)
+    control.publish_level(-30.0)  # typical speech
+    assert control.level == pytest.approx(0.5)
+
+
+def test_capture_publishes_live_level_for_the_meter() -> None:
+    # The menu-bar waveform reads CaptureControl.level; the real capture loop
+    # must feed it, so a loud utterance has to leave a non-zero level behind.
+    control = CaptureControl()
+
+    def loud_frames() -> Any:
+        for index in range(8):
+            if index == 5:
+                control.end_utterance()
+            yield frame(0.6)
+
+    recorder = AudioRecorder(
+        config(speech_start_s=0.02, trailing_silence_s=1.0),
+        speech_classifier=speech_vote,
+    )
+    recorder.capture_from_frames(loud_frames(), 1_000, control=control)
+    assert control.level > 0.5
+
+
 def test_interrupt_preserves_audio_and_persists_recovery_wav(tmp_path: Path) -> None:
     # A host/transport drop (not a deliberate user cancel) must keep the speech
     # and write it to the recovery wav so a mid-utterance crash is recoverable.

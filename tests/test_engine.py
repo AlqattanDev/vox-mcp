@@ -105,6 +105,16 @@ async def test_converse_speaks_then_listens_and_returns_idle(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_health_reports_zero_mic_level_when_closed(tmp_path: Path):
+    # The menu-bar waveform reads mic_level; with the mic closed it must be a
+    # hard 0 so a stale capture level can never make the meter look live.
+    engine = make_engine(tmp_path)
+    health = await engine.health()
+    assert health["mic_level"] == 0.0
+    assert health["microphone_open"] is False
+
+
+@pytest.mark.asyncio
 async def test_no_speech_is_bounded_and_keeps_session(tmp_path: Path):
     engine = make_engine(tmp_path, speech=False)
     result = await engine.listen("claude")
