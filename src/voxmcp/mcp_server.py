@@ -782,6 +782,7 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
             "status",
             "cycle_mode",
             "set_mode",
+            "repeat",
         }
         if action not in allowed:
             return JSONResponse({"ok": False, "error": "unsupported_action"}, status_code=400)
