@@ -59,9 +59,22 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
   `/health`, and the panel polls at 0.08s while open (0.4s closed) so the bars
   move as you speak. Modes are one **segmented control** (Talk / Narrate /
   Dictate). **One contextual primary button**: *Stop listening* (red) when the
-  mic is hot, *Turn Vox on* / *Resume Vox* when it's down, *Leave a note* when
-  idle. Repeat + More… shrink to a small footer. `More…` holds the
+  mic is hot, *Turn Vox on* / *Resume Vox* when it's down, *Reply* when idle.
+  Repeat + More… shrink to a small footer. `More…` holds the agent-picker note,
   Turn-off/Restart/Open-folder controls. Sleep/inactivity auto-pause unchanged.
+- **User-decided replies.** Turn-taking is the user's call, not only the
+  agent's. **(1) Reply window:** `converse`/`listen` take `onset_timeout` — a
+  short value (~4s) opens the mic for a beat after the agent speaks and returns
+  `no_speech` fast on silence, so a conversational turn offers a reply without a
+  hanging mic. The skill tells agents to end back-and-forth turns this way and
+  reserve bare `speak` for a true sign-off. **(2) Reply on demand:** a panel
+  **Reply** button (idle primary) and the permission-free global hotkey **⌃⌥⌘R**
+  (Carbon `RegisterEventHotKey`) grab the mic and answer whoever last spoke —
+  `reply` control → `engine.reply` auto-targets `last_spoken_agent` (tracked in
+  `_speak_locked`, exposed on `/health`) and delivers via the note path, so it
+  surfaces as that agent's `undelivered_heard` on its next turn. The agent-picker
+  note moved into **More…**. Inherent limit: a reply after a full sign-off waits
+  for the agent's next action (host-injection is the `deliver_text` PLAN item).
 - **Addressed notes (`note` control / panel button).** Speak one utterance
   without waiting for an agent to open the mic. The button first pops an agent
   picker (each agent = a project/voice); the note is **addressed to that agent**
@@ -86,7 +99,7 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
 | `com.vox.runtime` | ~73 MB | ~73 MB |
 | **total** | **~2.7 GB** | **~3.2 GB** |
 
-Tests: `.venv/bin/python -m pytest tests/` — **203 passing**.
+Tests: `.venv/bin/python -m pytest tests/` — **205 passing**.
 
 **Slash commands** (in `~/.claude/commands/`, global): `/speak` reads the
 agent's last reply aloud (no mic); `/listen` opens the mic for one utterance

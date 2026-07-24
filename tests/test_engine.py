@@ -737,6 +737,42 @@ async def test_note_no_speech_stores_nothing(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_reply_addresses_the_last_agent_that_spoke(tmp_path: Path):
+    # A user-initiated reply must go back to whoever just spoke — no picker.
+    engine = make_engine(tmp_path)
+    await engine.session("claude", "start")
+    await engine.speak("mobilescape", "here is your update", agent="mobilescape")
+    assert engine._last_spoken_agent == "mobilescape"
+
+    result = await engine.reply("http-control")
+    assert result["status"] == "noted"
+    assert result["target_agent"] == "mobilescape"
+
+    # Only the last speaker sees and claims it; an unrelated agent does not.
+    other = await engine.session("infra", "claim_undelivered", agent="infra")
+    assert other["claimed_heard"] is None
+    claimed = await engine.session("mobilescape", "claim_undelivered", agent="mobilescape")
+    assert claimed["claimed_heard"]["transcript"] == "hello world"
+
+
+@pytest.mark.asyncio
+async def test_converse_onset_timeout_flows_into_capture(tmp_path: Path):
+    # The reply window is a short onset_timeout; it must reach the recorder so a
+    # declined reply closes fast instead of holding the mic for the full onset.
+    engine = make_engine(tmp_path)
+    captured: dict[str, float] = {}
+    original = engine._listen_locked
+
+    async def spy(client_id, **kwargs):
+        captured["onset_timeout"] = kwargs.get("onset_timeout")
+        return await original(client_id, **kwargs)
+
+    engine._listen_locked = spy  # type: ignore[assignment]
+    await engine.converse("claude", "hi", onset_timeout=3.0)
+    assert captured["onset_timeout"] == 3.0
+
+
+@pytest.mark.asyncio
 async def test_speak_streaming_disabled_synthesizes_once(tmp_path: Path):
     engine = make_engine(tmp_path)
     engine._stream_tts = False

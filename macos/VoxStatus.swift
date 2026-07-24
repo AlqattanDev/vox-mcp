@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import Carbon.HIToolbox
 import Foundation
 
 /// A live scrolling waveform of the microphone level. Fed one 0..1 sample per
@@ -72,7 +73,9 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private let moreButton = NSButton(title: "More…", target: nil, action: nil)
     private var agents: [String] = []
     private var notesWaiting: [String] = []
+    private var lastSpokenAgent: String?
     private var micLevel: CGFloat = 0
+    private var replyHotKeyRef: EventHotKeyRef?
 
     private var runtime: Process?
     private var timer: Timer?
@@ -133,12 +136,54 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         timer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
             self?.refreshStatus()
         }
+        registerReplyHotKey()
         refreshStatus()
+    }
+
+    // A permission-free global hotkey (Carbon RegisterEventHotKey — unlike an
+    // NSEvent global monitor, it needs no Input Monitoring grant) that grabs the
+    // mic to reply to whoever last spoke, from any app. Default: ⌃⌥⌘R.
+    private func registerReplyHotKey() {
+        var eventType = EventTypeSpec(
+            eventClass: OSType(kEventClassKeyboard),
+            eventKind: OSType(kEventHotKeyPressed)
+        )
+        InstallEventHandler(
+            GetApplicationEventTarget(),
+            { _, _, userData in
+                guard let userData else { return noErr }
+                let delegate = Unmanaged<VoxAppDelegate>.fromOpaque(userData).takeUnretainedValue()
+                DispatchQueue.main.async { delegate.replyHotKeyFired() }
+                return noErr
+            },
+            1,
+            &eventType,
+            Unmanaged.passUnretained(self).toOpaque(),
+            nil
+        )
+        let hotKeyID = EventHotKeyID(signature: OSType(0x564F_5852), id: 1)  // 'VOXR'
+        let modifiers = UInt32(controlKey | optionKey | cmdKey)
+        RegisterEventHotKey(
+            UInt32(kVK_ANSI_R),
+            modifiers,
+            hotKeyID,
+            GetApplicationEventTarget(),
+            0,
+            &replyHotKeyRef
+        )
+    }
+
+    func replyHotKeyFired() {
+        // Ignore while the mic is already live or a control is mid-flight; the
+        // reply capture would just collide with the active turn.
+        guard !microphoneOpen, !controlInFlight else { return }
+        replyToLastSpeaker()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         quitting = true
         timer?.invalidate()
+        if let replyHotKeyRef { UnregisterEventHotKey(replyHotKeyRef) }
         DistributedNotificationCenter.default().removeObserver(self)
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         stopChildRuntime()
@@ -422,6 +467,7 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 self.ioMode = (payload["io_mode"] as? String) ?? self.ioMode
                 self.agents = (payload["agents"] as? [String]) ?? self.agents
                 self.notesWaiting = (payload["notes_waiting"] as? [String]) ?? []
+                self.lastSpokenAgent = payload["last_spoken_agent"] as? String
                 self.updatePresentation()
             }
         }.resume()
@@ -528,9 +574,13 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 symbol = "play.fill"; text = "Resume Vox"; color = .controlAccentColor
                 selector = #selector(toggleSession)
             default:
-                symbol = "square.and.pencil"; text = "Leave a note"; color = .controlAccentColor
-                selector = #selector(leaveNote)
-                // A note needs the mic free; only offer it when Vox is idle.
+                // Reply auto-targets whoever last spoke — the fast path. The
+                // agent-picker note lives in More… for the rarer addressed case.
+                symbol = "arrowshape.turn.up.left.fill"
+                text = lastSpokenAgent.map { "Reply to \($0)" } ?? "Reply"
+                color = .controlAccentColor
+                selector = #selector(replyToLastSpeaker)
+                // A reply needs the mic free; only offer it when Vox is idle.
                 enabled = enabled && normalized == "idle"
             }
         }
@@ -670,6 +720,7 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         case "stop": return "Voice stopped. Microphone closed."
         case "cycle_mode": return "Mode cycled. Talk = both · Narrate = agent speaks · Dictate = you only."
         case "note": return "Listening for your note — speak now, then you can walk away."
+        case "reply": return "Listening for your reply — speak now, then you can walk away."
         case "repeat": return "Replaying the agent's last speech."
         default: return "Vox control applied."
         }
@@ -686,6 +737,13 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     @objc private func repeatLast() {
         sendControl("repeat", notice: "Replaying the last thing I said…")
+    }
+
+    // Grab the mic and answer whoever last spoke, no agent picker. Reuses the
+    // note delivery path, so the reply reaches that agent on its next turn.
+    @objc private func replyToLastSpeaker() {
+        let who = lastSpokenAgent ?? "the last agent"
+        sendControl("reply", notice: "Listening — reply to \(who), then you can walk away.")
     }
 
     // Speak a note without waiting for an agent to open the mic. First pick WHO
@@ -750,6 +808,10 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         case "paused": toggleTitle = "Resume Vox"
         default: toggleTitle = "Turn Vox off"
         }
+        let noteItem = NSMenuItem(title: "Leave a note for a specific agent…", action: #selector(leaveNote), keyEquivalent: "")
+        noteItem.isEnabled = !controlInFlight && normalized == "idle"
+        menu.addItem(noteItem)
+        menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: toggleTitle, action: #selector(toggleSession), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Restart Vox (if it's stuck)", action: #selector(restartRuntime), keyEquivalent: ""))

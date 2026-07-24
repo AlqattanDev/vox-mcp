@@ -15,6 +15,7 @@ mkdir -p "$MACOS"
   -O \
   -framework AppKit \
   -framework AVFoundation \
+  -framework Carbon \
   "$ROOT/macos/VoxStatus.swift" \
   -o "$MACOS/VoxStatus"
 /bin/cp "$ROOT/macos/Info.plist" "$CONTENTS/Info.plist"

@@ -1,12 +1,19 @@
 # PLAN — proactive user input
 
-**Shipped:** *Leave a note* — the status-bar "Speak a note to the agent" button
-(and `note` control action) records one utterance without waiting for the agent
-to open the mic and holds it undelivered for the agent's next turn. That covers
-the "I need to go, let me say it now and it reaches you when possible" case.
+**Shipped:**
+- *Leave a note* — records one utterance addressed to a picked agent and holds
+  it undelivered for that agent's next turn.
+- *Reply window* — `converse`/`listen` take `onset_timeout`; a short value opens
+  a brief reply window after the agent speaks and closes fast on silence, so the
+  user can jump in without a hanging mic. The skill tells agents to use it for
+  conversational turns.
+- *Reply on demand* — a panel **Reply** button and the global hotkey **⌃⌥⌘R**
+  (`reply` control → `engine.reply`) grab the mic and answer the last speaker,
+  auto-targeted, delivered via the note path.
 
-**Remaining:** type-while-listening (below) — the *typed*-input variant, which
-needs host cooperation the note flow doesn't.
+**Remaining:** type-while-listening (below) — the *typed*-input variant. It, and
+the "reply after a full sign-off lands instantly" case, both need the same host
+cooperation: a way to inject captured input as a fresh turn.
 
 ---
 

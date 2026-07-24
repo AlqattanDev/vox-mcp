@@ -298,6 +298,14 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
                 client_id=client_id,
                 **options,
             )
+        if action == "reply":
+            # A user-initiated reply, auto-addressed to the last voice heard.
+            return await _invoke(
+                current_engine(),
+                "reply",
+                client_id=client_id,
+                **options,
+            )
         if action in {"cancel", "repeat", "status"}:
             return await _invoke(
                 current_engine(),
@@ -356,6 +364,7 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
         listen_duration_max: float = 75.0,
         listen_duration_min: float = 0.5,
         trailing_silence_s: float = 1.6,
+        onset_timeout: float | None = None,
         agent: str | None = None,
     ) -> Any:
         _listen_bounds(listen_duration_max, listen_duration_min)
@@ -371,6 +380,7 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
             listen_duration_max=listen_duration_max,
             listen_duration_min=listen_duration_min,
             trailing_silence_s=trailing_silence_s,
+            onset_timeout=onset_timeout,
         )
 
     @server.tool(
@@ -407,6 +417,7 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
         listen_duration_max: float = 75.0,
         listen_duration_min: float = 0.5,
         trailing_silence_s: float = 1.6,
+        onset_timeout: float | None = None,
         language: str | None = None,
         agent: str | None = None,
     ) -> Any:
@@ -419,6 +430,7 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
             listen_duration_max=listen_duration_max,
             listen_duration_min=listen_duration_min,
             trailing_silence_s=trailing_silence_s,
+            onset_timeout=onset_timeout,
             language=language,
         )
 
@@ -794,16 +806,17 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
             "set_mode",
             "repeat",
             "note",
+            "reply",
         }
         if action not in allowed:
             return JSONResponse({"ok": False, "error": "unsupported_action"}, status_code=400)
         options = {key: value for key, value in body.items() if key not in {"action", "client_id"}}
-        if action == "note":
-            # A note capture can run up to the utterance cap — far longer than a
-            # control request should block. Kick it off and return at once; the
-            # mic earcon and red glyph tell the user to speak, and the transcript
-            # lands in undelivered_heard for the agent's next turn.
-            task = asyncio.create_task(dispatch_control("note", "http-control", extra=options))
+        if action in {"note", "reply"}:
+            # A note/reply capture can run up to the utterance cap — far longer
+            # than a control request should block. Kick it off and return at
+            # once; the mic earcon and red glyph tell the user to speak, and the
+            # transcript lands in undelivered_heard for the agent's next turn.
+            task = asyncio.create_task(dispatch_control(action, "http-control", extra=options))
             _BACKGROUND_TASKS.add(task)
             task.add_done_callback(_BACKGROUND_TASKS.discard)
             return JSONResponse({"ok": True, "result": {"status": "listening"}}, status_code=202)

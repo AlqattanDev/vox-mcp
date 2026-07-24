@@ -145,6 +145,9 @@ class VoxEngine:
         self._pending_heard: dict[str, Any] | None = None
         self._pending_turn_id: str | None = None
         self._pending_agent: str | None = None
+        # The agent whose voice last spoke, so a user-initiated "reply" can be
+        # addressed back to it without an agent picker.
+        self._last_spoken_agent: str | None = None
         self._audio_tempdir: tempfile.TemporaryDirectory[str] | None = None
 
     @classmethod
@@ -517,6 +520,8 @@ class VoxEngine:
             # must never take the entire local speech path down.
             pass
         self.state.begin_speaking(client_id=client_id)
+        with self._active_lock:
+            self._last_spoken_agent = self._pending_agent
         self._log("tts.started", client_id=client_id, chars=len(message))
 
         chunks = split_for_tts(message) if self._stream_tts else [message]
@@ -813,6 +818,7 @@ class VoxEngine:
         listen_duration_max: float | None = None,
         listen_duration_min: float | None = None,
         trailing_silence_s: float | None = None,
+        onset_timeout: float | None = None,
         language: str | None = None,
     ) -> dict[str, Any]:
         selected_recorder: Any = self.recorder
@@ -820,6 +826,7 @@ class VoxEngine:
             listen_duration_max is not None
             or listen_duration_min is not None
             or trailing_silence_s is not None
+            or onset_timeout is not None
         ):
             capture_config = replace(
                 self.recorder.config,
@@ -837,6 +844,15 @@ class VoxEngine:
                     trailing_silence_s
                     if trailing_silence_s is not None
                     else self.recorder.config.trailing_silence_s
+                ),
+                # A short onset_timeout is the "reply window": if the user does
+                # not start speaking within it, the listen returns no_speech fast
+                # instead of holding the mic open, so a declined reply closes
+                # itself rather than hanging.
+                onset_timeout_s=(
+                    onset_timeout
+                    if onset_timeout is not None
+                    else self.recorder.config.onset_timeout_s
                 ),
             )
             selected_recorder = AudioRecorder(capture_config)
@@ -938,6 +954,7 @@ class VoxEngine:
         listen_duration_max: float | None = None,
         listen_duration_min: float | None = None,
         trailing_silence_s: float | None = None,
+        onset_timeout: float | None = None,
         language: str | None = None,
         agent: str | None = None,
         **_: Any,
@@ -975,6 +992,7 @@ class VoxEngine:
                     listen_duration_max=listen_duration_max,
                     listen_duration_min=listen_duration_min,
                     trailing_silence_s=trailing_silence_s,
+                    onset_timeout=onset_timeout,
                     language=language,
                 )
             result["status"] = (
@@ -1026,6 +1044,7 @@ class VoxEngine:
         listen_duration_max: float | None = None,
         listen_duration_min: float | None = None,
         trailing_silence_s: float | None = None,
+        onset_timeout: float | None = None,
         language: str | None = None,
         agent: str | None = None,
         **_: Any,
@@ -1038,6 +1057,7 @@ class VoxEngine:
                 listen_duration_max=listen_duration_max,
                 listen_duration_min=listen_duration_min,
                 trailing_silence_s=trailing_silence_s,
+                onset_timeout=onset_timeout,
                 language=language,
             ),
             agent=agent,
@@ -1062,6 +1082,29 @@ class VoxEngine:
             client_id,
             "note",
             lambda: self._note_locked(client_id, target_agent=target_agent, language=language),
+            agent=agent,
+        )
+
+    async def reply(
+        self,
+        client_id: str,
+        *,
+        language: str | None = None,
+        agent: str | None = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        """User-initiated "reply" — the same capture-and-hold as a note, but
+        auto-addressed to the agent whose voice last spoke, so the user can
+        answer what they just heard without picking an agent. Falls back to a
+        broadcast if nothing has spoken yet.
+        """
+
+        with self._active_lock:
+            target = self._last_spoken_agent
+        return await self._run_operation(
+            client_id,
+            "note",
+            lambda: self._note_locked(client_id, target_agent=target, language=language),
             agent=agent,
         )
 
@@ -1666,6 +1709,8 @@ class VoxEngine:
             # project/voice) and which of them already have a note waiting.
             "agents": sorted(self.agent_voices.assignments.keys()),
             "notes_waiting": self.notes.pending_targets(),
+            # Who a menu-bar "Reply" would be addressed to (the last voice heard).
+            "last_spoken_agent": self._last_spoken_agent,
         }
 
 

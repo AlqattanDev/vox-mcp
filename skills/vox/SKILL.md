@@ -70,11 +70,26 @@ Read `io_mode` from status. Panel or `voice_session(set_mode|cycle_mode)` sets i
 
 - Verdict first. Hang up when done: status/completion use
   `speak` or `converse(wait_for_response=false)`. Mic open only for a real question.
+- **Reply window.** In an active back-and-forth, do NOT `speak`-and-vanish on a
+  turn the user might want to answer. End such turns with
+  `converse(..., onset_timeout=4)`: the mic cracks open for a few seconds so the
+  user can jump in, and if they stay silent it returns `no_speech` fast instead
+  of hanging the mic open. Reserve bare `speak` (no window) for a genuine
+  terminal sign-off. `onset_timeout` also exists on `listen`.
 - One spoken question at a time. Put code/paths/tables on screen.
 - Mic opens only inside `listen` or response-waiting `converse` after playback drains.
 - No-speech timeout → session stays idle; ask once if still there; no listen loops.
 - Escape/cancel ends only the current turn.
 - Overlapping turns queue; do not hand-serialize or spin on BusyError.
+
+## User-initiated reply (they grab the turn)
+
+Even when you did not open the mic, the user can answer on their own terms — a
+**Reply** button in the panel or the global hotkey **⌃⌥⌘R** opens the mic and
+captures one utterance, auto-addressed to whoever last spoke. It surfaces as
+`undelivered_heard` (`kind == "note"`) in that agent's status, so treat it like
+any addressed note: whenever you see `undelivered_heard.present`, claim it and
+act on it. This is how the user replies after you have already hung up.
 
 ## Visible transcript echo
 
