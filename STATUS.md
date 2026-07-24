@@ -25,13 +25,33 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
   returns the transcript (`delivered_via: cancel_recovery`).
   `voice_session(claim_undelivered)` one-shots recovery. Status/health expose
   `undelivered_heard` (no full transcript on health).
+- **Interrupted speech survives a crash.** A host/transport drop is
+  `INTERRUPTED`, distinct from a deliberate user `CANCELLED`: the captured audio
+  is kept and written to the recovery wav, so a mid-utterance interruption is
+  recoverable via `transcribe(latest=true)`. User cancel still discards for
+  privacy.
+- **Listen earcons.** A rising blip marks the mic opening (talk now), a falling
+  blip marks it closing (stopped) — the start tone plays before capture so it
+  can't leak in. Off via `VOX_EARCONS=0`.
+- **Streamed TTS.** Long replies speak sentence-by-sentence; the next span
+  synthesizes while the current one plays, so audio starts after the first
+  sentence. Off via `VOX_STREAM_TTS=0`.
+- **Snappier endpointing.** Trailing-silence 1.6s (was 1.2 — stops cutting off
+  mid-thought); a single utterance caps at 75s (was 300 — kills the multi-minute
+  "listens forever" hang). Env: `VOX_TRAILING_SILENCE_SECONDS`,
+  `VOX_MAX_UTTERANCE_SECONDS`. These are the MCP tool defaults too, which govern
+  live usage.
 - **IO modes.** `talk` (default, both) · `narrate` (agent speaks, no mic) ·
   `dictate` (listen only, TTS skipped). Panel cycles; `voice_session`
   `set_mode` / `cycle_mode`; persisted in `~/.vox/state/io_mode`.
-- **Menu bar.** `Vox Ready · Mic Off` makes the idle privacy state explicit.
-  Mode cycle + Stop/Start + **I'm done talking** (preserve and transcribe the
-  current recording) + Cancel this turn. Restart / Open folder / Pause under
-  **More…**. Control HTTP timeout 6s (matches mic close).
+- **Menu bar (adaptive).** A glanceable SF Symbol glyph, not a text string:
+  a **red mic only when `microphone_open` is truly set** (never off stale
+  session state), so idle/speaking never read as "hot." **Left-click while the
+  mic is live ends the turn** (keeps + transcribes what you said) — the fix for
+  "I can't stop it listening"; right-click / mic-closed click opens the panel.
+  **More…** offers direct Talk / Narrate / Dictate (`set_mode`), plus Start /
+  Pause / Restart / Open folder. Polls every 0.4s so the glyph never lags.
+  Control HTTP timeout 6s (matches mic close).
 - **Loud rooms endpoint.** Adaptive floor + `noise_rise_smoothing` backstop.
   Music still degrades VAD (Silero later).
 - **Whisper `small`.** One server `com.vox.whisper` `:2022`.
@@ -47,7 +67,15 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
 | `com.vox.runtime` | ~73 MB | ~73 MB |
 | **total** | **~2.7 GB** | **~3.2 GB** |
 
-Tests: `.venv/bin/python -m pytest tests/` — **191 passing**.
+Tests: `.venv/bin/python -m pytest tests/` — **197 passing**.
+
+**Slash commands** (in `~/.claude/commands/`, global): `/speak` reads the
+agent's last reply aloud (no mic); `/listen` opens the mic for one utterance
+without arming a persistent session.
+
+**After menu-bar changes, rebuild + reinstall the app** (the runtime restarts):
+`zsh scripts/build_macos_app.sh` then the install step. The Python runtime
+changes take effect on the next `com.vox.runtime` restart.
 
 ## Wired agents
 
@@ -65,7 +93,16 @@ claude mcp add --scope local --transport http vox \
 
 ## Next steps
 
+- **Type-while-listening fusion** (see `PLAN.md`). When Ali types while the mic
+  is open, deliver the typed text immediately instead of waiting out the listen.
+  Needs a host-side Claude Code integration; the 75s cap already softens the
+  wasted-turn wait.
+- **Speak while the agent is still composing.** The streamed-TTS win is inside
+  one `speak` call; starting speech before the reply is fully written is a
+  client concern (Claude Code sends the whole message in one tool call). Would
+  need the agent/skill to emit sentence-level `speak` calls as it writes.
 - Silero VAD for music-proof endpointing.
+- Whisper hallucination filter (drop `[wind]`/`[music]`-only transcripts).
 - If `small` is too lossy on accents: revert model path to
   `ggml-large-v3-turbo.bin` (~1.6 GB).
 - Kokoro memory is the only large remaining cost lever.
