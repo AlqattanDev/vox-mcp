@@ -22,6 +22,8 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
     private let repeatButton = NSButton(title: "Repeat last speech", target: nil, action: nil)
     private let moreButton = NSButton(title: "More…", target: nil, action: nil)
     private var notePending = false
+    private var agents: [String] = []
+    private var notesWaiting: [String] = []
 
     private var runtime: Process?
     private var timer: Timer?
@@ -327,6 +329,9 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
                 if let undelivered = payload["undelivered_heard"] as? [String: Any] {
                     self.notePending = (undelivered["present"] as? Bool) ?? false
                 }
+                self.agents = (payload["agents"] as? [String]) ?? self.agents
+                self.notesWaiting = (payload["notes_waiting"] as? [String]) ?? []
+                self.notePending = !self.notesWaiting.isEmpty
                 self.updatePresentation()
             }
         }.resume()
@@ -423,8 +428,9 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
 
     private func panelDetail() -> String {
         if let actionNotice { return actionNotice }
-        if notePending {
-            return "A note is saved and waiting — the agent gets it on its next turn."
+        if !notesWaiting.isEmpty {
+            let targets = notesWaiting.map { $0 == "*" ? "any agent" : $0 }.joined(separator: ", ")
+            return "Note waiting for: \(targets) — delivered on that agent's next turn."
         }
         if state.lowercased() == "off", lastStopReason == "idle_timeout" {
             return "Stopped after 10 minutes without activity. The microphone is closed."
@@ -502,11 +508,44 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
         sendControl("repeat", notice: "Replaying the last thing I said…")
     }
 
-    // Speak a note without waiting for the agent to open the mic. The runtime
-    // records one utterance and holds it as undelivered; the agent picks it up
-    // on its next turn. Returns immediately — the mic earcon cues you to talk.
+    // Speak a note without waiting for an agent to open the mic. First pick WHO
+    // it's for (each agent = a project/voice), so it reaches only that agent —
+    // not whoever happens to poll first. Then the mic opens and you talk.
     @objc private func leaveNote() {
-        sendControl("note", notice: "Listening — speak your note now. It reaches the agent when it's free.")
+        let menu = NSMenu()
+        let header = NSMenuItem(title: "Speak a note to…", action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        menu.addItem(header)
+        menu.addItem(NSMenuItem.separator())
+        for agent in agents {
+            let waiting = notesWaiting.contains(agent)
+            let item = NSMenuItem(
+                title: waiting ? "\(agent)   ● note waiting" : agent,
+                action: #selector(sendNoteTo(_:)),
+                keyEquivalent: ""
+            )
+            item.representedObject = agent
+            item.target = self
+            menu.addItem(item)
+        }
+        if !agents.isEmpty { menu.addItem(NSMenuItem.separator()) }
+        let any = NSMenuItem(title: "Any agent (first to check)", action: #selector(sendNoteTo(_:)), keyEquivalent: "")
+        any.representedObject = ""
+        any.target = self
+        menu.addItem(any)
+        if let event = NSApp.currentEvent {
+            NSMenu.popUpContextMenu(menu, with: event, for: noteButton)
+        } else {
+            menu.popUp(positioning: nil, at: NSPoint(x: 0, y: noteButton.bounds.height), in: noteButton)
+        }
+    }
+
+    @objc private func sendNoteTo(_ sender: NSMenuItem) {
+        let target = (sender.representedObject as? String) ?? ""
+        let who = target.isEmpty ? "the next agent that checks" : target
+        var extra: [String: Any] = [:]
+        if !target.isEmpty { extra["target_agent"] = target }
+        sendControl("note", notice: "Listening — speak your note for \(who), then walk away.", extra: extra)
     }
 
     // One session on/off control — the whole Stop / Start / Resume / Pause /

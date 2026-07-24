@@ -39,6 +39,7 @@ from .eventlog import JsonlEventLogger, read_events
 from .intents import classify_spoken_intent
 from .agents import AgentVoices, FALLBACK_VOICES
 from .last_heard import LastHeardStore
+from .notes import NotesStore
 from .lease import DEFAULT_AGENT, LeaseManager, OperationGate
 from .models import SessionState, SpokenIntent, StopReason
 from .services import ServiceSupervisor
@@ -112,6 +113,7 @@ class VoxEngine:
         self.gate = gate or OperationGate()
         self.gate.on_event = self._log_queue_event
         self.last_heard = LastHeardStore(Path(config.state_dir) / "last_heard.json")
+        self.notes = NotesStore(Path(config.state_dir) / "notes.json")
         self._io_mode_path = Path(config.state_dir) / "io_mode"
         self._io_mode = self._load_io_mode()
 
@@ -1045,23 +1047,31 @@ class VoxEngine:
         self,
         client_id: str,
         *,
+        target_agent: str | None = None,
         language: str | None = None,
         agent: str | None = None,
         **_: Any,
     ) -> dict[str, Any]:
-        """User-initiated capture: record one utterance and leave it undelivered
-        for the agent to pick up on its next turn. Lets the user speak without
-        waiting for the agent to open the mic — "leave a note and walk away."
+        """User-initiated capture addressed to one agent. Records an utterance
+        and holds it for ``target_agent`` (recognised by its voice/project) to
+        claim on its next turn — "leave a note and walk away." An empty target
+        broadcasts to whichever agent asks first.
         """
 
         return await self._run_operation(
             client_id,
             "note",
-            lambda: self._note_locked(client_id, language=language),
+            lambda: self._note_locked(client_id, target_agent=target_agent, language=language),
             agent=agent,
         )
 
-    async def _note_locked(self, client_id: str, *, language: str | None = None) -> dict[str, Any]:
+    async def _note_locked(
+        self,
+        client_id: str,
+        *,
+        target_agent: str | None = None,
+        language: str | None = None,
+    ) -> dict[str, Any]:
         capture, transcription = await self._capture_once(client_id, language=language)
         if transcription is None:
             return {
@@ -1075,30 +1085,25 @@ class VoxEngine:
             }
         transcript = transcription.text or ""
         turn_id = uuid.uuid4().hex
-        with self._active_lock:
-            pending_agent = self._pending_agent
-        self.last_heard.write(
+        self.notes.put(
+            target_agent,
             transcript=transcript,
-            reason=capture.reason.value,
-            session_id=self.state.snapshot().session_id,
-            client_id=client_id,
-            agent=pending_agent,
             turn_id=turn_id,
-            delivered=False,
+            reason=capture.reason.value,
         )
         self.state.complete_turn(client_id=client_id)
-        self._log("note.captured", client_id=client_id, chars=len(transcript))
-        # Deliberately NOT _set_pending_heard: the note stays undelivered so the
-        # agent claims it on its next turn (claim_undelivered / status).
-        undelivered = self.last_heard.undelivered()
+        self._log(
+            "note.captured",
+            client_id=client_id,
+            target_agent=target_agent or "*",
+            chars=len(transcript),
+        )
         return {
             "status": "noted",
             "transcript": transcript,
             "turn_id": turn_id,
+            "target_agent": (target_agent or "").strip() or "*",
             "session": self.state.snapshot().to_dict(),
-            "undelivered_heard": (
-                undelivered.public() if undelivered is not None else {"present": False}
-            ),
         }
 
     async def session(
@@ -1142,14 +1147,22 @@ class VoxEngine:
             )
             return await self._status_for_agent(agent)
         if action == "claim_undelivered":
-            claimed = self.last_heard.claim()
+            # A note addressed to this agent takes priority over the global
+            # crash-recovery slot, so each agent gets only what was meant for it.
+            note = self.notes.claim(agent or DEFAULT_AGENT)
             payload = await self._status_for_agent(agent)
-            if claimed is None:
-                payload["undelivered_heard"] = {"present": False}
-                payload["claimed_heard"] = None
-            else:
-                payload["undelivered_heard"] = {"present": False}
-                payload["claimed_heard"] = claimed.public(include_transcript=True)
+            payload["undelivered_heard"] = {"present": False}
+            if note is not None:
+                payload["claimed_heard"] = {
+                    "transcript": str(note.get("transcript", "")),
+                    "kind": "note",
+                    "target_agent": note.get("target_agent", "*"),
+                }
+                return payload
+            claimed = self.last_heard.claim()
+            payload["claimed_heard"] = (
+                claimed.public(include_transcript=True) if claimed is not None else None
+            )
             return payload
         if action == "start":
             if administrative:
@@ -1563,11 +1576,25 @@ class VoxEngine:
         )
 
     async def _status_for_agent(self, agent: str | None) -> dict[str, Any]:
-        """Status plus who is asking and which voice they will speak in."""
+        """Status plus who is asking and which voice they will speak in.
+
+        A note addressed to this agent surfaces as ``undelivered_heard`` here (and
+        only here), so an agent sees only its own notes and the existing
+        claim_undelivered flow delivers it.
+        """
 
         label = agent or DEFAULT_AGENT
         status = await self.status()
         status["agent"] = {"id": label, "voice": await self._agent_voice(label)}
+        note = self.notes.get(label)
+        if note is not None:
+            transcript = str(note.get("transcript", ""))
+            status["undelivered_heard"] = {
+                "present": True,
+                "kind": "note",
+                "char_count": len(transcript),
+                "age_s": round(time.time() - float(note.get("captured_at", time.time())), 1),
+            }
         return status
 
     async def status(self) -> dict[str, Any]:
@@ -1628,6 +1655,10 @@ class VoxEngine:
                 "age_s": undelivered.get("age_s"),
                 "char_count": undelivered.get("char_count"),
             },
+            # For the menu bar's note picker: the agents you can address (by
+            # project/voice) and which of them already have a note waiting.
+            "agents": sorted(self.agent_voices.assignments.keys()),
+            "notes_waiting": self.notes.pending_targets(),
         }
 
 

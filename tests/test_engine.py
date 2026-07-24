@@ -685,20 +685,36 @@ async def test_speak_streams_each_sentence_and_completes(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_note_captures_and_leaves_undelivered_for_next_turn(tmp_path: Path):
+async def test_note_addresses_one_agent_and_only_it_claims(tmp_path: Path):
     engine = make_engine(tmp_path)
     await engine.session("claude", "start")
-    result = await engine.note("claude")
+    result = await engine.note("http-control", target_agent="mobilescape")
     assert result["status"] == "noted"
     assert result["transcript"] == "hello world"
-    # A note is NOT delivered in its own call — it waits, undelivered, for the
-    # agent to claim on its next turn.
-    undelivered = engine.last_heard.undelivered()
-    assert undelivered is not None
-    assert undelivered.public()["present"] is True
-    claimed = await engine.session("claude", "claim_undelivered")
+    assert result["target_agent"] == "mobilescape"
+
+    # A different agent neither sees nor claims a note addressed to mobilescape.
+    other_status = await engine._status_for_agent("infra")
+    assert other_status["undelivered_heard"]["present"] is False
+    other = await engine.session("infra", "claim_undelivered", agent="infra")
+    assert other["claimed_heard"] is None
+
+    # The addressed agent sees it and claims it once.
+    addressed = await engine._status_for_agent("mobilescape")
+    assert addressed["undelivered_heard"]["present"] is True
+    assert addressed["undelivered_heard"]["kind"] == "note"
+    claimed = await engine.session("mobilescape", "claim_undelivered", agent="mobilescape")
     assert claimed["claimed_heard"]["transcript"] == "hello world"
-    assert engine.last_heard.undelivered() is None
+    assert engine.notes.get("mobilescape") is None
+
+
+@pytest.mark.asyncio
+async def test_broadcast_note_is_claimable_by_any_agent(tmp_path: Path):
+    engine = make_engine(tmp_path)
+    await engine.session("claude", "start")
+    await engine.note("http-control")  # no target_agent → broadcast
+    claimed = await engine.session("whoever", "claim_undelivered", agent="whoever")
+    assert claimed["claimed_heard"]["transcript"] == "hello world"
 
 
 @pytest.mark.asyncio

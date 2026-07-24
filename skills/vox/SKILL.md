@@ -29,8 +29,16 @@ When the user explicitly asks to enter voice mode:
 2. If off, call `voice_session(action="start")`.
 3. If `undelivered_heard.present`, call `voice_session(action="claim_undelivered")`
    and treat `claimed_heard.transcript` as the user’s last message **before**
-   asking them to repeat.
+   asking them to repeat. `claimed_heard.kind == "note"` means the user left it
+   for **you** from the menu bar while you were away — act on it, don’t just
+   acknowledge it.
 4. Greet per mode (see below).
+
+**Addressed notes.** The user can leave a spoken note from the menu bar for a
+specific agent (by voice/project). It surfaces as `undelivered_heard` only in
+**that agent’s** status, so whenever you see `undelivered_heard.present` — at
+session start *and* on any later status — claim it. Notes for other agents are
+invisible to you; never claim on someone else’s behalf.
 
 When the user says “stop voice mode,” “switch to text,” or equivalent, call
 `voice_session(action="stop")`. Do not call another voice tool until they

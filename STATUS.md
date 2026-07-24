@@ -54,11 +54,15 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
   replays the agent's last clip. The old Stop / Start / Resume / Pause / Cancel
   pile-up collapsed to one contextual **Turn Vox off/on** in **More…**, with
   **Restart Vox** as the sole recovery. Sleep/inactivity auto-pause unchanged.
-- **Leave a note (`note` control / panel button).** Speak one utterance without
-  waiting for the agent to open the mic — the runtime records it and holds it
-  **undelivered**; the agent claims it on its next turn (`claim_undelivered` /
-  `undelivered_heard`). Fire-and-forget over HTTP (returns 202); the earcon and
-  red glyph cue you to talk. The panel shows when a note is waiting.
+- **Addressed notes (`note` control / panel button).** Speak one utterance
+  without waiting for an agent to open the mic. The button first pops an agent
+  picker (each agent = a project/voice); the note is **addressed to that agent**
+  and surfaces as `undelivered_heard` only in *its* status, so only that agent
+  claims it — not whoever polls first. `NotesStore` (`~/.vox/state/notes.json`)
+  holds one pending note per agent, so notes to different agents coexist. Empty
+  target = broadcast (any agent). Fire-and-forget over HTTP (202); the earcon +
+  red glyph cue you to talk. Health exposes `agents` + `notes_waiting`; the panel
+  names who has a note waiting.
 - **Loud rooms endpoint.** Adaptive floor + `noise_rise_smoothing` backstop.
   Music still degrades VAD (Silero later).
 - **Whisper `small`.** One server `com.vox.whisper` `:2022`.
