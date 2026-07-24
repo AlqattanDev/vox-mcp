@@ -1041,6 +1041,66 @@ class VoxEngine:
             agent=agent,
         )
 
+    async def note(
+        self,
+        client_id: str,
+        *,
+        language: str | None = None,
+        agent: str | None = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        """User-initiated capture: record one utterance and leave it undelivered
+        for the agent to pick up on its next turn. Lets the user speak without
+        waiting for the agent to open the mic — "leave a note and walk away."
+        """
+
+        return await self._run_operation(
+            client_id,
+            "note",
+            lambda: self._note_locked(client_id, language=language),
+            agent=agent,
+        )
+
+    async def _note_locked(self, client_id: str, *, language: str | None = None) -> dict[str, Any]:
+        capture, transcription = await self._capture_once(client_id, language=language)
+        if transcription is None:
+            return {
+                "status": (
+                    "cancelled"
+                    if capture.reason is CaptureStopReason.CANCELLED
+                    else "no_speech"
+                ),
+                "reason": capture.reason.value,
+                "session": self.state.snapshot().to_dict(),
+            }
+        transcript = transcription.text or ""
+        turn_id = uuid.uuid4().hex
+        with self._active_lock:
+            pending_agent = self._pending_agent
+        self.last_heard.write(
+            transcript=transcript,
+            reason=capture.reason.value,
+            session_id=self.state.snapshot().session_id,
+            client_id=client_id,
+            agent=pending_agent,
+            turn_id=turn_id,
+            delivered=False,
+        )
+        self.state.complete_turn(client_id=client_id)
+        self._log("note.captured", client_id=client_id, chars=len(transcript))
+        # Deliberately NOT _set_pending_heard: the note stays undelivered so the
+        # agent claims it on its next turn (claim_undelivered / status).
+        undelivered = self.last_heard.undelivered()
+        return {
+            "status": "noted",
+            "transcript": transcript,
+            "turn_id": turn_id,
+            "session": self.state.snapshot().to_dict(),
+            "undelivered_heard": (
+                undelivered.public() if undelivered is not None else {"present": False}
+            ),
+        }
+
     async def session(
         self,
         client_id: str,

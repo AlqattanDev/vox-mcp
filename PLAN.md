@@ -1,4 +1,16 @@
-# PLAN — type-while-listening fusion
+# PLAN — proactive user input
+
+**Shipped:** *Leave a note* — the status-bar "Speak a note to the agent" button
+(and `note` control action) records one utterance without waiting for the agent
+to open the mic and holds it undelivered for the agent's next turn. That covers
+the "I need to go, let me say it now and it reaches you when possible" case.
+
+**Remaining:** type-while-listening (below) — the *typed*-input variant, which
+needs host cooperation the note flow doesn't.
+
+---
+
+# type-while-listening fusion
 
 ## The problem (Ali's words)
 

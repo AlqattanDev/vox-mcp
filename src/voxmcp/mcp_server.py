@@ -7,6 +7,7 @@ model cannot impersonate another client by supplying its own owner id.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import ipaddress
 import os
@@ -33,6 +34,8 @@ from .lease import DEFAULT_AGENT
 _ENGINE: Any | None = None
 _ENGINE_LOCK = threading.Lock()
 _AGENT_MAX_LENGTH = 64
+# Strong references to fire-and-forget note captures so the loop cannot GC them.
+_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
 
 
 def get_engine() -> Any:
@@ -288,6 +291,13 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
         extra: Mapping[str, Any] | None = None,
     ) -> Any:
         options = dict(extra or {})
+        if action == "note":
+            return await _invoke(
+                current_engine(),
+                "note",
+                client_id=client_id,
+                **options,
+            )
         if action in {"cancel", "repeat", "status"}:
             return await _invoke(
                 current_engine(),
@@ -783,10 +793,20 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
             "cycle_mode",
             "set_mode",
             "repeat",
+            "note",
         }
         if action not in allowed:
             return JSONResponse({"ok": False, "error": "unsupported_action"}, status_code=400)
         options = {key: value for key, value in body.items() if key not in {"action", "client_id"}}
+        if action == "note":
+            # A note capture can run up to the utterance cap — far longer than a
+            # control request should block. Kick it off and return at once; the
+            # mic earcon and red glyph tell the user to speak, and the transcript
+            # lands in undelivered_heard for the agent's next turn.
+            task = asyncio.create_task(dispatch_control("note", "http-control", extra=options))
+            _BACKGROUND_TASKS.add(task)
+            task.add_done_callback(_BACKGROUND_TASKS.discard)
+            return JSONResponse({"ok": True, "result": {"status": "listening"}}, status_code=202)
         try:
             payload = await dispatch_control(
                 action,

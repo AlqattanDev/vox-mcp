@@ -685,6 +685,32 @@ async def test_speak_streams_each_sentence_and_completes(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_note_captures_and_leaves_undelivered_for_next_turn(tmp_path: Path):
+    engine = make_engine(tmp_path)
+    await engine.session("claude", "start")
+    result = await engine.note("claude")
+    assert result["status"] == "noted"
+    assert result["transcript"] == "hello world"
+    # A note is NOT delivered in its own call — it waits, undelivered, for the
+    # agent to claim on its next turn.
+    undelivered = engine.last_heard.undelivered()
+    assert undelivered is not None
+    assert undelivered.public()["present"] is True
+    claimed = await engine.session("claude", "claim_undelivered")
+    assert claimed["claimed_heard"]["transcript"] == "hello world"
+    assert engine.last_heard.undelivered() is None
+
+
+@pytest.mark.asyncio
+async def test_note_no_speech_stores_nothing(tmp_path: Path):
+    engine = make_engine(tmp_path, speech=False)
+    await engine.session("claude", "start")
+    result = await engine.note("claude")
+    assert result["status"] == "no_speech"
+    assert engine.last_heard.undelivered() is None
+
+
+@pytest.mark.asyncio
 async def test_speak_streaming_disabled_synthesizes_once(tmp_path: Path):
     engine = make_engine(tmp_path)
     engine._stream_tts = False

@@ -47,11 +47,18 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
 - **Menu bar (adaptive).** A glanceable SF Symbol glyph, not a text string:
   a **red mic only when `microphone_open` is truly set** (never off stale
   session state), so idle/speaking never read as "hot." **Left-click while the
-  mic is live ends the turn** (keeps + transcribes what you said) — the fix for
-  "I can't stop it listening"; right-click / mic-closed click opens the panel.
-  **More…** offers direct Talk / Narrate / Dictate (`set_mode`), plus Start /
-  Pause / Restart / Open folder. Polls every 0.4s so the glyph never lags.
-  Control HTTP timeout 6s (matches mic close).
+  mic is live ends the turn**; right-click / mic-closed click opens the panel.
+  Polls every 0.4s so the glyph never lags.
+- **Decluttered panel.** Mode is three buttons (Talk / Narrate / Dictate, active
+  one pushed in). One turn action: **Stop listening**. **Repeat last speech**
+  replays the agent's last clip. The old Stop / Start / Resume / Pause / Cancel
+  pile-up collapsed to one contextual **Turn Vox off/on** in **More…**, with
+  **Restart Vox** as the sole recovery. Sleep/inactivity auto-pause unchanged.
+- **Leave a note (`note` control / panel button).** Speak one utterance without
+  waiting for the agent to open the mic — the runtime records it and holds it
+  **undelivered**; the agent claims it on its next turn (`claim_undelivered` /
+  `undelivered_heard`). Fire-and-forget over HTTP (returns 202); the earcon and
+  red glyph cue you to talk. The panel shows when a note is waiting.
 - **Loud rooms endpoint.** Adaptive floor + `noise_rise_smoothing` backstop.
   Music still degrades VAD (Silero later).
 - **Whisper `small`.** One server `com.vox.whisper` `:2022`.

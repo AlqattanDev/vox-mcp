@@ -17,9 +17,11 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
     private let talkButton = NSButton(title: "Talk", target: nil, action: nil)
     private let narrateButton = NSButton(title: "Narrate", target: nil, action: nil)
     private let dictateButton = NSButton(title: "Dictate", target: nil, action: nil)
+    private let noteButton = NSButton(title: "Speak a note to the agent", target: nil, action: nil)
     private let endTurnButton = NSButton(title: "Stop listening", target: nil, action: nil)
     private let repeatButton = NSButton(title: "Repeat last speech", target: nil, action: nil)
     private let moreButton = NSButton(title: "More…", target: nil, action: nil)
+    private var notePending = false
 
     private var runtime: Process?
     private var timer: Timer?
@@ -104,10 +106,11 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
             button.tag = index
             button.action = #selector(selectModeButton(_:))
         }
-        for button in [endTurnButton, repeatButton, moreButton] {
+        for button in [noteButton, endTurnButton, repeatButton, moreButton] {
             button.target = self
             button.bezelStyle = .rounded
         }
+        noteButton.action = #selector(leaveNote)
         endTurnButton.action = #selector(endTurn)
         repeatButton.action = #selector(repeatLast)
         moreButton.action = #selector(showMoreMenu)
@@ -128,6 +131,7 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
         stack.addArrangedSubview(modeLabel)
         stack.addArrangedSubview(modeRow)
         stack.addArrangedSubview(divider)
+        stack.addArrangedSubview(noteButton)
         stack.addArrangedSubview(endTurnButton)
         stack.addArrangedSubview(repeatButton)
         stack.addArrangedSubview(moreButton)
@@ -143,6 +147,7 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
             modeLabel.widthAnchor.constraint(equalTo: detailLabel.widthAnchor),
             modeRow.widthAnchor.constraint(equalTo: detailLabel.widthAnchor),
             divider.widthAnchor.constraint(equalTo: detailLabel.widthAnchor),
+            noteButton.widthAnchor.constraint(equalTo: detailLabel.widthAnchor),
             endTurnButton.widthAnchor.constraint(equalTo: detailLabel.widthAnchor),
             repeatButton.widthAnchor.constraint(equalTo: detailLabel.widthAnchor),
             moreButton.widthAnchor.constraint(equalTo: detailLabel.widthAnchor),
@@ -319,6 +324,9 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
                 self.detail = (payload["detail"] as? String) ?? "Local-only runtime connected"
                 self.lastStopReason = payload["last_stop_reason"] as? String
                 self.ioMode = (payload["io_mode"] as? String) ?? self.ioMode
+                if let undelivered = payload["undelivered_heard"] as? [String: Any] {
+                    self.notePending = (undelivered["present"] as? Bool) ?? false
+                }
                 self.updatePresentation()
             }
         }.resume()
@@ -356,6 +364,9 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
             button.state = currentMode == mode ? .on : .off
             button.isEnabled = !controlInFlight && normalized != "offline"
         }
+        // Leave a note only when the session is idle (mic free) — the gate would
+        // otherwise queue it behind whatever the agent is doing.
+        noteButton.isEnabled = !controlInFlight && normalized == "idle"
         endTurnButton.title = microphoneOpen ? "Stop listening — keep what I said" : "Stop listening"
         endTurnButton.isEnabled = !controlInFlight && normalized == "listening"
         // Replay the agent's last clip — for when you missed it. The runtime
@@ -412,6 +423,9 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
 
     private func panelDetail() -> String {
         if let actionNotice { return actionNotice }
+        if notePending {
+            return "A note is saved and waiting — the agent gets it on its next turn."
+        }
         if state.lowercased() == "off", lastStopReason == "idle_timeout" {
             return "Stopped after 10 minutes without activity. The microphone is closed."
         }
@@ -469,6 +483,8 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
         case "end_turn": return "Got it. Recording closed; transcribing what you said."
         case "stop": return "Voice stopped. Microphone closed."
         case "cycle_mode": return "Mode cycled. Talk = both · Narrate = agent speaks · Dictate = you only."
+        case "note": return "Listening for your note — speak now, then you can walk away."
+        case "repeat": return "Replaying the agent's last speech."
         default: return "Vox control applied."
         }
     }
@@ -484,6 +500,13 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func repeatLast() {
         sendControl("repeat", notice: "Replaying the last thing I said…")
+    }
+
+    // Speak a note without waiting for the agent to open the mic. The runtime
+    // records one utterance and holds it as undelivered; the agent picks it up
+    // on its next turn. Returns immediately — the mic earcon cues you to talk.
+    @objc private func leaveNote() {
+        sendControl("note", notice: "Listening — speak your note now. It reaches the agent when it's free.")
     }
 
     // One session on/off control — the whole Stop / Start / Resume / Pause /
