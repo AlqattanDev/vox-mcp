@@ -39,7 +39,7 @@ from .diagnostics import static_diagnostics
 from .earcons import earcons_enabled, ensure_earcons
 from .errors import BusyError, PrivacyError, ServiceUnavailableError, VoxError
 from .eventlog import JsonlEventLogger, read_events
-from .intents import classify_spoken_intent, companion_may_answer
+from .intents import classify_spoken_intent, companion_may_answer, is_non_speech_transcript
 from .agents import AgentVoices, FALLBACK_VOICES
 from .last_heard import LastHeardStore
 from .notes import NotesStore
@@ -753,7 +753,7 @@ class VoxEngine:
             capture.latest_wav_path,
             language=language or self.default_language,
         )
-        if not (transcription.text or "").strip():
+        if is_non_speech_transcript(transcription.text):
             # Nothing intelligible came back from audio loud enough to trip the
             # gate — the likely source is Kokoro's own voice returning through
             # the speakers. Reporting that to the agent as a user utterance
@@ -1160,6 +1160,20 @@ class VoxEngine:
                 transcription.text = get_manager().process_stt(transcription.text)
         except Exception:
             pass
+        if is_non_speech_transcript(transcription.text):
+            # Audio tripped the gate but Whisper found no words in it — a noise
+            # burst, or a marker like [BLANK_AUDIO]. Handing that back as the
+            # user's turn lets an annotation answer on their behalf, so it is
+            # silence, reported the same way an unspoken turn is.
+            self._log(
+                "stt.non_speech",
+                client_id=client_id,
+                backend=transcription.backend,
+                elapsed_ms=transcription.elapsed_ms,
+                transcript=transcription.text,
+            )
+            self._return_idle_if_active()
+            return capture, None
         self._log(
             "stt.completed",
             client_id=client_id,
@@ -1957,12 +1971,21 @@ class VoxEngine:
             if spoken.get("status") == "cancelled":
                 return {"status": "cancelled", "turns": turns, "reason": "cancelled"}
 
+            silences = 0
             for _ in range(budget):
                 heard = await self._listen_locked(client_id)
                 status = heard.get("status")
                 if status != "completed":
+                    # One quiet moment is not the user walking away, and a noise
+                    # burst that trips the gate without words is not a turn at
+                    # all. Reopen rather than handing back after the first
+                    # silence — the budget still bounds how long that goes on.
+                    silences += 1
+                    if status == "no_speech" and silences < 3:
+                        continue
                     reason = str(status or "no_speech")
                     break
+                silences = 0
                 transcript = str(heard.get("transcript") or "")
                 if heard.get("control", {}).get("action") in {"stop", "pause"}:
                     outcome, reason = "completed", "user_stopped"

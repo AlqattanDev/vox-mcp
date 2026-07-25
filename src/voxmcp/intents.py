@@ -82,6 +82,28 @@ _PHRASES = MappingProxyType(
 
 _PUNCTUATION = re.compile(r"[^\w\s]", flags=re.UNICODE)
 _WHITESPACE = re.compile(r"\s+")
+
+# whisper.cpp annotates silence and ambient sound rather than returning nothing:
+# [BLANK_AUDIO], [MUSIC], [wind], (door closes). A transcript made only of those
+# is a label about the audio, never words a person said.
+_NON_SPEECH_MARKERS_ONLY = re.compile(r"^(?:\s*[\[(][^\])]*[\])]\s*)+$")
+
+
+def is_non_speech_transcript(text: str | None) -> bool:
+    """True when a transcript carries no user words at all.
+
+    Passing a marker on to an agent as though the user had spoken it is worse
+    than reporting silence: it made the companion escalate ``out_of_scope`` on a
+    quiet room — the exact moment it exists to cover — and it would let a stray
+    ``[BLANK_AUDIO]`` answer for the user in any ordinary listen.
+    """
+
+    if not isinstance(text, str):
+        return True
+    stripped = text.strip()
+    if not stripped:
+        return True
+    return bool(_NON_SPEECH_MARKERS_ONLY.match(stripped))
 _WAIT_DURATION = re.compile(
     r"^(?:please\s+)?wait(?:\s+for)?\s+"
     r"(?P<amount>\d{1,3}|one|two|three|four|five|ten)\s+"
@@ -185,7 +207,11 @@ _WORK_TOPIC = re.compile(
       | can \s+ you \s+ (?:fix|change|add|write|implement|refactor|check|look)
       | show \s+ me
       | what \s+ (?:did|are) \s+ you \s+ (?:do|doing|change|changing)
-      | change | changes | changed | fix | fixed | broke | broken | working
+      | change | changes | changed | fix | fixed | broke | broken
+      # "is it working now", but not "while this guy is working" — a bare
+      # `working` escalated ordinary conversation about the person working.
+      | (?:it|that|this|everything|anything) \s+ working
+      | working \s+ (?:now|yet|again)
       | tell \s+ me | explain | walk \s+ me \s+ through | status | progress
       | done \s+ yet | finished \s+ yet | how \s+ long
     )\b""",
@@ -240,9 +266,21 @@ def companion_may_answer(text: str) -> bool:
     # are you doing today?" through while "tell me exactly what all the
     # changes" still goes to the agent that knows the code.
     words = normalized.split()
-    if len(words) > 16:
-        return False
+    # The signal check comes before the length cap on purpose. Ali rambled for
+    # fifty words about not knowing what to chat about, ending in "how are you
+    # and are you good" — unmistakable small talk that the cap escalated before
+    # the signal was ever consulted. Length is a weak proxy for "this is a
+    # request"; an explicit chit-chat marker that survived every veto is
+    # stronger evidence than word count.
     if _SMALL_TALK_SIGNAL.search(normalized):
         return True
-    # Otherwise only things too short to be a request at all.
-    return len(words) <= 4 and all(len(word) <= 12 for word in words)
+    if len(words) > 16:
+        return False
+    # Nothing above matched: no filename, no identifier, no work topic and no
+    # request shape. Demanding a positive chit-chat keyword *as well* made the
+    # companion unusable rather than safe — the first natural thing said to it,
+    # "so what do you want to talk to me about", carries no keyword from any
+    # list and was escalated as if it were a question about the code. The vetoes
+    # are what protect the project; this fallback only ever blocked conversation
+    # the vetoes had already cleared.
+    return True

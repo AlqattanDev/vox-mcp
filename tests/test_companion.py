@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from voxmcp.companion import CompanionReply, _extract, _resolve_grokctl, ask_companion
-from voxmcp.intents import companion_may_answer
+from voxmcp.intents import companion_may_answer, is_non_speech_transcript
 
 
 ANSWERABLE = [
@@ -24,6 +24,28 @@ ANSWERABLE = [
     "so man how are you doing today hows things",
     "hello hi how are you",
     "im just waiting man",
+    # Neutral conversation carrying no chit-chat keyword from any list. These
+    # were all escalated as "out of scope" while a positive small-talk signal
+    # was required on top of the work vetoes; the first one is verbatim the
+    # opening line of the live companion verification.
+    "so what do you want to talk to me about",
+    "did you watch the game last night",
+    "my back is killing me from sitting here",
+    "its raining pretty hard outside",
+    "i might make some coffee",
+    # Verbatim from the live run: a bare `working` in _WORK_TOPIC escalated this
+    # because Ali was talking about the person working, not about whether the
+    # code works.
+    "im so worried while this guy is working should we like watch some youtube",
+    "you working hard tonight or what",
+    # Fifty words of live small talk that the >16-word cap escalated before the
+    # chit-chat signal in it was ever consulted.
+    (
+        "its a bit weird i dont know what to chat to you about with you if its "
+        "just general things i dont know what general things are the only thing "
+        "i can think of is how are you and are you good thats it give me things "
+        "you can talk to me about"
+    ),
 ]
 
 MUST_ESCALATE = [
@@ -47,6 +69,42 @@ MUST_ESCALATE = [
     # A greeting does not launder a work question riding along with it.
     "hello hi how are you so im asking you about the code of vox what changes did we do",
 ]
+
+
+# whisper.cpp labels silence rather than returning nothing. Handed on as an
+# utterance, "[BLANK_AUDIO]" fails the small-talk whitelist and the companion
+# escalated out_of_scope on the first turn of a quiet room — killing the handoff
+# at the exact moment it exists to cover. Observed live.
+NON_SPEECH = [
+    "[BLANK_AUDIO]",
+    "[ Silence ]",
+    "[MUSIC]",
+    "(wind blowing)",
+    "[BLANK_AUDIO] [BLANK_AUDIO]",
+    "  [ INAUDIBLE ]  ",
+    "",
+    "   ",
+    None,
+]
+
+REAL_SPEECH_NEAR_MARKERS = [
+    "[BLANK_AUDIO] okay so what did you change",  # a marker plus real words
+    "hey man",
+    "stop",
+    "no (laughs) not really",  # a marker inside genuine speech
+]
+
+
+@pytest.mark.parametrize("transcript", NON_SPEECH)
+def test_marker_only_transcripts_are_not_speech(transcript) -> None:
+    assert is_non_speech_transcript(transcript) is True
+
+
+@pytest.mark.parametrize("transcript", REAL_SPEECH_NEAR_MARKERS)
+def test_real_words_survive_even_beside_a_marker(transcript: str) -> None:
+    # Over-filtering would silently drop what the user actually said, which is
+    # worse than passing a marker through.
+    assert is_non_speech_transcript(transcript) is False
 
 
 @pytest.mark.parametrize("utterance", ANSWERABLE)
