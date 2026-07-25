@@ -109,6 +109,33 @@ Run `vox barge-in calibrate` before enabling it. It measures Kokoro's bleed
 against your voice on your hardware and prints the margin that follows from the
 numbers — including an honest verdict when the gap is too small to gate on.
 
+## The companion (dead-air tier)
+
+Off by default. `VOX_COMPANION_ENABLED=1` gives Vox a second, faster voice for
+the 25–40 seconds an agent spends working. The agent calls `companion` with a
+brief *before* it goes quiet; the companion speaks it in its own Kokoro voice
+and then holds the conversation until the agent comes back.
+
+**It never answers anything about your work.** Scope is a whitelist decided in
+`intents.companion_may_answer` — small talk, acknowledgements, "still there?".
+Anything that looks like a file, a command, a question about the code, or is
+simply long enough to be a real request escalates immediately and returns the
+full transcript, so the agent picks up without you repeating yourself. The
+heuristic is deliberately biased toward escalating: over-escalating costs a
+round trip, under-escalating means a model that has never seen your project
+answers a question about it confidently.
+
+**Where the network call happens.** Vox opens no outbound sockets — that stays
+literally true. A companion turn shells out to `grokctl ask`, which already
+owns the xAI OAuth credential, and *it* makes the call. `diagnostics(section=
+"privacy")` reports both halves rather than hiding the second one: `local_only`
+stays `true` and a `companion` block names the backend and whether egress is
+enabled.
+
+Measured: ~2.5s per companion turn end to end, against 25–40s for a full agent
+turn. It is a courtesy, not a dependency — a missing or failing backend
+escalates back to the agent rather than taking the voice turn down.
+
 ## Session and turn controls
 
 | User intent | Effect |

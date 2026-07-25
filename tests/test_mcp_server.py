@@ -30,6 +30,7 @@ TOOL_NAMES = {
     "transcribe",
     "voice_registry",
     "voice_survey",
+    "companion",
     "dj",
     "voice_clone",
     "soundfonts",

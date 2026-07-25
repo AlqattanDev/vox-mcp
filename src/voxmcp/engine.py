@@ -31,12 +31,13 @@ from .audio import (
     PlaybackHandle,
 )
 from .compat import LegacyCompatibility
+from .companion import COMPANION_AGENT, ask_companion
 from .config import VoxConfig
 from .diagnostics import static_diagnostics
 from .earcons import earcons_enabled, ensure_earcons
 from .errors import BusyError, PrivacyError, ServiceUnavailableError, VoxError
 from .eventlog import JsonlEventLogger, read_events
-from .intents import classify_spoken_intent
+from .intents import classify_spoken_intent, companion_may_answer
 from .agents import AgentVoices, FALLBACK_VOICES
 from .last_heard import LastHeardStore
 from .notes import NotesStore
@@ -1715,6 +1716,19 @@ class VoxEngine:
             "barge_in_enabled": self.config.barge_in_enabled,
             "mic_armed_for_barge_in": self.barge_in_armed,
             "control_token_path": str(self.control_token_path),
+            # local_only above is a true statement about this process: Vox
+            # itself opens no outbound socket, ever. But a companion turn is
+            # answered by grokctl, which calls xAI on your behalf, and pretending
+            # that is purely local would be the dishonest half of a true claim.
+            "companion": {
+                "enabled": self.config.companion_enabled,
+                "backend": "grokctl",
+                "egress": self.config.companion_enabled,
+                "note": (
+                    "Companion turns are answered by a separate local process "
+                    "(grokctl) which calls xAI. Vox opens no outbound sockets."
+                ),
+            },
         }
         try:
             result["events"] = read_events(self.config.event_log_path)[-50:]
@@ -1831,10 +1845,102 @@ class VoxEngine:
             "local_only": True,
         }
 
+    async def companion(
+        self,
+        client_id: str,
+        *,
+        action: str = "handoff",
+        brief: str = "",
+        budget_turns: int = 6,
+        agent: str = COMPANION_AGENT,
+        **_: Any,
+    ) -> dict[str, Any]:
+        """Hand the conversation to a fast model while the real agent works.
+
+        This is the answer to dead air, not to hard questions: the companion
+        holds small talk at conversational speed and escalates everything else
+        straight back.  It runs through ``_run_operation`` like any other turn,
+        so the privacy pause and the FIFO gate apply unchanged.
+        """
+
+        if action != "handoff":
+            raise VoxError(f"Unknown companion action: {action}")
+        if not self.config.companion_enabled:
+            return {
+                "status": "disabled",
+                "reason": "VOX_COMPANION_ENABLED is not set",
+                "turns": [],
+            }
+        budget = max(1, min(int(budget_turns), 20))
+
+        async def operation() -> dict[str, Any]:
+            turns: list[dict[str, Any]] = []
+            voice = await self._agent_voice(agent)
+            opening = brief.strip() or "Give me a minute, I'm working on it."
+            outcome = "completed"
+            reason = "budget_exhausted"
+
+            spoken = await self._speak_locked(
+                client_id, opening, voice=voice, speed=1.0, instructions=None
+            )
+            if spoken.get("status") == "cancelled":
+                return {"status": "cancelled", "turns": turns, "reason": "cancelled"}
+
+            for _ in range(budget):
+                heard = await self._listen_locked(client_id)
+                status = heard.get("status")
+                if status != "completed":
+                    reason = str(status or "no_speech")
+                    break
+                transcript = str(heard.get("transcript") or "")
+                if heard.get("control", {}).get("action") in {"stop", "pause"}:
+                    outcome, reason = "completed", "user_stopped"
+                    turns.append({"heard": transcript, "said": None})
+                    break
+                if not companion_may_answer(transcript):
+                    # Whitelist-only: anything that might be about the work goes
+                    # back to the agent that actually knows it.
+                    outcome, reason = "escalated", "out_of_scope"
+                    turns.append({"heard": transcript, "said": None, "escalated": True})
+                    break
+                reply = await ask_companion(transcript)
+                if not reply.ok:
+                    outcome, reason = "escalated", reply.reason
+                    turns.append({"heard": transcript, "said": None, "escalated": True})
+                    break
+                turns.append(
+                    {"heard": transcript, "said": reply.text, "elapsed_ms": reply.elapsed_ms}
+                )
+                self._log(
+                    "companion.turn",
+                    client_id=client_id,
+                    backend=reply.backend,
+                    elapsed_ms=reply.elapsed_ms,
+                )
+                said = await self._speak_locked(
+                    client_id, reply.text, voice=voice, speed=1.0, instructions=None
+                )
+                if said.get("status") == "cancelled":
+                    outcome, reason = "cancelled", "cancelled"
+                    break
+
+            return {
+                "status": outcome,
+                "reason": reason,
+                "turns": turns,
+                "agent": agent,
+                # Everything the companion heard, so the real agent can pick the
+                # conversation up without asking the user to repeat themselves.
+                "transcript": [turn["heard"] for turn in turns if turn.get("heard")],
+            }
+
+        return await self._run_operation(client_id, "companion", operation, agent=agent)
+
     async def survey(
         self,
         client_id: str,
         turns: list[dict[str, Any]],
+        agent: str | None = None,
         **_: Any,
     ) -> dict[str, Any]:
         if not 1 <= len(turns) <= 50:
@@ -1842,13 +1948,16 @@ class VoxEngine:
 
         async def operation() -> dict[str, Any]:
             results: list[dict[str, Any]] = []
+            # One voice for the whole run: a scripted interview read by a
+            # rotating cast would sound like a fault, not a feature.
+            default_voice = await self._agent_voice(agent) if agent else None
             for index, turn in enumerate(turns):
                 message = str(turn.get("message", ""))
                 try:
                     spoken = await self._speak_locked(
                         client_id,
                         message,
-                        voice=turn.get("voice"),
+                        voice=turn.get("voice") or default_voice,
                         speed=float(turn.get("speed", 1.0)),
                         instructions=turn.get("instructions"),
                     )

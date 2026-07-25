@@ -579,6 +579,31 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
         )
 
     @server.tool(
+        name="companion",
+        description=(
+            "Hand the conversation to a fast companion voice while you work, so the user "
+            "is not left in silence. Call this BEFORE a long stretch of tool use, with a "
+            "brief saying what you are about to do. The companion holds small talk only "
+            "and escalates anything about the user's project straight back to you; the "
+            "returned transcript is everything it heard. Off unless VOX_COMPANION_ENABLED."
+        ),
+        annotations=LOCAL_ACTION,
+    )
+    async def companion(
+        ctx: Context,
+        brief: str,
+        budget_turns: int = 6,
+    ) -> Any:
+        return await _invoke(
+            current_engine(),
+            "companion",
+            client_id=_client_id(ctx),
+            action="handoff",
+            brief=brief,
+            budget_turns=budget_turns,
+        )
+
+    @server.tool(
         name="voice_survey",
         description="Run or record a local voice-comparison survey.",
         annotations=LOCAL_ACTION,

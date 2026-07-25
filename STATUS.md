@@ -59,6 +59,17 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
   Honest while armed: `microphone_open`, `mic_armed_for_barge_in`,
   `barge_in_enabled` on `/health` and `diagnostics(privacy)`; the glyph goes
   red and the panel reads "Speaking · cut in".
+- **Companion tier (off by default).** `VOX_COMPANION_ENABLED=1` + the
+  `companion` tool: hand over a brief before a long stretch of work and a
+  second Kokoro voice keeps the user company instead of leaving dead air.
+  ~2.5s per turn vs 25–40s for a real agent turn. **Never answers anything
+  about the project** — `intents.companion_may_answer` is a whitelist (small
+  talk only) and everything else escalates with the full transcript attached.
+  Backend is `grokctl ask` on Ali's xAI OAuth (no metered key, no new
+  credential), so **voxmcp still opens zero outbound sockets** and
+  `config.local_only` stays an unqualified true; `diagnostics(privacy)` carries
+  a `companion` block naming the backend and egress. A missing or failing
+  backend escalates rather than stalling.
 - **Voice turn contract.** The runtime owns 2–4s of a spoken turn; the agent owns
   25–40. That gap is desk work done inside a conversation, so the contract ships
   where hosts read it — MCP server instructions, the `voice_mode` prompt, and the
@@ -123,7 +134,7 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
 | `com.vox.runtime` | ~73 MB | ~73 MB |
 | **total** | **~2.7 GB** | **~3.2 GB** |
 
-Tests: `.venv/bin/python -m pytest tests/` — **221 passing**.
+Tests: `.venv/bin/python -m pytest tests/` — **249 passing**.
 
 **Slash commands** (in `~/.claude/commands/`, global): `/speak` reads the
 agent's last reply aloud (no mic); `/listen` opens the mic for one utterance

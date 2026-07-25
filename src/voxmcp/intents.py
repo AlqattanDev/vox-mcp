@@ -141,3 +141,79 @@ def classify_spoken_intent(text: str) -> IntentMatch:
 
 # A short alias is convenient for adapters and remains unambiguous.
 parse_spoken_intent = classify_spoken_intent
+
+
+# Everything the companion is allowed to answer on its own.  Anything outside
+# this is escalated to the real agent — the list is a whitelist and it stays
+# short on purpose.  A companion that starts explaining your codebase is the
+# failure this whole design exists to prevent.
+_COMPANION_SMALL_TALK = frozenset(
+    {
+        "hi", "hey", "hello", "yo", "sup", "morning", "good morning",
+        "good evening", "thanks", "thank you", "cheers", "nice", "cool",
+        "ok", "okay", "right", "sure", "yeah", "yep", "yes", "no", "nope",
+        "mhm", "uh huh", "go on", "keep going", "carry on", "still there",
+        "you there", "how are you", "hows it going", "how is it going",
+        "whats up", "what's up", "im back", "im here", "just waiting",
+        "nothing", "never mind", "nevermind", "sorry", "my bad", "haha",
+        "lol", "fair", "fair enough", "makes sense", "true", "bye",
+    }
+)
+
+# Shapes that mean "this is about the work" no matter how they are phrased.
+_CODE_SHAPED = re.compile(
+    r"""
+      (?: \b[\w-]+\.(?:py|ts|tsx|js|jsx|swift|rs|go|java|rb|sh|json|toml|yaml|yml|md)\b )
+    | (?: \b\w+ \s* \( \s* \) )                 # a function call
+    | (?: \b\w+ (?: _\w+ )+ \b )                # snake_case identifier
+    | (?: \b(?:src|tests|docs)/ )               # a repo path
+    | (?: \b(?:git|npm|pytest|bun|uv|cargo|launchctl|ssh|aws|terraform)\b )
+    """,
+    re.VERBOSE,
+)
+
+_WORK_TOPIC = re.compile(
+    r"""\b(?:
+        code | codebase | repo | repository | commit | branch | merge | diff
+      | bug | crash | stack \s* trace | error | exception | traceback
+      | test | tests | build | compile | deploy | deployment | rollback
+      | function | class | method | variable | parameter | api | endpoint
+      | database | schema | migration | config | environment
+      | why \s+ (?:does|did|is|isn't|isnt|are|aren't|arent)
+      | what'?s? \s+ wrong
+      | how \s+ do \s+ i
+      | can \s+ you \s+ (?:fix|change|add|write|implement|refactor|check|look)
+      | show \s+ me
+      | what \s+ (?:did|are) \s+ you \s+ (?:do|doing|change|changing)
+    )\b""",
+    re.VERBOSE,
+)
+
+
+def companion_may_answer(text: str) -> bool:
+    """True only when the companion can safely answer without the real agent.
+
+    Deliberately biased toward escalation: this is a text heuristic, not a
+    classifier, so every ambiguous case goes to the agent that actually knows
+    the code.  Over-escalating costs a round trip; under-escalating means a
+    model with no knowledge of the project answers a question about it
+    confidently, which is the failure mode worth paying to avoid.
+    """
+
+    normalized = normalize_utterance(text)
+    if not normalized:
+        return False
+    # Code shapes live in exactly the punctuation normalize_utterance strips —
+    # "audio.py" and "src/" survive only in the raw text — so that check runs
+    # before normalization and the topic check runs after it.
+    if isinstance(text, str) and _CODE_SHAPED.search(text.casefold()):
+        return False
+    if normalized in _COMPANION_SMALL_TALK:
+        return True
+    # Past the whitelist, length alone is suspicious: a long utterance during a
+    # wait is far more likely to be a real request than a pleasantry.
+    if len(normalized.split()) > 12:
+        return False
+    if _CODE_SHAPED.search(normalized) or _WORK_TOPIC.search(normalized):
+        return False
+    return True

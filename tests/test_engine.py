@@ -1020,3 +1020,93 @@ async def test_armed_microphone_is_reported_while_the_agent_is_speaking(tmp_path
     assert health["mic_armed_for_barge_in"] is True
     assert health["barge_in_enabled"] is True
     assert "interrupt" in health["detail"]
+
+
+@pytest.mark.asyncio
+async def test_companion_is_off_unless_enabled(tmp_path: Path):
+    # Nothing reaches the network by default, not even indirectly.
+    engine = make_engine(tmp_path)
+    result = await engine.companion("claude", brief="Working on it.")
+    assert result["status"] == "disabled"
+    assert result["turns"] == []
+
+
+@pytest.mark.asyncio
+async def test_companion_answers_small_talk_and_escalates_the_work(tmp_path: Path, monkeypatch):
+    # The whole point: chat is handled locally-ish and fast, anything about the
+    # project comes straight back to the agent that knows it.
+    from voxmcp import engine as engine_module
+    from voxmcp.companion import CompanionReply
+
+    heard = iter(["how's it going", "why did engine.py crash"])
+    asked: list[str] = []
+
+    class ScriptedSpeech(FakeSpeech):
+        async def transcribe(self, path, **kwargs):
+            return SpeechResult("whisper.cpp", 20, text=next(heard, "bye"))
+
+    async def fake_ask(prompt, **kwargs):
+        asked.append(prompt)
+        return CompanionReply(True, "Doing great, still here.", "ok", 900)
+
+    monkeypatch.setattr(engine_module, "ask_companion", fake_ask)
+    engine = make_engine(tmp_path, speech_client=ScriptedSpeech())
+    engine.config = VoxConfig(
+        state_dir=tmp_path / "state", idle_timeout_seconds=600, companion_enabled=True
+    )
+
+    result = await engine.companion("claude", brief="Reading the audio path.", budget_turns=5)
+
+    assert result["status"] == "escalated"
+    assert result["reason"] == "out_of_scope"
+    # Answered the pleasantry, refused the code question.
+    assert asked == ["how's it going"]
+    assert result["turns"][0]["said"] == "Doing great, still here."
+    assert result["turns"][1]["escalated"] is True
+    # The agent gets everything that was said, so the user never repeats themselves.
+    assert result["transcript"] == ["how's it going", "why did engine.py crash"]
+
+
+@pytest.mark.asyncio
+async def test_companion_backend_failure_escalates_rather_than_stalling(tmp_path: Path, monkeypatch):
+    # A dead backend must hand the conversation back, not leave the user
+    # talking to a microphone that never answers.
+    from voxmcp import engine as engine_module
+    from voxmcp.companion import CompanionReply
+
+    async def dead_backend(prompt, **kwargs):
+        return CompanionReply(False, "", "llm-spending-limit", 40)
+
+    monkeypatch.setattr(engine_module, "ask_companion", dead_backend)
+    engine = make_engine(tmp_path)
+    engine.config = VoxConfig(
+        state_dir=tmp_path / "state", idle_timeout_seconds=600, companion_enabled=True
+    )
+
+    result = await engine.companion("claude", brief="One sec.", budget_turns=3)
+
+    assert result["status"] == "escalated"
+    assert result["reason"] == "llm-spending-limit"
+
+
+@pytest.mark.asyncio
+async def test_companion_speaks_in_its_own_voice(tmp_path: Path, monkeypatch):
+    # A companion that sounds like the agent reads as the agent going vague
+    # about its own work.
+    from voxmcp import engine as engine_module
+    from voxmcp.companion import CompanionReply
+
+    async def fake_ask(prompt, **kwargs):
+        return CompanionReply(True, "Still here.", "ok", 10)
+
+    monkeypatch.setattr(engine_module, "ask_companion", fake_ask)
+    engine = make_engine(tmp_path)
+    engine.config = VoxConfig(
+        state_dir=tmp_path / "state", idle_timeout_seconds=600, companion_enabled=True
+    )
+    engine._voice_pool = ["af_sky", "bf_emma", "am_adam", "bm_george"]
+
+    result = await engine.companion("claude", brief="Give me a minute.", budget_turns=1)
+
+    assert result["agent"] == "companion"
+    assert engine.agent_voices.resolve("companion") != engine.default_voice
