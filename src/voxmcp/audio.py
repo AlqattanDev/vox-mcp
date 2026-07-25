@@ -102,10 +102,23 @@ class CaptureConfig:
     speech_start_s: float = 0.06
     frame_ms: int = 20
     initial_noise_floor_dbfs: float = -60.0
-    minimum_speech_dbfs: float = -48.0
+    minimum_speech_dbfs: float = -60.0
     speech_margin_db: float = 9.0
-    noise_smoothing: float = 0.95
-    noise_rise_smoothing: float = 0.999
+    # How far above the room's own noise a VAD-endorsed frame must sit. A fixed
+    # rise cannot work across rooms: a bedroom at night and a café differ by
+    # 25 dB in absolute level, but in both of them speech sits well above the
+    # room while the room's own fluctuation stays small. So the requirement is
+    # sized to the measured fluctuation, which travels with you.
+    vad_margin_db: float = 3.0
+    noise_spread_k: float = 4.0
+    max_vad_margin_db: float = 15.0
+    # The floor is read straight off a rolling window of recent loudness rather
+    # than smoothed from frames a classifier already labelled. Labelling first
+    # is circular: walk into a loud room and every frame reads as speech, so
+    # the floor never rises to meet the room and never stops reading as speech.
+    # A low percentile of raw levels has no such loop — speech has gaps, and a
+    # room's quietest moments are the room.
+    noise_window_s: float = 3.0
     queue_capacity_frames: int = 512
     source_stall_timeout_s: float = 2.0
     save_latest: bool = True
@@ -146,10 +159,14 @@ class CaptureConfig:
             raise ValueError("minimum_speech_dbfs must be in [-96, 0]")
         if not 0 < self.speech_margin_db <= 40.0:
             raise ValueError("speech_margin_db must be in (0, 40]")
-        if not 0 <= self.noise_smoothing < 1.0:
-            raise ValueError("noise_smoothing must be in [0, 1)")
-        if not 0 <= self.noise_rise_smoothing < 1.0:
-            raise ValueError("noise_rise_smoothing must be in [0, 1)")
+        if not 0 < self.noise_window_s <= 30.0:
+            raise ValueError("noise_window_s must be in (0, 30]")
+        if not 0 < self.vad_margin_db <= 40.0:
+            raise ValueError("vad_margin_db must be in (0, 40]")
+        if not 0 <= self.noise_spread_k <= 10.0:
+            raise ValueError("noise_spread_k must be in [0, 10]")
+        if not self.vad_margin_db <= self.max_vad_margin_db <= 40.0:
+            raise ValueError("max_vad_margin_db must be in [vad_margin_db, 40]")
         if self.queue_capacity_frames < 2:
             raise ValueError("queue_capacity_frames must be at least 2")
         if self.source_stall_timeout_s <= 0:
@@ -377,6 +394,14 @@ class AdaptiveCaptureState:
         self.speech_classifier = speech_classifier
         self.phase = CapturePhase.WAITING_FOR_SPEECH
         self.noise_floor_dbfs = self.config.initial_noise_floor_dbfs
+        # How much this room's own noise wanders above its floor, in dB.
+        # Learned from the room itself, so the speech gate re-sizes when you
+        # move between a quiet bedroom and a loud office without being told.
+        self.noise_spread_db = self.config.vad_margin_db
+        window = max(
+            8, round(self.config.noise_window_s * 1000.0 / self.config.frame_ms)
+        )
+        self._recent_dbfs: deque[float] = deque(maxlen=window)
         self.elapsed_s = 0.0
         self.speech_duration_s = 0.0
         self.trailing_silence_s = 0.0
@@ -401,6 +426,44 @@ class AdaptiveCaptureState:
             self.config.minimum_speech_dbfs,
             self.noise_floor_dbfs + self.config.speech_margin_db,
         )
+
+    def _vad_required_rise_db(self) -> float:
+        """How far above this room's floor a VAD-endorsed frame must sit.
+
+        Rooms differ by 25 dB in absolute level but agree on the shape: the
+        room's own noise wanders within a few dB of its floor, and speech sits
+        far above it.  Sizing the requirement to the measured wander is what
+        lets one rule work in a bedroom at night and an office at noon; a fixed
+        number only ever fits the room it was measured in.  Bounded at both
+        ends so a burst of noise cannot make Vox deaf, and a freakishly still
+        room cannot make it hair-triggered.
+        """
+
+        config = self.config
+        scaled = config.noise_spread_k * self.noise_spread_db
+        return min(config.max_vad_margin_db, max(config.vad_margin_db, scaled))
+
+    def _observe_room(self, dbfs: float) -> None:
+        """Re-read the room from raw loudness, before anything is called speech.
+
+        The floor is the 10th percentile of the recent window: speech has gaps
+        between words and phrases, so the quietest tenth of any few seconds is
+        the room rather than the talking.  The spread from there to the median
+        says how restless the room is, which is what the speech gate has to
+        clear.  Both move with you, which is the point — the same rule has to
+        hold in a bedroom at night and an office at noon.
+        """
+
+        self._recent_dbfs.append(dbfs)
+        # Below about a quarter second there is not enough window to read a
+        # floor from; the configured starting point is the safer guess.
+        if len(self._recent_dbfs) < 12:
+            return
+        window = sorted(self._recent_dbfs)
+        floor = window[max(0, round(0.10 * (len(window) - 1)))]
+        median = window[len(window) // 2]
+        self.noise_floor_dbfs = max(-96.0, min(-3.0, floor))
+        self.noise_spread_db = max(0.0, median - floor)
 
     def _effective_trailing_silence_s(self) -> float:
         """How much silence ends *this* utterance, scaled to how much was said.
@@ -450,6 +513,9 @@ class AdaptiveCaptureState:
             self._pre_roll_samples -= excess
 
     def _classify(self, frame: FloatAudio, dbfs: float) -> bool:
+        # Read the room before deciding anything about this frame. Doing it the
+        # other way round is the loop that made a loud room unusable.
+        self._observe_room(dbfs)
         threshold = self.threshold_dbfs
         energy_speech = dbfs >= threshold
         vad_vote: bool | None = None
@@ -464,38 +530,21 @@ class AdaptiveCaptureState:
         if vad_vote is None:
             is_speech = energy_speech
         elif vad_vote:
-            # Allow VAD to recognize quiet speech, but still require a small
-            # rise above the learned floor to reject stationary fan noise —
-            # and never below the absolute floor, whatever the VAD claims.
-            # WebRTC VAD votes speech on ordinary room tone, and a room whose
-            # ambient sits within 3 dB of its own learned floor would otherwise
-            # read as continuous speech: trailing silence never accumulates and
-            # the turn cannot endpoint. minimum_speech_dbfs is the promise that
-            # a level this quiet is not speech no matter who says otherwise.
+            # WebRTC VAD votes speech on ordinary room tone, so its vote alone
+            # cannot open the gate: a room whose own fluctuation exceeds the
+            # required rise reads as continuous speech, trailing silence never
+            # accumulates, and the turn cannot endpoint. The rise it must clear
+            # is sized to how much *this* room actually fluctuates, so the same
+            # rule holds in a silent bedroom and a loud office instead of
+            # needing a number measured in one of them.
             is_speech = (
-                dbfs >= self.noise_floor_dbfs + 3.0
+                dbfs >= self.noise_floor_dbfs + self._vad_required_rise_db()
                 and dbfs >= self.config.minimum_speech_dbfs
             )
         else:
             # A very strong transient may be clipped speech that VAD missed.
             is_speech = energy_speech and dbfs >= threshold + 12.0
 
-        if not is_speech or vad_vote is False:
-            # The VAD calling a loud frame non-speech is the signature of a
-            # droning room (fan, AC).  Let the floor keep learning it at the
-            # normal rate even when raw energy trips the threshold; otherwise a
-            # room whose ambient starts above the threshold reads as endless
-            # speech and the turn can never endpoint.
-            alpha = self.config.noise_smoothing
-            self.noise_floor_dbfs = alpha * self.noise_floor_dbfs + (1.0 - alpha) * dbfs
-        elif dbfs > self.noise_floor_dbfs:
-            # Speech-accepted frames still lift the floor, only very slowly:
-            # real speech has inter-word gaps that pull it back down, while a
-            # sustained drone that fools the VAD eventually reads as the new
-            # silence so the turn can endpoint.
-            alpha = self.config.noise_rise_smoothing
-            self.noise_floor_dbfs = alpha * self.noise_floor_dbfs + (1.0 - alpha) * dbfs
-        self.noise_floor_dbfs = max(-96.0, min(-3.0, self.noise_floor_dbfs))
         return is_speech
 
     def feed(self, samples: Any) -> FrameDecision:

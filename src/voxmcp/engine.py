@@ -148,8 +148,11 @@ class VoxEngine:
         self._barge_in_speech_margin_db = float(
             os.environ.get("VOX_BARGE_IN_SPEECH_MARGIN_DB", "18.0")
         )
-        self._barge_in_noise_rise_smoothing = float(
-            os.environ.get("VOX_BARGE_IN_NOISE_RISE_SMOOTHING", "0.9")
+        # A short window so the floor re-reads the room quickly once our own
+        # playback becomes part of it: the speaker bleed has to count as the
+        # new silence within a sentence, not within a paragraph.
+        self._barge_in_noise_window_s = float(
+            os.environ.get("VOX_BARGE_IN_NOISE_WINDOW_SECONDS", "0.8")
         )
         self._barge_in_duck_volume = min(
             1.0, max(0.0, float(os.environ.get("VOX_BARGE_IN_DUCK_VOLUME", "0.85")))
@@ -1008,7 +1011,7 @@ class VoxEngine:
             self.recorder.config,
             speech_start_s=self._barge_in_speech_start_s,
             speech_margin_db=self._barge_in_speech_margin_db,
-            noise_rise_smoothing=self._barge_in_noise_rise_smoothing,
+            noise_window_s=self._barge_in_noise_window_s,
         )
 
     async def _capture_once(

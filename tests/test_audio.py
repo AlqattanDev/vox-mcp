@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from voxmcp.audio import (
+    _dbfs,
     AdaptiveCaptureState,
     AudioPlayer,
     AudioRecorder,
@@ -124,7 +125,16 @@ def adaptive_config(**overrides: Any) -> CaptureConfig:
 
 
 def feed_speech(state: AdaptiveCaptureState, seconds: float) -> None:
-    for _ in range(round(seconds / 0.02)):
+    """Feed `seconds` of speech-shaped audio, dips and all.
+
+    A flat tone is a drone, not speech, and the detector is right to say so —
+    a steady level becomes its own noise floor. Real speech breathes: short
+    quiet gaps between words are what keep the floor down where the room is.
+    """
+
+    for index in range(round(seconds / 0.02)):
+        if index and index % 4 == 0:  # a 20 ms inter-word gap, too short to close
+            state.feed(frame(0.002))
         state.feed(frame(0.2))
 
 
@@ -257,13 +267,11 @@ def test_loud_drone_the_vad_rejects_endpoints_instead_of_recording_forever() -> 
 
 
 def test_sustained_drone_that_fools_the_vad_still_endpoints() -> None:
-    # Even when the VAD wrongly votes speech on a constant drone, the slow
-    # upward floor drift must eventually read it as the new silence.
-    state = AdaptiveCaptureState(
-        1_000,
-        config(noise_rise_smoothing=0.9),
-        lambda _samples, _sr: True,
-    )
+    # Even when the VAD wrongly votes speech on a constant drone, the room
+    # reads as the room: a steady level becomes its own floor, and a frame
+    # sitting *at* the floor never clears the rise above it. No tuning knob
+    # is involved — that is the point of reading the floor from raw levels.
+    state = AdaptiveCaptureState(1_000, config(), lambda _samples, _sr: True)
 
     decision = None
     for _ in range(80):
@@ -424,6 +432,50 @@ class FakeSoundDevice:
                 return None
 
         return Stream()
+
+
+@pytest.mark.parametrize(
+    "room_dbfs,wander_db,speech_dbfs,label",
+    [
+        (-70.0, 3.0, -35.0, "silent bedroom at night"),
+        (-48.8, 6.0, -28.0, "measured MacBook room"),
+        (-40.0, 8.0, -25.0, "same room, machines running"),
+        (-32.0, 8.0, -18.0, "office or cafe"),
+    ],
+)
+def test_one_rule_holds_across_rooms_25db_apart(
+    room_dbfs: float, wander_db: float, speech_dbfs: float, label: str
+) -> None:
+    """Silence stays silence and speech stays speech, wherever you are.
+
+    Vox has to work in the room you are in, not the room it was calibrated in.
+    These four differ by nearly 40 dB of absolute level; the gate has to move
+    with them without anyone typing a number. WebRTC is simulated at its worst
+    here — a VAD that calls every single frame speech — because that is the
+    vote that made an idle room read as continuous talking.
+    """
+
+    rng = np.random.default_rng(7)
+    always_speech = lambda _samples, _sr: True  # noqa: E731
+
+    def room_frame() -> np.ndarray:
+        return frame(10 ** ((room_dbfs + rng.uniform(-wander_db, wander_db)) / 20.0))
+
+    def speech_frame() -> np.ndarray:
+        return frame(10 ** ((speech_dbfs + rng.uniform(-2.0, 2.0)) / 20.0))
+
+    def classify(samples: np.ndarray) -> bool:
+        return state._classify(samples, _dbfs(samples))
+
+    state = AdaptiveCaptureState(1_000, config(), always_speech)
+    for _ in range(50):  # a second to read the room
+        classify(room_frame())
+
+    false_speech = sum(1 for _ in range(200) if classify(room_frame()))
+    heard = sum(1 for _ in range(25) if classify(speech_frame()))
+
+    assert false_speech <= 4, f"{label}: room read as speech {false_speech}/200"
+    assert heard >= 22, f"{label}: real speech missed, only {heard}/25"
 
 
 def test_room_tone_the_vad_calls_speech_is_still_below_the_absolute_floor() -> None:

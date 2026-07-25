@@ -34,21 +34,28 @@ Default turn bounds are deliberately generous for this user’s speaking style:
 All four are configurable. Unlike VoiceMode, the speech-onset timeout and
 trailing-silence timeout are separate.
 
-### Calibrate the speech floor first
+### Vox reads whatever room it is in
 
-Everything below assumes Vox can tell your silence from your speech, and on a
-laptop microphone that is not automatic. WebRTC VAD votes "speech" on ordinary
-room tone, so if your room sits above `minimum_speech_dbfs` the runtime hears
-continuous talking: trailing silence never accumulates and a one-word answer
-takes many seconds to end.
+Nothing here needs calibrating, and no level is written down anywhere. Every
+few seconds Vox re-reads the room from raw loudness: the quietest tenth of the
+recent window is the room, and how far the room wanders above that says how
+much of a rise real speech has to clear. Both move with you.
 
-```bash
-vox calibrate
-```
+This matters because WebRTC VAD votes "speech" on ordinary room tone. Trusting
+that vote against a fixed level only works in the room the level was measured
+in — everywhere else, silence reads as continuous talking, trailing silence
+never accumulates, and a one-word answer takes many seconds to end. Reading the
+floor from the room instead means a bedroom at night, a kitchen with the
+machines on, and an office at noon all get the same treatment despite being
+nearly 40 dB apart.
 
-It measures your quiet room, then your voice, and prints the floor that clears
-the room's *peaks* plus the command to apply it. Note the applied value only
-lasts the login session — re-run it after a reboot.
+The floor is read from raw levels rather than from frames something already
+called speech, because labelling first is circular: walk somewhere loud and
+every frame reads as speech, so the floor never rises to meet the room and
+never stops reading as speech.
+
+`VOX_MINIMUM_SPEECH_DBFS` still exists as a hard backstop for pathological
+hardware, but it is not part of normal setup and you should not need it.
 
 ### Trailing silence scales with the utterance
 

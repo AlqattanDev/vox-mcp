@@ -36,18 +36,17 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
 - **Streamed TTS.** Long replies speak sentence-by-sentence; the next span
   synthesizes while the current one plays, so audio starts after the first
   sentence. Off via `VOX_STREAM_TTS=0`.
-- **The speech floor is absolute.** `minimum_speech_dbfs` is honoured whatever
-  WebRTC VAD votes. It previously applied only on the energy path, so a VAD
-  "speech" vote needed just 3 dB over the learned floor — and WebRTC votes
-  speech on ordinary room tone. Measured on this MacBook: an idle room sits at
-  −48.8 dBFS median / −42.5 peak, above the −48 default, so **silence was
-  classified as talking**: `speech_duration_s` inflated ~8× (the single word
-  "Done" scored 5.22 s), trailing silence never accumulated, and short answers
-  took 7 s to endpoint. With the floor honoured, the same one-word answer
-  endpoints in **2.7 s**. Run **`vox calibrate`** to measure your room and get
-  the value; `VOX_MINIMUM_SPEECH_DBFS` and `VOX_SPEECH_MARGIN_DB` set it.
-  This machine runs `-38`. `launchctl setenv` lasts the login session — re-run
-  it after a reboot.
+- **The noise floor is read from the room, every few seconds.** No calibration,
+  no stored level, nothing to re-run when you move. The floor is the 10th
+  percentile of a rolling 3 s window of raw loudness (speech has gaps; the
+  quietest tenth is the room), and the rise real speech must clear is scaled
+  from how far the room wanders above it — bounded 3–15 dB. Read from *raw*
+  levels, never from frames a classifier already labelled: labelling first is
+  circular, so in a loud room every frame reads as speech and the floor never
+  rises to meet it. Verified across four simulated rooms nearly 40 dB apart
+  (silent bedroom → café), plus live: one word **7.24 s → 1.6 s capture** with
+  nothing configured, which beat the hand-tuned value it replaced.
+  `VOX_MINIMUM_SPEECH_DBFS` remains a hard backstop, not part of setup.
 - **Endpointing scales with the utterance.** Trailing silence runs 0.6s for a
   short answer and 1.6s for a long one, interpolated over 1.5s–3.0s of measured
   *speech* (not wall time, so pausing to think keeps a long answer on the long
@@ -62,9 +61,10 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
   remaining spans and the one being synthesized ahead are abandoned, and the
   pre-roll makes your opening words the reply — one capture serves both the
   detection and the answer. There is no AEC (playback is an opaque `afplay`
-  subprocess, so no reference signal exists), so the gate carries it: a
-  fast-rising noise floor swallows speaker bleed, the margin above it doubles,
-  onset needs 0.3s of sustained speech, and the turn ducks slightly. An empty
+  subprocess, so no reference signal exists), so the gate carries it: a short
+  0.8s noise window re-reads the room fast enough that speaker bleed becomes
+  the new floor within a sentence, the margin above it doubles, onset needs
+  0.3s of sustained speech, and the turn ducks slightly. An empty
   transcript after a barge-in is reported as silence, never as a user
   utterance. **Run `vox barge-in calibrate` first** — it measures bleed vs
   voice on your hardware and says plainly when the gap is too small.
@@ -153,9 +153,10 @@ So the contract took roughly a third off the mean and the runtime owns under
 1.5 s of a turn — but 26 s on one exchange says it is discipline, not a fix.
 The remaining lever is the agent behaving, not the runtime.
 
-Endpointing, same session: one-word answer **7.24 s → 2.7 s** once the speech
-floor was honoured; a 12.5 s ramble still gets the full 1.6 s and is not cut
-off mid-thought.
+Endpointing, same session, one word: **7.24 s → 1.60 s** (0.4 s of it speech)
+once the floor was read from the room. A ramble still gets patience scaled to
+its length — 1.88 s of speech drew 0.86 s of trailing silence, 12.5 s drew the
+full 1.6 s — and is never cut off mid-thought.
 
 ## Memory
 
@@ -166,7 +167,7 @@ off mid-thought.
 | `com.vox.runtime` | ~73 MB | ~73 MB |
 | **total** | **~2.7 GB** | **~3.2 GB** |
 
-Tests: `.venv/bin/python -m pytest tests/` — **251 passing**.
+Tests: `.venv/bin/python -m pytest tests/` — **255 passing**.
 
 **Slash commands** (in `~/.claude/commands/`, global): `/speak` reads the
 agent's last reply aloud (no mic); `/listen` opens the mic for one utterance
