@@ -736,6 +736,10 @@ def _calibrate_barge_in(
 
     bleed_armed_p90 = bleed.p90_dbfs + duck_offset_db
     gap_db = voice.median_dbfs - bleed_armed_p90
+    # The gate the VAD path enforces is a rise above the floor, and during
+    # playback the floor is the bleed. So the rise that separates you from
+    # Kokoro is the gap, less a safety band. This is the knob that bites when
+    # webrtcvad is installed; speech_margin_db only governs the fallback.
     recommended = max(6.0, round(gap_db - safety_db, 1))
     usable = gap_db >= safety_db + 6.0
 
@@ -757,8 +761,14 @@ def _calibrate_barge_in(
         },
         "gap_db": round(gap_db, 1),
         "recommended": {
+            "VOX_BARGE_IN_MAX_VAD_MARGIN_DB": recommended,
             "VOX_BARGE_IN_SPEECH_MARGIN_DB": recommended,
         },
+        "apply": (
+            f"launchctl setenv VOX_BARGE_IN_MAX_VAD_MARGIN_DB {recommended} && "
+            f"launchctl setenv VOX_BARGE_IN_SPEECH_MARGIN_DB {recommended} && "
+            f"launchctl kickstart -k gui/$(id -u)/com.vox.runtime"
+        ),
         "usable": usable,
         "verdict": (
             f"Your voice sits {gap_db:.1f} dB above the loudest speaker bleed. "

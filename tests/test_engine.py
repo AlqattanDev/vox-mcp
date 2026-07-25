@@ -1110,3 +1110,33 @@ async def test_companion_speaks_in_its_own_voice(tmp_path: Path, monkeypatch):
 
     assert result["agent"] == "companion"
     assert engine.agent_voices.resolve("companion") != engine.default_voice
+
+
+@pytest.mark.asyncio
+async def test_the_armed_gate_is_stricter_where_it_actually_decides(tmp_path: Path):
+    # Tightening only speech_margin_db looks like an echo gate and is not one:
+    # that knob feeds the energy path, which only decides when webrtcvad is
+    # absent. Wherever webrtcvad is installed the VAD path rules, so the armed
+    # config has to be stricter *there* or barge-in listens through its own
+    # playback exactly as sensitively as it listens to the user.
+    from voxmcp.audio import AdaptiveCaptureState
+
+    from voxmcp.audio import AudioRecorder, CaptureConfig
+
+    engine = make_engine(tmp_path, barge_in=True)
+    normal = CaptureConfig(save_latest=False, latest_wav_path=None)
+    engine.recorder = AudioRecorder(normal)
+    armed = engine.armed_capture_config()
+
+    always_speech = lambda _samples, _sr: True  # noqa: E731 - WebRTC on room tone
+
+    def required_rise(config) -> float:
+        state = AdaptiveCaptureState(16_000, config, always_speech)
+        return state._vad_required_rise_db()
+
+    assert required_rise(armed) > required_rise(normal)
+    assert armed.max_vad_margin_db > normal.max_vad_margin_db
+    # Onset still needs sustained speech, and the room is re-read faster so our
+    # own bleed becomes the floor within a sentence.
+    assert armed.speech_start_s > normal.speech_start_s
+    assert armed.noise_window_s < normal.noise_window_s

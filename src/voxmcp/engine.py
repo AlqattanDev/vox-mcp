@@ -148,6 +148,16 @@ class VoxEngine:
         self._barge_in_speech_margin_db = float(
             os.environ.get("VOX_BARGE_IN_SPEECH_MARGIN_DB", "18.0")
         )
+        # WebRTC votes speech on our own playback bleed, so tightening only the
+        # energy path leaves the gate wide open on any machine where webrtcvad
+        # is installed — which is every machine that has it as a dependency.
+        # These are the knobs the VAD path actually reads.
+        self._barge_in_noise_spread_k = float(
+            os.environ.get("VOX_BARGE_IN_NOISE_SPREAD_K", "6.0")
+        )
+        self._barge_in_max_vad_margin_db = float(
+            os.environ.get("VOX_BARGE_IN_MAX_VAD_MARGIN_DB", "24.0")
+        )
         # A short window so the floor re-reads the room quickly once our own
         # playback becomes part of it: the speaker bleed has to count as the
         # new silence within a sentence, not within a paragraph.
@@ -1011,6 +1021,8 @@ class VoxEngine:
             self.recorder.config,
             speech_start_s=self._barge_in_speech_start_s,
             speech_margin_db=self._barge_in_speech_margin_db,
+            noise_spread_k=self._barge_in_noise_spread_k,
+            max_vad_margin_db=self._barge_in_max_vad_margin_db,
             noise_window_s=self._barge_in_noise_window_s,
         )
 
