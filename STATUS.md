@@ -82,12 +82,12 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
   `config.local_only` stays an unqualified true; `diagnostics(privacy)` carries
   a `companion` block naming the backend and egress. A missing or failing
   backend escalates rather than stalling.
-- **Voice turn contract.** The runtime owns 2–4s of a spoken turn; the agent owns
-  25–40. That gap is desk work done inside a conversation, so the contract ships
-  where hosts read it — MCP server instructions, the `voice_mode` prompt, and the
-  `converse` tool description: one or two sentences, no tool calls between turns,
-  detail on screen not in the speaker, announce work before going quiet. See
-  `docs/EXPERIENCE.md`.
+- **Voice turn contract.** The runtime owns under 1.5s of a spoken turn and the
+  agent owns the rest (measured table below). That gap is desk work done inside
+  a conversation, so the contract ships where hosts read it — MCP server
+  instructions, the `voice_mode` prompt, and the `converse` tool description:
+  one or two sentences, no tool calls between turns, detail on screen not in
+  the speaker, announce work before going quiet. See `docs/EXPERIENCE.md`.
 - **IO modes.** `talk` (default, both) · `narrate` (agent speaks, no mic) ·
   `dictate` (listen only, TTS skipped). Panel cycles; `voice_session`
   `set_mode` / `cycle_mode`; persisted in `~/.vox/state/io_mode`.
