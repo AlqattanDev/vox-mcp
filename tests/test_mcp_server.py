@@ -290,7 +290,7 @@ async def test_tool_arguments_are_adapted_to_engine_contract(tmp_path: Path) -> 
         await client.call_tool("transcribe", {"audio_file": "/tmp/private.wav"})
         await client.call_tool(
             "voice_survey",
-            {"turns": [{"message": "A", "voice": "af_sky"}]},
+            {"turns": [{"message": "A", "voice": "af_sky"}], "agent": "companion"},
         )
         await client.call_tool(
             "voice_clone",
@@ -312,6 +312,9 @@ async def test_tool_arguments_are_adapted_to_engine_contract(tmp_path: Path) -> 
     assert calls["control"] == {"action": "manual_end", "client_id": owner}
     assert calls["transcribe"]["path"] == "/tmp/private.wav"
     assert calls["survey"]["turns"] == [{"message": "A", "voice": "af_sky"}]
+    # Without this the tool dropped `agent` on the floor and a scripted
+    # interview could never be read in the companion's voice.
+    assert calls["survey"]["agent"] == "companion"
     assert calls["clone_voice"]["audio_path"] == "/tmp/voice.wav"
     assert calls["soundfonts"]["enabled"] is True
     assert all(arguments["client_id"] == owner for arguments in calls.values())

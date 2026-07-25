@@ -611,11 +611,17 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
     async def voice_survey(
         ctx: Context,
         turns: list[dict[str, Any]],
+        agent: str | None = None,
     ) -> Any:
+        # `agent` reads that agent's registered voice and uses it for the whole
+        # run, which is how a scripted interview is read in the companion voice
+        # instead of the asking agent's. The engine always supported it; the tool
+        # simply never passed it, so the documented use case was unreachable.
         return await _invoke(
             current_engine(),
             "survey",
             turns=turns,
+            agent=agent,
             client_id=_client_id(ctx),
         )
 
