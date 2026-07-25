@@ -225,6 +225,26 @@ claude mcp add --scope local --transport http vox \
   "http://127.0.0.1:8766/mcp?agent=<name>"
 ```
 
+## Not yet verified against real audio
+
+Honest list — these are built, committed, and green in tests, but no human has
+used them:
+
+- **Barge-in.** The whole mechanism has only ever run against fakes. It
+  self-disables on this machine's speakers (correctly — see above), so proving
+  it needs one session wearing headphones. `PLAN.md` step 1.
+- **Companion beyond two turns.** Live-verified for one answer plus one
+  escalation. The `budget_turns` loop, the STOP/PAUSE intents inside it, and
+  `voice_survey(agent="companion")` as the interview path are untested aloud.
+- **The turn contract under pressure.** It cut the mean from 30.2 s to 18.1 s,
+  but one exchange still ran 26 s. It is a prompt, not a mechanism, and nothing
+  enforces it.
+
+Three of this session's worst bugs — an echo gate that did nothing, a floor
+that cut people off mid-sentence, a scope check that answered code questions —
+were all already marked done and were all found by *using* the thing, never by
+the suite. Verify aloud before believing green.
+
 ## Next steps
 
 - **Type-while-listening fusion** (see `PLAN.md`). When Ali types while the mic
