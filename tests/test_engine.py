@@ -23,7 +23,7 @@ class FakeRecorder:
         self.path = path
         self.speech = speech
 
-    def capture(self, *, device=None, control=None):
+    def capture(self, *, device=None, control=None, on_speech_started=None):
         if control and control.cancelled:
             reason = CaptureStopReason.CANCELLED
             speech = False
@@ -75,16 +75,86 @@ class FakeCompat:
     pass
 
 
-def make_engine(tmp_path: Path, *, speech=True):
-    config = VoxConfig(state_dir=tmp_path / "state", idle_timeout_seconds=600)
+class CountingSpeech(FakeSpeech):
+    def __init__(self) -> None:
+        self.spans: list[str] = []
+
+    async def synthesize(self, text, destination, **kwargs):
+        self.spans.append(text)
+        return await super().synthesize(text, destination, **kwargs)
+
+
+class BargingRecorder(FakeRecorder):
+    """A microphone that hears the user start talking over the agent.
+
+    Onset is announced on the caller's thread exactly as the real recorder
+    announces it from its worker thread, then the capture keeps running and
+    returns the utterance — the words that triggered it included, which in the
+    real recorder is what the pre-roll buffer preserves.
+    """
+
+    def __init__(self, path: Path, *, transcript_speech: bool = True, fire: bool = True):
+        super().__init__(path, speech=transcript_speech)
+        self.fire = fire
+        self.captures = 0
+        self.fired = threading.Event()
+
+    def capture(self, *, device=None, control=None, on_speech_started=None):
+        self.captures += 1
+        if self.fire and on_speech_started is not None:
+            on_speech_started()
+            self.fired.set()
+        return super().capture(device=device, control=control)
+
+
+class BlockingHandle:
+    """Playback that actually has to be cancelled to stop."""
+
+    def __init__(self):
+        self._done = threading.Event()
+        self.cancelled = False
+        self.cancel_grace = None
+        self.running = True
+
+    def wait(self, timeout=None):
+        self._done.wait(timeout if timeout is not None else 5.0)
+        return -15 if self.cancelled else 0
+
+    def cancel(self, grace_s: float = 0.2):
+        self.cancelled = True
+        self.cancel_grace = grace_s
+        self.running = False
+        self._done.set()
+
+
+class BlockingPlayer:
+    def __init__(self):
+        self.handles: list[BlockingHandle] = []
+        self.volumes: list[float] = []
+
+    def play_file(self, *args, volume=1.0, **kwargs):
+        self.volumes.append(volume)
+        handle = BlockingHandle()
+        self.handles.append(handle)
+        return handle
+
+    def cancel_all(self):
+        return 0
+
+
+def make_engine(tmp_path: Path, *, speech=True, recorder=None, player=None, speech_client=None,
+                barge_in=False):
+    config = VoxConfig(
+        state_dir=tmp_path / "state", idle_timeout_seconds=600, barge_in_enabled=barge_in
+    )
     store = AudioStore(tmp_path / "audio")
     return VoxEngine(
         config=config,
         home=tmp_path,
         state=VoiceStateMachine(snapshot_path=config.snapshot_path, idle_timeout_seconds=600),
-        recorder=FakeRecorder(store.latest_stt, speech=speech),
-        player=FakePlayer(),
-        speech=FakeSpeech(),
+        recorder=recorder or FakeRecorder(store.latest_stt, speech=speech),
+        player=player or FakePlayer(),
+        speech=speech_client or FakeSpeech(),
         supervisor=FakeSupervisor(),
         store=store,
         logger=JsonlEventLogger(config.event_log_path),
@@ -668,15 +738,6 @@ def test_split_for_tts_streams_sentences_but_keeps_short_and_runon_whole() -> No
     assert split_for_tts(runon) == [runon.strip()]
 
 
-class CountingSpeech(FakeSpeech):
-    def __init__(self) -> None:
-        self.spans: list[str] = []
-
-    async def synthesize(self, text, destination, **kwargs):
-        self.spans.append(text)
-        return await super().synthesize(text, destination, **kwargs)
-
-
 @pytest.mark.asyncio
 async def test_speak_streams_each_sentence_and_completes(tmp_path: Path):
     engine = make_engine(tmp_path)
@@ -786,3 +847,176 @@ async def test_speak_streaming_disabled_synthesizes_once(tmp_path: Path):
     result = await engine.speak("claude", long_reply)
     assert result["status"] == "completed"
     assert len(counting.spans) == 1
+
+
+@pytest.mark.asyncio
+async def test_barge_in_stops_playback_and_keeps_the_interrupting_words(tmp_path: Path):
+    # Talking over the agent must not cost the user their turn: the capture
+    # that noticed them is the capture that answers.
+    store = AudioStore(tmp_path / "audio")
+    recorder = BargingRecorder(store.latest_stt)
+    player = BlockingPlayer()
+    engine = make_engine(tmp_path, recorder=recorder, player=player, barge_in=True)
+
+    result = await engine.converse("claude", "Here is a long explanation.")
+
+    assert result["spoken"]["status"] == "barge_in"
+    assert result["barge_in"] is True
+    assert result["heard"]["transcript"] == "hello world"
+    assert result["status"] == "completed"
+    assert player.handles[0].cancelled is True
+    # Cancelled hard, not with the polite grace a normal stop uses.
+    assert player.handles[0].cancel_grace == pytest.approx(0.05)
+    # One capture served both the detection and the reply.
+    assert recorder.captures == 1
+    assert engine.microphone_open is False
+
+
+@pytest.mark.asyncio
+async def test_barge_in_aborts_the_rest_of_a_streamed_reply(tmp_path: Path):
+    # Sentence four must never arrive once the user is talking over sentence
+    # one, including the span already being synthesized ahead.
+    store = AudioStore(tmp_path / "audio")
+    counting = CountingSpeech()
+    engine = make_engine(
+        tmp_path,
+        recorder=BargingRecorder(store.latest_stt),
+        player=BlockingPlayer(),
+        speech_client=counting,
+        barge_in=True,
+    )
+
+    result = await engine.converse(
+        "claude",
+        "The endpointing is fixed now and the mic no longer cuts you off. "
+        "I also added the earcons you asked for so you hear the window open. "
+        "The status bar shows a red mic only when it is truly listening.",
+    )
+
+    assert result["spoken"]["status"] == "barge_in"
+    # Two spans at most: the one playing plus the one already in flight.
+    assert len(counting.spans) <= 2
+
+
+@pytest.mark.asyncio
+async def test_armed_but_unused_barge_in_releases_the_microphone(tmp_path: Path):
+    # The regression that matters most: a turn nobody interrupted must not
+    # leave its armed capture holding the device while the listen that
+    # follows opens a second stream on it.
+    store = AudioStore(tmp_path / "audio")
+    recorder = BargingRecorder(store.latest_stt, fire=False)
+    engine = make_engine(tmp_path, recorder=recorder, barge_in=True)
+
+    result = await engine.converse("claude", "Nobody interrupts this one.")
+
+    assert result["spoken"]["status"] == "completed"
+    assert result.get("barge_in") is None
+    assert result["heard"]["transcript"] == "hello world"
+    # One armed capture, then one real listen — never both at once.
+    assert recorder.captures == 2
+    assert engine.barge_in_armed is False
+    assert engine.microphone_open is False
+    assert result["session"]["state"] == "idle"
+
+
+@pytest.mark.asyncio
+async def test_cancel_while_armed_releases_playback_and_the_microphone(tmp_path: Path):
+    # A cancel arriving mid-speech must reach the armed capture too, or it
+    # keeps the microphone with nothing left to consume its result.
+    store = AudioStore(tmp_path / "audio")
+    engine = make_engine(
+        tmp_path,
+        recorder=BargingRecorder(store.latest_stt, fire=False),
+        player=BlockingPlayer(),
+        barge_in=True,
+    )
+
+    async def cancel_soon():
+        for _ in range(200):
+            if engine.barge_in_armed:
+                break
+            await asyncio.sleep(0.005)
+        engine._signal_cancel(manual_end=False, cancel_task=False, force=True)
+
+    canceller = asyncio.create_task(cancel_soon())
+    result = await engine.converse("claude", "This turn gets cancelled.")
+    await canceller
+
+    assert engine.barge_in_armed is False
+    assert engine.microphone_open is False
+    assert result["spoken"]["status"] in {"cancelled", "barge_in", "completed"}
+
+
+@pytest.mark.asyncio
+async def test_barge_in_that_transcribes_to_nothing_is_treated_as_silence(tmp_path: Path):
+    # Audio loud enough to trip the gate but empty after STT is almost
+    # certainly our own voice returning through the speakers. Handing that
+    # back as a user utterance would be worse than the interruption.
+    store = AudioStore(tmp_path / "audio")
+
+    class EchoSpeech(FakeSpeech):
+        async def transcribe(self, path, **kwargs):
+            return SpeechResult("whisper.cpp", 20, text="   ")
+
+    engine = make_engine(
+        tmp_path,
+        recorder=BargingRecorder(store.latest_stt),
+        player=BlockingPlayer(),
+        speech_client=EchoSpeech(),
+        barge_in=True,
+    )
+
+    result = await engine.converse("claude", "Here is a long explanation.")
+
+    assert result["spoken"]["status"] == "barge_in"
+    assert result["heard"]["status"] == "no_speech"
+    assert "transcript" not in result["heard"]
+    events = (tmp_path / "state" / "events.jsonl").read_text()
+    assert "barge_in.echo_suspected" in events
+
+
+@pytest.mark.asyncio
+async def test_barge_in_stays_off_unless_enabled(tmp_path: Path):
+    # Default config must never open the mic during playback.
+    store = AudioStore(tmp_path / "audio")
+    recorder = BargingRecorder(store.latest_stt)
+    engine = make_engine(tmp_path, recorder=recorder)
+
+    result = await engine.converse("claude", "Hi")
+
+    assert result["spoken"]["status"] == "completed"
+    assert result.get("barge_in") is None
+    assert recorder.captures == 1  # the listen only; nothing was armed
+
+
+@pytest.mark.asyncio
+async def test_armed_microphone_is_reported_while_the_agent_is_speaking(tmp_path: Path):
+    # The panel reads microphone_open independently of state, so an armed
+    # window must say the mic is hot even though state is still speaking.
+    store = AudioStore(tmp_path / "audio")
+    engine = make_engine(
+        tmp_path,
+        recorder=BargingRecorder(store.latest_stt, fire=False),
+        player=BlockingPlayer(),
+        barge_in=True,
+    )
+    seen: list[dict] = []
+
+    async def watch():
+        for _ in range(200):
+            if engine.barge_in_armed:
+                seen.append(await engine.health())
+                engine._signal_cancel(manual_end=False, cancel_task=False, force=True)
+                return
+            await asyncio.sleep(0.005)
+
+    watcher = asyncio.create_task(watch())
+    await engine.converse("claude", "Listening while I talk.")
+    await watcher
+
+    assert seen, "never observed the armed window"
+    health = seen[0]
+    assert health["microphone_open"] is True
+    assert health["mic_armed_for_barge_in"] is True
+    assert health["barge_in_enabled"] is True
+    assert "interrupt" in health["detail"]

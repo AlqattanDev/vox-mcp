@@ -12,6 +12,7 @@ microphone is physically closed.
 | A voice session starts | Closed; state becomes `IDLE` |
 | `speak` or `converse(..., wait_for_response=false)` | Closed |
 | `converse(..., wait_for_response=true)` | Opens only after playback has fully drained |
+| `converse(...)` with barge-in enabled | Opens *during* playback, gated against Vox's own voice, so talking interrupts |
 | `listen` | Opens immediately for one bounded turn |
 | A `listen` turn is used as push-to-talk | Open until manual end, then closed |
 | The user says a short standalone “wait” phrase | Closed during the wait, then reopened for a fresh bounded turn |
@@ -75,6 +76,38 @@ instructions, the `voice_mode` prompt, and the `converse` tool description:
   the work, not for deciding what to say back.
 - **`wait_for_response=false` for status updates and sign-offs.** Never make the
   user confirm that you finished.
+
+## Talking over Vox (barge-in)
+
+Off by default. `VOX_BARGE_IN_ENABLED=1` opens the microphone alongside
+playback so interrupting is something you *do* rather than a button you press.
+Start talking and the sentence being spoken stops mid-word, the rest of the
+reply is abandoned — including the sentence already being synthesized ahead —
+and what you said becomes the answer. The 300 ms pre-roll means the words that
+triggered the interruption are part of the recording; you never repeat yourself.
+
+**The microphone is genuinely open while Vox is speaking.** That is a real
+widening of when the mic is live, so it is reported rather than hidden: the
+menu-bar glyph turns red, the panel reads **Speaking · cut in**, and both
+`/health` and `diagnostics(section="privacy")` carry `barge_in_enabled` and
+`mic_armed_for_barge_in`.
+
+There is no acoustic echo cancellation. Playback is an opaque `afplay`
+subprocess, so no reference signal exists to subtract, which means on laptop
+speakers the microphone genuinely hears Kokoro. The gate is what stops that
+from self-triggering:
+
+- The noise floor rises fast enough to swallow steady speaker bleed.
+- Speech must sit well above that floor, and be sustained rather than a
+  transient.
+- The turn plays slightly quieter while armed, widening the gap.
+- A barge-in whose transcript comes back empty is treated as silence, never as
+  something you said. A hallucinated utterance built from Vox's own voice would
+  be worse than the interruption.
+
+Run `vox barge-in calibrate` before enabling it. It measures Kokoro's bleed
+against your voice on your hardware and prints the margin that follows from the
+numbers — including an honest verdict when the gap is too small to gate on.
 
 ## Session and turn controls
 

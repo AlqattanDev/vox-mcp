@@ -45,6 +45,20 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
   `VOX_SHORT_TRAILING_SILENCE_SECONDS`, `VOX_SHORT_UTTERANCE_SPEECH_SECONDS`,
   `VOX_LONG_UTTERANCE_SPEECH_SECONDS`, `VOX_MAX_UTTERANCE_SECONDS`. Lowering the
   ceiling below the floor clamps instead of raising.
+- **Barge-in (off by default).** `VOX_BARGE_IN_ENABLED=1` opens the mic
+  *during* playback: start talking and the current sentence dies mid-word, the
+  remaining spans and the one being synthesized ahead are abandoned, and the
+  pre-roll makes your opening words the reply — one capture serves both the
+  detection and the answer. There is no AEC (playback is an opaque `afplay`
+  subprocess, so no reference signal exists), so the gate carries it: a
+  fast-rising noise floor swallows speaker bleed, the margin above it doubles,
+  onset needs 0.3s of sustained speech, and the turn ducks slightly. An empty
+  transcript after a barge-in is reported as silence, never as a user
+  utterance. **Run `vox barge-in calibrate` first** — it measures bleed vs
+  voice on your hardware and says plainly when the gap is too small.
+  Honest while armed: `microphone_open`, `mic_armed_for_barge_in`,
+  `barge_in_enabled` on `/health` and `diagnostics(privacy)`; the glyph goes
+  red and the panel reads "Speaking · cut in".
 - **Voice turn contract.** The runtime owns 2–4s of a spoken turn; the agent owns
   25–40. That gap is desk work done inside a conversation, so the contract ships
   where hosts read it — MCP server instructions, the `voice_mode` prompt, and the
@@ -109,7 +123,7 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
 | `com.vox.runtime` | ~73 MB | ~73 MB |
 | **total** | **~2.7 GB** | **~3.2 GB** |
 
-Tests: `.venv/bin/python -m pytest tests/` — **210 passing**.
+Tests: `.venv/bin/python -m pytest tests/` — **221 passing**.
 
 **Slash commands** (in `~/.claude/commands/`, global): `/speak` reads the
 agent's last reply aloud (no mic); `/listen` opens the mic for one utterance

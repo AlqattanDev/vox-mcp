@@ -284,6 +284,20 @@ class CaptureControl:
         return self._interrupt.is_set()
 
 
+def _notify_speech_started(callback: Callable[[], None]) -> None:
+    """Fire an onset callback without letting it take the capture down.
+
+    The callback runs on the recorder's worker thread while the audio device
+    is open.  A raise here would abandon a live InputStream, so a broken
+    listener loses its notification rather than the user losing their turn.
+    """
+
+    try:
+        callback()
+    except Exception:
+        pass
+
+
 def _as_mono_float32(samples: Any) -> FloatAudio:
     """Normalize an integer/float, mono/multichannel frame to mono float32."""
 
@@ -681,6 +695,7 @@ class AudioRecorder:
         sample_rate: int,
         *,
         control: CaptureControl | None = None,
+        on_speech_started: Callable[[], None] | None = None,
     ) -> CaptureResult:
         """Drive the complete capture path without opening an audio device."""
 
@@ -697,7 +712,10 @@ class AudioRecorder:
             if control.manual_end_requested:
                 state.stop(CaptureStopReason.MANUAL_END)
                 break
-            control.publish_level(state.feed(frame).dbfs)
+            decision = state.feed(frame)
+            control.publish_level(decision.dbfs)
+            if decision.speech_started and on_speech_started is not None:
+                _notify_speech_started(on_speech_started)
             if state.finished:
                 break
         if not state.finished:
@@ -772,8 +790,15 @@ class AudioRecorder:
         *,
         device: int | str | None = None,
         control: CaptureControl | None = None,
+        on_speech_started: Callable[[], None] | None = None,
     ) -> CaptureResult:
-        """Record one utterance from the native-rate default input device."""
+        """Record one utterance from the native-rate default input device.
+
+        ``on_speech_started`` fires once, on this worker thread, the moment the
+        detector confirms speech.  Barge-in uses it to kill playback the
+        instant the user starts talking; the pre-roll means the words that
+        triggered it are still part of the recording.
+        """
 
         control = control or CaptureControl()
         sounddevice = self._sounddevice or _load_sounddevice()
@@ -865,6 +890,8 @@ class AudioRecorder:
                     control.publish_level(decision.dbfs)
                     if decision.speech_started:
                         speech_started_at = self._clock()
+                        if on_speech_started is not None:
+                            _notify_speech_started(on_speech_started)
         except Exception as exc:
             if not state.finished:
                 state.stop(CaptureStopReason.DEVICE_ERROR)

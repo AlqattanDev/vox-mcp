@@ -88,6 +88,9 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var detail = "Waiting for Vox runtime"
     private var actionNotice: String?
     private var microphoneOpen = false
+    // The mic is open *during* playback so speaking over Vox interrupts it.
+    // Distinct from plain listening: the agent is still talking.
+    private var micArmedForBargeIn = false
     private var lastStopReason: String?
     private var ioMode = "talk"
     private let baseURL = URL(string: "http://127.0.0.1:8766")!
@@ -461,6 +464,7 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
                 self.state = (payload["state"] as? String) ?? (payload["status"] as? String) ?? "online"
                 self.microphoneOpen = (payload["microphone_open"] as? Bool) ?? false
+                self.micArmedForBargeIn = (payload["mic_armed_for_barge_in"] as? Bool) ?? false
                 self.micLevel = CGFloat((payload["mic_level"] as? Double) ?? 0)
                 self.detail = (payload["detail"] as? String) ?? "Local-only runtime connected"
                 self.lastStopReason = payload["last_stop_reason"] as? String
@@ -488,14 +492,23 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         default: title = "Vox Starting"
         }
         applyStatusGlyph(normalized: normalized, title: title)
-        statusItem.button?.toolTip = microphoneOpen
-            ? "Mic is LIVE — click to stop listening. \(panelDetail())"
-            : panelDetail()
+        if micArmedForBargeIn {
+            statusItem.button?.toolTip =
+                "Mic is LIVE while Vox speaks — just start talking to interrupt. \(panelDetail())"
+        } else {
+            statusItem.button?.toolTip = microphoneOpen
+                ? "Mic is LIVE — click to stop listening. \(panelDetail())"
+                : panelDetail()
+        }
 
         // Hero row: a coloured dot + one state word instead of a wall of labels.
         let badge: String
         let accent: NSColor
-        if microphoneOpen {
+        if micArmedForBargeIn {
+            // Both things are true at once and hiding either would be a lie:
+            // Vox is talking, and the mic is live so you can cut in.
+            badge = "Speaking · cut in"; accent = .systemRed
+        } else if microphoneOpen {
             badge = "Listening"; accent = .systemRed
         } else {
             switch normalized {
@@ -613,7 +626,11 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func applyStatusGlyph(normalized: String, title: String) {
         guard let button = statusItem.button else { return }
         let symbol: String
-        if microphoneOpen {
+        if micArmedForBargeIn {
+            // Red, so the live mic still reads as live, but a distinct glyph:
+            // Vox is speaking and listening at the same time.
+            symbol = "waveform.badge.mic"
+        } else if microphoneOpen {
             symbol = "mic.fill"
         } else {
             switch normalized {

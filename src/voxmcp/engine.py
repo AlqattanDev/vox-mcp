@@ -163,6 +163,14 @@ class VoxEngine:
         self._capture_control: CaptureControl | None = None
         self._playback: PlaybackHandle | None = None
         self._playback_interruptible = True
+        # A capture that runs *during* playback so the user can interrupt by
+        # talking.  Kept separate from _capture_control because for the length
+        # of one turn both can be live: the armed one listening through the
+        # speech, the normal one owning the reply that follows.
+        self._barge_in_control: CaptureControl | None = None
+        self._barge_in_future: asyncio.Future[Any] | None = None
+        self._barge_in_fired = False
+        self._barge_in_loop: asyncio.AbstractEventLoop | None = None
         self._cancel_requested = False
         self._microphone_active = False
         self._microphone_closing = False
@@ -330,6 +338,9 @@ class VoxEngine:
             self._active_client = None
             self._capture_control = None
             self._playback = None
+            self._barge_in_control = None
+            self._barge_in_future = None
+            self._barge_in_fired = False
             self._cancel_requested = False
 
     def _load_io_mode(self) -> str:
@@ -496,10 +507,15 @@ class VoxEngine:
         with self._active_lock:
             task = self._active_task
             control = self._capture_control
+            barge_control = self._barge_in_control
             playback = self._playback
             interruptible = self._playback_interruptible
             client = self._active_client
         cancel_control = control is not None
+        # An armed capture owns the microphone even though the session still
+        # reads SPEAKING. Leaving it running here would strand a live
+        # InputStream with nothing left to await its result.
+        cancel_barge_in = barge_control is not None
         cancel_playback = (
             playback is not None
             and playback.running
@@ -510,11 +526,12 @@ class VoxEngine:
             cancel_task
             and not manual_end
             and control is None
+            and barge_control is None
             and (playback is None or force or interruptible)
             and task is not None
             and task is not asyncio.current_task()
         )
-        signalled = cancel_control or cancel_playback or cancel_async_task
+        signalled = cancel_control or cancel_barge_in or cancel_playback or cancel_async_task
         if signalled and not manual_end:
             with self._active_lock:
                 self._cancel_requested = True
@@ -522,6 +539,10 @@ class VoxEngine:
             with self._active_lock:
                 self._microphone_closing = True
             control.end_utterance() if manual_end else control.cancel()
+        if barge_control is not None:
+            with self._active_lock:
+                self._microphone_closing = True
+            barge_control.end_utterance() if manual_end else barge_control.cancel()
         if cancel_playback and playback is not None:
             playback.cancel()
         # A capture runs in a worker thread.  Cancelling its asyncio wrapper
@@ -530,6 +551,171 @@ class VoxEngine:
         if cancel_async_task and task is not None:
             task.cancel()
         return {"signalled": signalled, "client_id": client, "manual_end": manual_end}
+
+    @property
+    def barge_in_armed(self) -> bool:
+        with self._active_lock:
+            return self._barge_in_control is not None
+
+    def _on_barge_in_onset(self) -> None:
+        """Kill playback the instant the user starts talking.
+
+        Runs on the recorder's worker thread, so it touches nothing that
+        belongs to the event loop directly: the subprocess kill is thread-safe
+        and the state transition is handed back over call_soon_threadsafe.
+        """
+
+        with self._active_lock:
+            if self._barge_in_fired:
+                return
+            self._barge_in_fired = True
+            playback = self._playback
+            loop = self._barge_in_loop
+        if playback is not None:
+            playback.cancel(grace_s=self._barge_in_cancel_grace_s)
+        if loop is not None:
+            loop.call_soon_threadsafe(self._on_barge_in_onset_loop)
+
+    def _on_barge_in_onset_loop(self) -> None:
+        """The event-loop half of barge-in: make the session state honest."""
+
+        try:
+            self.state.begin_listening(client_id=self._active_client)
+        except IllegalStateTransition:
+            # The turn already moved on (cancel, stop, error). The capture
+            # still unwinds normally; only the label would have been wrong.
+            pass
+        self._log("barge_in.detected", client_id=self._active_client)
+
+    async def _arm_barge_in(self, client_id: str) -> None:
+        """Open the microphone alongside playback, gated against our own voice."""
+
+        recorder = self.recorder
+        armed: Any = recorder
+        if isinstance(recorder, AudioRecorder):
+            armed = AudioRecorder(self.armed_capture_config())
+        control = CaptureControl()
+        loop = asyncio.get_running_loop()
+        # Published before the capture is submitted, never after: the worker
+        # can reach speech onset before this coroutine is scheduled again, and
+        # initialising _barge_in_fired afterwards would erase that detection.
+        with self._active_lock:
+            self._barge_in_control = control
+            self._barge_in_fired = False
+            self._barge_in_loop = loop
+            # The microphone is genuinely open while the session state still
+            # says SPEAKING. status()/health() read this flag directly, so
+            # setting it here is what keeps the panel honest during the window.
+            self._microphone_active = True
+            self._microphone_closing = False
+        future = loop.run_in_executor(
+            None,
+            lambda: armed.capture(
+                device=self.input_device,
+                control=control,
+                on_speech_started=self._on_barge_in_onset,
+            ),
+        )
+        with self._active_lock:
+            self._barge_in_future = future
+
+        def microphone_closed(_future: asyncio.Future[Any]) -> None:
+            with self._active_lock:
+                self._microphone_active = False
+                self._microphone_closing = False
+                fired = self._barge_in_fired
+            if fired:
+                # Only cue the close when the user knew the window was open.
+                self._play_listen_stop_cue()
+
+        future.add_done_callback(microphone_closed)
+        self._log("barge_in.armed", client_id=client_id)
+
+    async def _disarm_barge_in(self) -> None:
+        """Tear down an armed capture that never fired.
+
+        Skipping this would leave a live InputStream behind while the listen
+        that follows opens a second one on the same device.
+        """
+
+        with self._active_lock:
+            control = self._barge_in_control
+            future = self._barge_in_future
+            fired = self._barge_in_fired
+        if control is None or fired:
+            return
+        control.cancel()
+        if future is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(future), timeout=3.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
+        with self._active_lock:
+            self._barge_in_control = None
+            self._barge_in_future = None
+            self._microphone_active = False
+
+    async def _harvest_barge_in(self, client_id: str, *, language: str | None) -> dict[str, Any]:
+        """Finish the capture that interrupted playback and treat it as the reply."""
+
+        with self._active_lock:
+            future = self._barge_in_future
+        if future is None:  # pragma: no cover - arming always sets it
+            return {"status": "no_speech", "reason": "barge_in_lost"}
+        try:
+            capture = await asyncio.shield(future)
+        finally:
+            with self._active_lock:
+                self._barge_in_control = None
+                self._barge_in_future = None
+                self._barge_in_fired = False
+
+        self._log(
+            "listening.stopped",
+            client_id=client_id,
+            reason=capture.reason.value,
+            duration_s=round(capture.audio_duration_s, 3),
+            speech=capture.speech_detected,
+            barge_in=True,
+        )
+        if (
+            capture.reason is CaptureStopReason.CANCELLED
+            or not capture.speech_detected
+            or capture.latest_wav_path is None
+        ):
+            self._return_idle_if_active()
+            return self._silent_heard_result(capture)
+
+        self.state.begin_processing(client_id=client_id)
+        transcription = await self.speech.transcribe(
+            capture.latest_wav_path,
+            language=language or self.default_language,
+        )
+        if not (transcription.text or "").strip():
+            # Nothing intelligible came back from audio loud enough to trip the
+            # gate — the likely source is Kokoro's own voice returning through
+            # the speakers. Reporting that to the agent as a user utterance
+            # would be worse than the interruption itself, so it becomes
+            # silence and leaves a trail for the calibration to be re-run.
+            self._log(
+                "barge_in.echo_suspected",
+                client_id=client_id,
+                speech_seconds=round(capture.speech_duration_s, 3),
+            )
+            self._return_idle_if_active()
+            return self._silent_heard_result(capture)
+
+        self._log(
+            "stt.completed",
+            client_id=client_id,
+            backend=transcription.backend,
+            elapsed_ms=transcription.elapsed_ms,
+            transcript=transcription.text,
+        )
+        transcript, turn_id, intent = self._record_heard(client_id, capture, transcription)
+        return await self._heard_result(
+            client_id, capture, transcription, transcript, turn_id, intent
+        )
 
     async def _speak_locked(
         self,
@@ -540,6 +726,7 @@ class VoxEngine:
         speed: float,
         instructions: str | None,
         interruptible: bool = True,
+        barge_in: bool = False,
     ) -> dict[str, Any]:
         if not message.strip():
             return {"status": "skipped", "reason": "empty_message"}
@@ -557,16 +744,30 @@ class VoxEngine:
             self._last_spoken_agent = self._pending_agent
         self._log("tts.started", client_id=client_id, chars=len(message))
 
-        chunks = split_for_tts(message) if self._stream_tts else [message]
-        if len(chunks) <= 1:
-            return await self._speak_single(
-                client_id, message, voice=voice, speed=speed,
-                instructions=instructions, interruptible=interruptible,
-            )
-        return await self._speak_streaming(
-            client_id, chunks, voice=voice, speed=speed,
-            instructions=instructions, interruptible=interruptible,
-        )
+        if barge_in:
+            await self._arm_barge_in(client_id)
+        try:
+            chunks = split_for_tts(message) if self._stream_tts else [message]
+            if len(chunks) <= 1:
+                spoken = await self._speak_single(
+                    client_id, message, voice=voice, speed=speed,
+                    instructions=instructions, interruptible=interruptible,
+                )
+            else:
+                spoken = await self._speak_streaming(
+                    client_id, chunks, voice=voice, speed=speed,
+                    instructions=instructions, interruptible=interruptible,
+                )
+        except BaseException:
+            if barge_in:
+                await self._disarm_barge_in()
+            raise
+        if barge_in:
+            # A fired barge-in keeps its capture running: it is the reply.
+            # Anything else must release the device before the next listen
+            # opens a second stream on it.
+            await self._disarm_barge_in()
+        return spoken
 
     async def _render_tts(
         self,
@@ -595,10 +796,21 @@ class VoxEngine:
     async def _play_and_wait(self, replay_path: Path, *, interruptible: bool) -> bool:
         """Play one committed clip; return True if it finished, False if cancelled."""
 
-        handle = self.player.play_file(replay_path, volume=self.volume, blocking=False)
+        # afplay takes its volume as a launch argument, so ducking cannot react
+        # to a threat that has already been detected. When barge-in is armed
+        # the whole turn plays slightly quieter instead, widening the gap the
+        # echo gate has to work with for the price of a barely audible drop.
+        volume = self.volume * self._barge_in_duck_volume if self.barge_in_armed else self.volume
+        handle = self.player.play_file(replay_path, volume=volume, blocking=False)
         with self._active_lock:
             self._playback = handle
             self._playback_interruptible = interruptible
+            # The user can start talking during synthesis, before any playback
+            # exists to cancel. Onset then had nothing to kill, so this span
+            # has to arrive already dead rather than talk over them.
+            already_barged = self._barge_in_fired
+        if already_barged:
+            handle.cancel(grace_s=self._barge_in_cancel_grace_s)
         return_code = await asyncio.to_thread(handle.wait)
         with self._active_lock:
             cancelled = self._cancel_requested
@@ -619,7 +831,18 @@ class VoxEngine:
         replay_path, result = await self._render_tts(
             message, voice=voice, speed=speed, instructions=instructions
         )
-        if not await self._play_and_wait(replay_path, interruptible=interruptible):
+        finished = await self._play_and_wait(replay_path, interruptible=interruptible)
+        # Checked regardless of how playback ended: a barge-in during synthesis
+        # can leave the span itself completing normally.
+        with self._active_lock:
+            barged = self._barge_in_fired
+        if barged:
+            return {
+                "status": "barge_in",
+                "backend": result.backend,
+                "elapsed_ms": result.elapsed_ms,
+            }
+        if not finished:
             self._return_idle_if_active()
             return {"status": "cancelled", "backend": result.backend, "elapsed_ms": result.elapsed_ms}
         self.state.complete_turn(client_id=client_id)
@@ -682,13 +905,27 @@ class VoxEngine:
                 if index + 1 < len(chunks)
                 else None
             )
-            if not await self._play_and_wait(replay_path, interruptible=interruptible):
+            finished = await self._play_and_wait(replay_path, interruptible=interruptible)
+            with self._active_lock:
+                barged = self._barge_in_fired
+            if barged or not finished:
                 cancelled = True
+                # Abort the whole remaining span sequence, not just the span
+                # that was playing: the user is already talking over sentence
+                # three, so sentence four must never arrive.
                 if pending is not None:
                     pending.cancel()
                     await asyncio.gather(pending, return_exceptions=True)
                 break
         if cancelled:
+            with self._active_lock:
+                barged = self._barge_in_fired
+            if barged:
+                return {
+                    "status": "barge_in",
+                    "backend": first_backend or "kokoro",
+                    "elapsed_ms": elapsed_ms,
+                }
             self._return_idle_if_active()
             return {
                 "status": "cancelled",
@@ -917,31 +1154,9 @@ class VoxEngine:
                 language=language,
             )
             if transcription is None:
-                return {
-                    "status": (
-                        "cancelled"
-                        if capture.reason is CaptureStopReason.CANCELLED
-                        else "no_speech"
-                    ),
-                    "reason": capture.reason.value,
-                    "capture": _capture_dict(capture),
-                    "session": self.state.snapshot().to_dict(),
-                }
+                return self._silent_heard_result(capture)
 
-            transcript = transcription.text or ""
-            turn_id = uuid.uuid4().hex
-            with self._active_lock:
-                pending_agent = self._pending_agent
-            self.last_heard.write(
-                transcript=transcript,
-                reason=capture.reason.value,
-                session_id=self.state.snapshot().session_id,
-                client_id=client_id,
-                agent=pending_agent,
-                turn_id=turn_id,
-                delivered=False,
-            )
-            intent = classify_spoken_intent(transcript)
+            transcript, turn_id, intent = self._record_heard(client_id, capture, transcription)
             if intent.intent is SpokenIntent.REPEAT and repeats < repeat_limit:
                 repeats += 1
                 self.state.complete_turn(client_id=client_id)
@@ -965,34 +1180,89 @@ class VoxEngine:
                 await asyncio.sleep(wait_seconds)
                 continue
 
-            result: dict[str, Any] = {
-                "status": "completed",
-                "transcript": transcript,
-                "intent": intent.intent.value,
-                "backend": transcription.backend,
-                "fallback": transcription.fallback,
-                "timings": {
-                    "capture_seconds": round(capture.audio_duration_s, 3),
-                    "stt_ms": transcription.elapsed_ms,
-                },
-                "capture": _capture_dict(capture),
-                "turn_id": turn_id,
-            }
-            if intent.intent is SpokenIntent.STOP:
-                self.state.stop(StopReason.USER_REQUEST, client_id=client_id)
-                await self.lease.release(client_id)
-                result["control"] = {"action": "stop", "session_ended": True}
-            elif intent.intent is SpokenIntent.PAUSE:
-                self.state.pause("spoken pause", client_id=client_id)
-                result["control"] = {"action": "pause"}
-            else:
-                self.state.complete_turn(client_id=client_id)
-                if intent.intent is not SpokenIntent.NONE:
-                    result["control"] = {"action": intent.intent.value}
-            result["session"] = self.state.snapshot().to_dict()
-            # Durable before the tool returns so host cancel cannot erase it.
-            self._set_pending_heard(result, turn_id)
-            return result
+            return await self._heard_result(
+                client_id, capture, transcription, transcript, turn_id, intent
+            )
+
+    def _silent_heard_result(self, capture: CaptureResult) -> dict[str, Any]:
+        """The result for a capture that produced no transcript."""
+
+        return {
+            "status": (
+                "cancelled" if capture.reason is CaptureStopReason.CANCELLED else "no_speech"
+            ),
+            "reason": capture.reason.value,
+            "capture": _capture_dict(capture),
+            "session": self.state.snapshot().to_dict(),
+        }
+
+    def _record_heard(
+        self,
+        client_id: str,
+        capture: CaptureResult,
+        transcription: SpeechResult,
+    ) -> tuple[str, str, Any]:
+        """Make a fresh transcript durable and classify what it asked for."""
+
+        transcript = transcription.text or ""
+        turn_id = uuid.uuid4().hex
+        with self._active_lock:
+            pending_agent = self._pending_agent
+        self.last_heard.write(
+            transcript=transcript,
+            reason=capture.reason.value,
+            session_id=self.state.snapshot().session_id,
+            client_id=client_id,
+            agent=pending_agent,
+            turn_id=turn_id,
+            delivered=False,
+        )
+        return transcript, turn_id, classify_spoken_intent(transcript)
+
+    async def _heard_result(
+        self,
+        client_id: str,
+        capture: CaptureResult,
+        transcription: SpeechResult,
+        transcript: str,
+        turn_id: str,
+        intent: Any,
+    ) -> dict[str, Any]:
+        """Settle the session for a completed turn and shape its result.
+
+        Shared by the normal listen loop and the barge-in path so intent
+        handling, session bookkeeping, and undelivered-transcript recovery
+        cannot drift apart between them.
+        """
+
+        result: dict[str, Any] = {
+            "status": "completed",
+            "transcript": transcript,
+            "intent": intent.intent.value,
+            "backend": transcription.backend,
+            "fallback": transcription.fallback,
+            "timings": {
+                "capture_seconds": round(capture.audio_duration_s, 3),
+                "stt_ms": transcription.elapsed_ms,
+            },
+            "capture": _capture_dict(capture),
+            "turn_id": turn_id,
+        }
+        if intent.intent is SpokenIntent.STOP:
+            self.state.stop(StopReason.USER_REQUEST, client_id=client_id)
+            await self.lease.release(client_id)
+            result["control"] = {"action": "stop", "session_ended": True}
+        elif intent.intent is SpokenIntent.PAUSE:
+            self.state.pause("spoken pause", client_id=client_id)
+            result["control"] = {"action": "pause"}
+        else:
+            self.state.complete_turn(client_id=client_id)
+            if intent.intent is not SpokenIntent.NONE:
+                result["control"] = {"action": intent.intent.value}
+        result["session"] = self.state.snapshot().to_dict()
+        # Durable before the tool returns so host cancel cannot erase it.
+        self._set_pending_heard(result, turn_id)
+        return result
 
     async def converse(
         self,
@@ -1036,9 +1306,17 @@ class VoxEngine:
                     speed=speed,
                     instructions=instructions,
                     interruptible=True,
+                    barge_in=effective_wait and self.config.barge_in_enabled,
                 )
             result: dict[str, Any] = {"spoken": spoken, "io_mode": mode}
-            if effective_wait and spoken.get("status") != "cancelled":
+            if spoken.get("status") == "barge_in":
+                # The user talked over the reply. The capture that detected
+                # them is still running and already holds their opening words
+                # in its pre-roll, so it *is* the answer — opening a second
+                # listen here would ask them to repeat themselves.
+                result["barge_in"] = True
+                result["heard"] = await self._harvest_barge_in(client_id, language=language)
+            elif effective_wait and spoken.get("status") != "cancelled":
                 result["heard"] = await self._listen_locked(
                     client_id,
                     listen_duration_max=listen_duration_max,
@@ -1431,6 +1709,11 @@ class VoxEngine:
             "persist_audio": self.config.persist_audio,
             "persist_transcripts": self.config.persist_transcripts,
             "microphone_open": self.microphone_open,
+            # When enabled, the microphone is open during playback so you can
+            # interrupt by talking. That is a real widening of when the mic is
+            # live, so it is reported here and not only in the tuning knobs.
+            "barge_in_enabled": self.config.barge_in_enabled,
+            "mic_armed_for_barge_in": self.barge_in_armed,
             "control_token_path": str(self.control_token_path),
         }
         try:
@@ -1701,7 +1984,16 @@ class VoxEngine:
         detail = _state_detail(self.state.state)
         with self._active_lock:
             microphone_closing = self._microphone_closing
-        if microphone_open and microphone_closing:
+            barge_in_armed = self._barge_in_control is not None
+        # An armed barge-in is the one case where an open microphone during
+        # SPEAKING is intended rather than a mic that failed to close, so it
+        # has to be tested before the fail-closed branches below.
+        mic_armed_for_barge_in = (
+            barge_in_armed and microphone_open and self.state.state is SessionState.SPEAKING
+        )
+        if mic_armed_for_barge_in:
+            detail = "Playing local speech; microphone open so you can interrupt"
+        elif microphone_open and microphone_closing:
             detail = "Microphone is still closing; Vox is fail-closed to new audio turns"
         elif microphone_open and self.state.state is not SessionState.LISTENING:
             detail = "Microphone is still closing; Vox is fail-closed to new audio turns"
@@ -1718,6 +2010,8 @@ class VoxEngine:
             "storage": self.store.status(),
             "local_only": True,
             "io_mode": self._io_mode,
+            "barge_in_enabled": self.config.barge_in_enabled,
+            "mic_armed_for_barge_in": mic_armed_for_barge_in,
             "undelivered_heard": (
                 undelivered.public() if undelivered is not None else {"present": False}
             ),
@@ -1734,7 +2028,10 @@ class VoxEngine:
         undelivered = status.get("undelivered_heard") or {"present": False}
         with self._active_lock:
             mic_active = self._microphone_active
-            control = self._capture_control
+            # An armed capture publishes levels too; without it the waveform
+            # would sit flat through the one window where the mic is open but
+            # the session still reads SPEAKING.
+            control = self._capture_control or self._barge_in_control
         # Live loudness for the menu-bar waveform; 0 whenever the mic is closed
         # so a stale value can never make the meter look like it is hearing you.
         mic_level = control.level if (mic_active and control is not None) else 0.0
@@ -1745,6 +2042,8 @@ class VoxEngine:
             "version": "0.1.0",
             "local_only": True,
             "microphone_open": session["microphone_open"],
+            "barge_in_enabled": self.config.barge_in_enabled,
+            "mic_armed_for_barge_in": status.get("mic_armed_for_barge_in", False),
             "mic_level": round(mic_level, 3),
             # Kept deliberately compact and transcript-free for the native
             # status panel. This makes an automatic idle stop explainable
