@@ -169,6 +169,30 @@ class AudioDeviceInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class LevelMeasurement:
+    """Loudness statistics for a fixed listening window. No audio retained."""
+
+    device: str
+    frames: int
+    median_dbfs: float
+    p90_dbfs: float
+    peak_dbfs: float
+
+    @classmethod
+    def from_dbfs(cls, levels: list[float], *, device: str) -> "LevelMeasurement":
+        if not levels:
+            return cls(device=device, frames=0, median_dbfs=-96.0, p90_dbfs=-96.0, peak_dbfs=-96.0)
+        array = np.asarray(levels, dtype=np.float64)
+        return cls(
+            device=device,
+            frames=len(levels),
+            median_dbfs=float(np.median(array)),
+            p90_dbfs=float(np.percentile(array, 90)),
+            peak_dbfs=float(np.max(array)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class FrameDecision:
     """The endpoint detector's decision for one input frame."""
 
@@ -686,6 +710,62 @@ class AudioRecorder:
             else:
                 state.stop(CaptureStopReason.SOURCE_ENDED)
         return self._finish(state, dropped_frames=0)
+
+    def measure(
+        self,
+        seconds: float,
+        *,
+        device: int | str | None = None,
+    ) -> "LevelMeasurement":
+        """Watch the microphone for a fixed window and report loudness only.
+
+        No endpointing, no retained audio, no transcript — this exists so the
+        barge-in echo gate can be set from measured speaker bleed instead of a
+        guess.  Frames are reduced to dBFS the instant they arrive and the
+        samples are dropped.
+        """
+
+        if seconds <= 0:
+            raise ValueError("seconds must be positive")
+        sounddevice = self._sounddevice or _load_sounddevice()
+        device_info = resolve_input_device(sounddevice, device)
+        levels: list[float] = []
+        levels_lock = threading.Lock()
+
+        def callback(indata: Any, _frame_count: int, _time_info: Any, status: Any) -> None:
+            if status and not getattr(status, "input_overflow", False):
+                return
+            try:
+                dbfs = _dbfs(_as_mono_float32(indata))
+            except Exception:
+                return
+            with levels_lock:
+                levels.append(dbfs)
+
+        factory = self._stream_factory or sounddevice.InputStream
+        blocksize = max(1, round(device_info.sample_rate * self.config.frame_ms / 1000))
+        deadline = self._clock() + seconds
+        try:
+            with factory(
+                samplerate=device_info.sample_rate,
+                channels=1,
+                dtype="float32",
+                blocksize=blocksize,
+                callback=callback,
+                device=device_info.index,
+            ):
+                while self._clock() < deadline:
+                    time.sleep(min(0.02, self.config.frame_ms / 1000))
+        except Exception as exc:
+            if isinstance(exc, AudioError):
+                raise
+            raise AudioDeviceError(
+                f"Audio measurement failed on {device_info.name}: {exc}"
+            ) from exc
+
+        with levels_lock:
+            observed = list(levels)
+        return LevelMeasurement.from_dbfs(observed, device=device_info.name)
 
     def capture(
         self,

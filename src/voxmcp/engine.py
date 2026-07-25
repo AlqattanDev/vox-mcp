@@ -133,6 +133,30 @@ class VoxEngine:
             "off",
         }
 
+        # Barge-in echo gate. There is no acoustic echo cancellation anywhere in
+        # the stack — playback is an opaque afplay subprocess, so no reference
+        # signal exists to subtract. On laptop speakers the microphone hears
+        # Kokoro, so an armed capture runs a deliberately deaf configuration:
+        # the noise floor is allowed to rise fast enough to swallow the steady
+        # speaker bleed, and only speech well above that floor, sustained rather
+        # than transient, can trigger onset. Tune these from measurements taken
+        # by `vox barge-in calibrate`, not by feel.
+        self._barge_in_speech_start_s = float(
+            os.environ.get("VOX_BARGE_IN_SPEECH_START_SECONDS", "0.30")
+        )
+        self._barge_in_speech_margin_db = float(
+            os.environ.get("VOX_BARGE_IN_SPEECH_MARGIN_DB", "18.0")
+        )
+        self._barge_in_noise_rise_smoothing = float(
+            os.environ.get("VOX_BARGE_IN_NOISE_RISE_SMOOTHING", "0.9")
+        )
+        self._barge_in_duck_volume = min(
+            1.0, max(0.0, float(os.environ.get("VOX_BARGE_IN_DUCK_VOLUME", "0.85")))
+        )
+        self._barge_in_cancel_grace_s = max(
+            0.0, float(os.environ.get("VOX_BARGE_IN_CANCEL_GRACE_S", "0.05"))
+        )
+
         self._active_lock = threading.RLock()
         self._active_task: asyncio.Task[Any] | None = None
         self._active_client: str | None = None
@@ -721,6 +745,25 @@ class VoxEngine:
             self.player.play_file(cues[1], volume=self.volume, blocking=False)
         except Exception:
             pass
+
+    def armed_capture_config(self) -> CaptureConfig:
+        """Capture settings deaf enough to listen through our own playback.
+
+        Only the pre-onset gate is tightened.  Once the user has actually
+        started talking the capture endpoints on the normal settings, so a
+        barge-in reply gets the same trailing-silence treatment as any other
+        turn.  The fast-rising noise floor is the load-bearing part: it lets
+        the steady speaker bleed become the floor within a few hundred
+        milliseconds, so the margin is measured against Kokoro rather than
+        against the silence Kokoro is no longer providing.
+        """
+
+        return replace(
+            self.recorder.config,
+            speech_start_s=self._barge_in_speech_start_s,
+            speech_margin_db=self._barge_in_speech_margin_db,
+            noise_rise_smoothing=self._barge_in_noise_rise_smoothing,
+        )
 
     async def _capture_once(
         self,

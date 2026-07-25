@@ -79,6 +79,19 @@ def test_environment_loader_is_strict(tmp_path: Path) -> None:
         VoxConfig.from_env({"VOX_STT_URL": "https://api.openai.com/v1"})
 
 
+def test_barge_in_is_off_until_explicitly_enabled(tmp_path: Path) -> None:
+    # Arming barge-in opens the microphone while the agent is still speaking,
+    # so it must never be the default anyone gets by accident.
+    assert VoxConfig(state_dir=tmp_path).barge_in_enabled is False
+    assert VoxConfig.from_env({"VOX_STATE_DIR": str(tmp_path)}).barge_in_enabled is False
+
+    enabled = VoxConfig.from_env({"VOX_STATE_DIR": str(tmp_path), "VOX_BARGE_IN_ENABLED": "1"})
+    assert enabled.barge_in_enabled is True
+
+    with pytest.raises(ConfigurationError):
+        VoxConfig.from_env({"VOX_BARGE_IN_ENABLED": "sometimes"})
+
+
 def test_config_rejects_unsafe_paths_and_ranges(tmp_path: Path) -> None:
     with pytest.raises(ConfigurationError):
         VoxConfig(state_dir=tmp_path, event_log_filename="../events.jsonl")

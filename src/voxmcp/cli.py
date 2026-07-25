@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import math
 import os
 import subprocess
 import time
@@ -396,6 +397,31 @@ def create_cli(
     def control_repeat() -> None:
         _invoke_and_print(dependencies, "voice_control", {"action": "repeat"})
 
+    @cli.group("barge-in")
+    def barge_in_group() -> None:
+        """Measure and tune the echo gate that lets you interrupt playback."""
+
+    @barge_in_group.command("calibrate")
+    @click.option(
+        "--seconds",
+        type=click.FloatRange(min=2.0, max=30.0),
+        default=8.0,
+        show_default=True,
+        help="Length of each measurement window.",
+    )
+    @click.option("--safety-db", type=click.FloatRange(min=0.0, max=20.0), default=6.0,
+                  show_default=True, help="Headroom subtracted from the measured gap.")
+    def barge_in_calibrate(seconds: float, safety_db: float) -> None:
+        """Measure speaker bleed against your voice and print a real margin.
+
+        Barge-in has no acoustic echo cancellation to lean on, so the gate is
+        only as good as the numbers behind it. This measures both sides on
+        your actual hardware instead of guessing.
+        """
+
+        measurement = _calibrate_barge_in(dependencies, seconds=seconds, safety_db=safety_db)
+        click.echo(json.dumps(measurement, indent=2, sort_keys=True))
+
     @cli.command("doctor")
     @click.option("--include-logs", is_flag=True)
     def doctor_command(include_logs: bool) -> None:
@@ -650,6 +676,101 @@ def create_cli(
         _print_json(result)
 
     return cli
+
+
+CALIBRATION_SCRIPT = (
+    "Calibrating the barge-in gate now. Keep quiet while I talk, because this "
+    "first pass measures how much of my own voice your microphone can hear "
+    "coming back through the speakers. I will keep going for a few seconds so "
+    "there is enough signal to be worth measuring, and then it will be your "
+    "turn to say something."
+)
+
+
+def _measure_input(seconds: float) -> Any:
+    """Watch the microphone for one window using the production recorder."""
+
+    from .audio import AudioRecorder, CaptureConfig
+
+    recorder = AudioRecorder(CaptureConfig(save_latest=False, latest_wav_path=None))
+    return recorder.measure(seconds, device=os.environ.get("VOX_INPUT_DEVICE"))
+
+
+def _calibrate_barge_in(
+    dependencies: "_Dependencies",
+    *,
+    seconds: float,
+    safety_db: float,
+) -> dict[str, Any]:
+    import threading
+
+    duck = min(1.0, max(0.0, float(os.environ.get("VOX_BARGE_IN_DUCK_VOLUME", "0.85"))))
+    duck_offset_db = 20.0 * math.log10(duck) if duck > 0 else -96.0
+
+    click.echo("Vox is opening the microphone for calibration. Stay quiet for the first pass.")
+    speak_error: list[Exception] = []
+
+    def speak() -> None:
+        try:
+            result = dependencies.caller("speak", {"message": CALIBRATION_SCRIPT})
+            if inspect.isawaitable(result):
+                asyncio.run(result)
+        except Exception as exc:  # reported, never raised into the measuring thread
+            speak_error.append(exc)
+
+    speaker = threading.Thread(target=speak, daemon=True)
+    speaker.start()
+    time.sleep(0.6)  # let playback actually start before the window opens
+    bleed = _measure_input(seconds)
+    speaker.join(timeout=max(5.0, seconds))
+
+    if speak_error:
+        raise click.ClickException(
+            f"Could not play the calibration script through the runtime: {speak_error[0]}"
+        )
+
+    click.echo("")
+    click.echo(f"Now speak normally for {seconds:.0f} seconds, at your usual distance.")
+    click.pause(info="Press any key when you are ready to talk...")
+    voice = _measure_input(seconds)
+
+    bleed_armed_p90 = bleed.p90_dbfs + duck_offset_db
+    gap_db = voice.median_dbfs - bleed_armed_p90
+    recommended = max(6.0, round(gap_db - safety_db, 1))
+    usable = gap_db >= safety_db + 6.0
+
+    return {
+        "device": voice.device,
+        "duck_volume": duck,
+        "bleed": {
+            "frames": bleed.frames,
+            "median_dbfs": round(bleed.median_dbfs, 1),
+            "p90_dbfs": round(bleed.p90_dbfs, 1),
+            "peak_dbfs": round(bleed.peak_dbfs, 1),
+            "p90_dbfs_at_armed_volume": round(bleed_armed_p90, 1),
+        },
+        "voice": {
+            "frames": voice.frames,
+            "median_dbfs": round(voice.median_dbfs, 1),
+            "p90_dbfs": round(voice.p90_dbfs, 1),
+            "peak_dbfs": round(voice.peak_dbfs, 1),
+        },
+        "gap_db": round(gap_db, 1),
+        "recommended": {
+            "VOX_BARGE_IN_SPEECH_MARGIN_DB": recommended,
+        },
+        "usable": usable,
+        "verdict": (
+            f"Your voice sits {gap_db:.1f} dB above the loudest speaker bleed. "
+            f"Set VOX_BARGE_IN_SPEECH_MARGIN_DB={recommended}."
+            if usable
+            else (
+                f"Only {gap_db:.1f} dB separates your voice from the speaker bleed — too "
+                "little to gate on reliably. Expect Kokoro to interrupt itself. Lower the "
+                "output volume, move the microphone, or use headphones."
+            )
+        ),
+    }
 
 
 def _invoke_and_print(

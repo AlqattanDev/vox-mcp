@@ -19,6 +19,7 @@ from voxmcp.audio import (
     CaptureControl,
     CapturePhase,
     CaptureStopReason,
+    LevelMeasurement,
     PlaybackRegistry,
     resolve_input_device,
     write_wav_atomic,
@@ -423,6 +424,42 @@ class FakeSoundDevice:
                 return None
 
         return Stream()
+
+
+def test_measure_reports_loudness_without_retaining_audio() -> None:
+    # Two thirds quiet, one third loud: the median must land on the quiet
+    # bleed and the peak on the loud frames, which is exactly the shape the
+    # barge-in calibration reads.
+    quiet = [np.full(960, 0.001, dtype=np.float32) for _ in range(20)]
+    loud = [np.full(960, 0.2, dtype=np.float32) for _ in range(10)]
+    backend = FakeSoundDevice(quiet + loud)
+    recorder = AudioRecorder(
+        config(),
+        sounddevice=backend,
+        clock=iter([0.0, 1.0]).__next__,
+    )
+
+    measurement = recorder.measure(0.5)
+
+    assert measurement.frames == 30
+    assert measurement.device == "Mock 48 kHz microphone"
+    assert measurement.median_dbfs == pytest.approx(-60.0, abs=1.0)
+    assert measurement.peak_dbfs == pytest.approx(-14.0, abs=1.0)
+    assert measurement.median_dbfs < measurement.peak_dbfs
+    assert not hasattr(measurement, "samples")
+
+
+def test_measure_rejects_a_non_positive_window() -> None:
+    recorder = AudioRecorder(config(), sounddevice=FakeSoundDevice([]))
+    with pytest.raises(ValueError, match="seconds must be positive"):
+        recorder.measure(0.0)
+
+
+def test_level_measurement_of_an_empty_window_is_silence() -> None:
+    empty = LevelMeasurement.from_dbfs([], device="none")
+    assert empty.frames == 0
+    assert empty.median_dbfs == -96.0
+    assert empty.peak_dbfs == -96.0
 
 
 def test_default_input_uses_native_device_rate() -> None:

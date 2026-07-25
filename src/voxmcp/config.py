@@ -90,6 +90,10 @@ class VoxConfig:
     persist_audio: bool = True
     event_log_filename: str = "events.jsonl"
     local_only: bool = True
+    # Consent-adjacent, so it lives here and surfaces in diagnostics(privacy)
+    # rather than hiding among the numeric tuning knobs: when armed, the
+    # microphone is physically open while the agent is still speaking.
+    barge_in_enabled: bool = False
 
     def __post_init__(self) -> None:
         if not self.local_only:
@@ -112,6 +116,8 @@ class VoxConfig:
             raise ConfigurationError("persist_transcripts must be a boolean")
         if not isinstance(self.persist_audio, bool):
             raise ConfigurationError("persist_audio must be a boolean")
+        if not isinstance(self.barge_in_enabled, bool):
+            raise ConfigurationError("barge_in_enabled must be a boolean")
 
         filename = self.event_log_filename
         if (
@@ -146,6 +152,7 @@ class VoxConfig:
             persist_transcripts=_env_bool(env, "VOX_PERSIST_TRANSCRIPTS", False),
             persist_audio=_env_bool(env, "VOX_PERSIST_AUDIO", True),
             event_log_filename=env.get("VOX_EVENT_LOG_FILENAME", "events.jsonl"),
+            barge_in_enabled=_env_bool(env, "VOX_BARGE_IN_ENABLED", False),
         )
 
 
