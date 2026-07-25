@@ -465,8 +465,17 @@ class AdaptiveCaptureState:
             is_speech = energy_speech
         elif vad_vote:
             # Allow VAD to recognize quiet speech, but still require a small
-            # rise above the learned floor to reject stationary fan noise.
-            is_speech = dbfs >= self.noise_floor_dbfs + 3.0
+            # rise above the learned floor to reject stationary fan noise —
+            # and never below the absolute floor, whatever the VAD claims.
+            # WebRTC VAD votes speech on ordinary room tone, and a room whose
+            # ambient sits within 3 dB of its own learned floor would otherwise
+            # read as continuous speech: trailing silence never accumulates and
+            # the turn cannot endpoint. minimum_speech_dbfs is the promise that
+            # a level this quiet is not speech no matter who says otherwise.
+            is_speech = (
+                dbfs >= self.noise_floor_dbfs + 3.0
+                and dbfs >= self.config.minimum_speech_dbfs
+            )
         else:
             # A very strong transient may be clipped speech that VAD missed.
             is_speech = energy_speech and dbfs >= threshold + 12.0

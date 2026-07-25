@@ -34,6 +34,22 @@ Default turn bounds are deliberately generous for this user’s speaking style:
 All four are configurable. Unlike VoiceMode, the speech-onset timeout and
 trailing-silence timeout are separate.
 
+### Calibrate the speech floor first
+
+Everything below assumes Vox can tell your silence from your speech, and on a
+laptop microphone that is not automatic. WebRTC VAD votes "speech" on ordinary
+room tone, so if your room sits above `minimum_speech_dbfs` the runtime hears
+continuous talking: trailing silence never accumulates and a one-word answer
+takes many seconds to end.
+
+```bash
+vox calibrate
+```
+
+It measures your quiet room, then your voice, and prints the floor that clears
+the room's *peaks* plus the command to apply it. Note the applied value only
+lasts the login session — re-run it after a reboot.
+
 ### Trailing silence scales with the utterance
 
 A one-word answer and a rambling paragraph should not wait the same amount of

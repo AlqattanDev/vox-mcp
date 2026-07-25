@@ -221,6 +221,14 @@ class VoxEngine:
             min_duration_s=float(os.environ.get("VOX_MIN_UTTERANCE_SECONDS", "0.5")),
             max_duration_s=float(os.environ.get("VOX_MAX_UTTERANCE_SECONDS", "75")),
             pre_roll_s=float(os.environ.get("VOX_PRE_ROLL_SECONDS", "0.3")),
+            # The absolute floor below which nothing is speech, whatever the
+            # adaptive noise floor says. It has to clear the room's own tone:
+            # a quiet room that still sits above this value gets classified as
+            # continuous speech, which inflates speech_duration_s and stops a
+            # turn from ever endpointing. `vox calibrate` measures the room and
+            # prints the value to use.
+            minimum_speech_dbfs=float(os.environ.get("VOX_MINIMUM_SPEECH_DBFS", "-48")),
+            speech_margin_db=float(os.environ.get("VOX_SPEECH_MARGIN_DB", "9")),
             latest_wav_path=store.latest_stt,
             save_latest=True,
         )

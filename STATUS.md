@@ -36,6 +36,18 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
 - **Streamed TTS.** Long replies speak sentence-by-sentence; the next span
   synthesizes while the current one plays, so audio starts after the first
   sentence. Off via `VOX_STREAM_TTS=0`.
+- **The speech floor is absolute.** `minimum_speech_dbfs` is honoured whatever
+  WebRTC VAD votes. It previously applied only on the energy path, so a VAD
+  "speech" vote needed just 3 dB over the learned floor — and WebRTC votes
+  speech on ordinary room tone. Measured on this MacBook: an idle room sits at
+  −48.8 dBFS median / −42.5 peak, above the −48 default, so **silence was
+  classified as talking**: `speech_duration_s` inflated ~8× (the single word
+  "Done" scored 5.22 s), trailing silence never accumulated, and short answers
+  took 7 s to endpoint. With the floor honoured, the same one-word answer
+  endpoints in **2.7 s**. Run **`vox calibrate`** to measure your room and get
+  the value; `VOX_MINIMUM_SPEECH_DBFS` and `VOX_SPEECH_MARGIN_DB` set it.
+  This machine runs `-38`. `launchctl setenv` lasts the login session — re-run
+  it after a reboot.
 - **Endpointing scales with the utterance.** Trailing silence runs 0.6s for a
   short answer and 1.6s for a long one, interpolated over 1.5s–3.0s of measured
   *speech* (not wall time, so pausing to think keeps a long answer on the long
@@ -125,6 +137,26 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
 - **No empty logs theater.** Installer does not create `~/.vox/logs/*`.
   Process stdout/stderr → `/dev/null`. Audit trail: `~/.vox/state/events.jsonl`.
 
+## Measured turn latency (2026-07-25, live)
+
+Who owns the seconds in a spoken turn, from `~/.vox/state/events.jsonl`:
+
+| Phase | Measured | Owner |
+|---|---|---|
+| Kokoro synth, first span | 0.55–0.89 s | vox |
+| Whisper STT | 257–661 ms | vox |
+| Trailing silence | 0.6 s short / 1.6 s long | vox |
+| **Agent turn** (you stop → next word) | **9.2 / 26.2 / 18.9 s** (mean 18.1) | the agent |
+
+Baseline before the voice turn contract was 25.4 / 40.8 / 24.3 s (mean 30.2).
+So the contract took roughly a third off the mean and the runtime owns under
+1.5 s of a turn — but 26 s on one exchange says it is discipline, not a fix.
+The remaining lever is the agent behaving, not the runtime.
+
+Endpointing, same session: one-word answer **7.24 s → 2.7 s** once the speech
+floor was honoured; a 12.5 s ramble still gets the full 1.6 s and is not cut
+off mid-thought.
+
 ## Memory
 
 | service | now | peak |
@@ -134,7 +166,7 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
 | `com.vox.runtime` | ~73 MB | ~73 MB |
 | **total** | **~2.7 GB** | **~3.2 GB** |
 
-Tests: `.venv/bin/python -m pytest tests/` — **249 passing**.
+Tests: `.venv/bin/python -m pytest tests/` — **251 passing**.
 
 **Slash commands** (in `~/.claude/commands/`, global): `/speak` reads the
 agent's last reply aloud (no mic); `/listen` opens the mic for one utterance

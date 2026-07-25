@@ -426,6 +426,37 @@ class FakeSoundDevice:
         return Stream()
 
 
+def test_room_tone_the_vad_calls_speech_is_still_below_the_absolute_floor() -> None:
+    # Measured on a MacBook Pro mic: an idle room sits around -45 dBFS, and
+    # WebRTC VAD votes speech on it. Honouring that vote against the learned
+    # floor alone made silence read as continuous speech — trailing silence
+    # never accumulated and a one-word answer took seven seconds to endpoint.
+    # minimum_speech_dbfs has to mean "not speech", whoever disagrees.
+    always_speech = lambda _samples, _sr: True  # noqa: E731 - a VAD that never says no
+    state = AdaptiveCaptureState(
+        1_000,
+        config(minimum_speech_dbfs=-38.0, trailing_silence_s=0.4, min_duration_s=0.0),
+        always_speech,
+    )
+
+    # Room tone at roughly -45 dBFS: above the noise floor, below the floor
+    # that decides what counts as speech at all.
+    room = frame(0.0056)
+    for _ in range(10):
+        assert state.feed(room).is_speech is False
+
+    # Real speech clears it and is still detected.
+    assert state.feed(frame(0.2)).is_speech is True
+
+
+def test_the_absolute_floor_does_not_deafen_the_energy_path() -> None:
+    # Raising the floor must not break the no-VAD fallback: loud speech is
+    # still speech when webrtcvad is unavailable.
+    state = AdaptiveCaptureState(1_000, config(minimum_speech_dbfs=-38.0), None)
+    assert state.feed(frame(0.001)).is_speech is False
+    assert state.feed(frame(0.3)).is_speech is True
+
+
 def test_measure_reports_loudness_without_retaining_audio() -> None:
     # Two thirds quiet, one third loud: the median must land on the quiet
     # bleed and the peak on the loud frames, which is exactly the shape the
