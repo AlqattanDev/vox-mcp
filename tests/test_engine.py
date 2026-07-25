@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from voxmcp.audio import CaptureResult, CaptureStopReason
+from voxmcp.audio import AudioRecorder, CaptureConfig, CaptureResult, CaptureStopReason
 from voxmcp.config import VoxConfig
 from voxmcp.engine import VoxEngine
 from voxmcp.errors import BusyError
@@ -104,6 +104,29 @@ class BargingRecorder(FakeRecorder):
         if self.fire and on_speech_started is not None:
             on_speech_started()
             self.fired.set()
+        return super().capture(device=device, control=control)
+
+
+class ArmedHoldingRecorder(FakeRecorder):
+    """An armed capture that stays open for the whole reply, like the real one.
+
+    BargingRecorder returns its capture immediately, which completes the future
+    and clears ``_microphone_active`` before a cancel can possibly land — so it
+    cannot reproduce the ordering that wedges the session. The real device holds
+    the microphone until the control is cancelled, and that is precisely what
+    makes the mid-speech return-to-idle illegal.
+    """
+
+    def __init__(self, path: Path):
+        super().__init__(path, speech=False)
+        self.armed = threading.Event()
+
+    def capture(self, *, device=None, control=None, on_speech_started=None):
+        self.armed.set()
+        while control is None or not control.cancelled:
+            if control is None:
+                break
+            threading.Event().wait(0.005)
         return super().capture(device=device, control=control)
 
 
@@ -926,6 +949,20 @@ async def test_armed_but_unused_barge_in_releases_the_microphone(tmp_path: Path)
     assert result["session"]["state"] == "idle"
 
 
+def test_armed_capture_stays_open_for_the_whole_reply(tmp_path: Path):
+    # Measured before this was pinned: the armed microphone closed itself at
+    # 15.1 s of a 72 s reply, so the back 79% could not be interrupted and the
+    # only visible symptom was the menu-bar mic badge quietly disappearing.
+    # A real AudioRecorder, because the armed config is derived from the
+    # recorder's own CaptureConfig. Constructing one opens no device.
+    engine = make_engine(tmp_path, recorder=AudioRecorder(CaptureConfig()), barge_in=True)
+    armed = engine.armed_capture_config()
+
+    assert armed.onset_timeout_s is None
+    # The ordinary listen keeps its timeout: an unattended mic must still close.
+    assert engine.recorder.config.onset_timeout_s is not None
+
+
 @pytest.mark.asyncio
 async def test_cancel_while_armed_releases_playback_and_the_microphone(tmp_path: Path):
     # A cancel arriving mid-speech must reach the armed capture too, or it
@@ -933,7 +970,7 @@ async def test_cancel_while_armed_releases_playback_and_the_microphone(tmp_path:
     store = AudioStore(tmp_path / "audio")
     engine = make_engine(
         tmp_path,
-        recorder=BargingRecorder(store.latest_stt, fire=False),
+        recorder=ArmedHoldingRecorder(store.latest_stt),
         player=BlockingPlayer(),
         barge_in=True,
     )
@@ -952,6 +989,13 @@ async def test_cancel_while_armed_releases_playback_and_the_microphone(tmp_path:
     assert engine.barge_in_armed is False
     assert engine.microphone_open is False
     assert result["spoken"]["status"] in {"cancelled", "barge_in", "completed"}
+    # The mic closing is not enough. Cancel tries to return to idle *before*
+    # barge-in disarms, and that attempt is refused while the microphone is
+    # still open — so the session sat in SPEAKING forever and every later turn
+    # failed, with the microphone correctly closed the whole time. Checking the
+    # device but not the state machine is why this shipped: assert both.
+    assert engine.state.snapshot().to_dict()["state"] == "idle"
+    assert result["session"]["state"] == "idle"
 
 
 @pytest.mark.asyncio

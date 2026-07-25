@@ -708,6 +708,14 @@ class VoxEngine:
             self._barge_in_control = None
             self._barge_in_future = None
             self._microphone_active = False
+        # A cancel that lands while barge-in is armed tries to return to idle
+        # *before* this runs, and _return_idle_if_active refuses while the
+        # microphone is still open — so that attempt silently does nothing and
+        # the session used to stay SPEAKING forever, failing every later turn.
+        # Disarming is what makes the transition legal, so it retries here.
+        # On the completed path complete_turn already reached IDLE and this is a
+        # no-op; on the fired path we returned above and the capture is the reply.
+        self._return_idle_if_active()
 
     async def _harvest_barge_in(self, client_id: str, *, language: str | None) -> dict[str, Any]:
         """Finish the capture that interrupted playback and treat it as the reply."""
@@ -1056,6 +1064,13 @@ class VoxEngine:
             noise_spread_k=self._barge_in_noise_spread_k,
             max_vad_margin_db=self._barge_in_max_vad_margin_db,
             noise_window_s=self._barge_in_noise_window_s,
+            # No onset timeout: this capture ends when the reply does, and
+            # _disarm_barge_in is what stops it. Inheriting the ordinary 15 s
+            # timeout let the microphone close itself partway through a long
+            # reply — measured dying at 15.1 s of a 72 s answer, leaving 79% of
+            # it uninterruptible with the glyph correctly showing a closed mic
+            # and nothing explaining why talking no longer worked.
+            onset_timeout_s=None,
         )
 
     async def _capture_once(

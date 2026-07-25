@@ -91,7 +91,11 @@ def default_latest_recording_path() -> Path:
 class CaptureConfig:
     """Endpointing and persistence settings for one recording."""
 
-    onset_timeout_s: float = 15.0
+    # None means "wait indefinitely for onset". Only the barge-in capture uses
+    # it: what ends that capture is the reply finishing, not a clock, and a
+    # 15 s timeout silently made the back half of every long reply
+    # uninterruptible (measured: armed died at 15.1 s of a 72 s reply).
+    onset_timeout_s: float | None = 15.0
     trailing_silence_s: float = 1.6
     short_trailing_silence_s: float = 0.6
     short_utterance_speech_s: float = 1.5
@@ -130,8 +134,9 @@ class CaptureConfig:
     latest_wav_path: Path | None = field(default_factory=default_latest_recording_path)
 
     def __post_init__(self) -> None:
-        if not 0 < self.onset_timeout_s <= 15.0:
-            raise ValueError("onset_timeout_s must be in (0, 15]")
+        onset = self.onset_timeout_s
+        if onset is not None and not 0 < onset <= 15.0:
+            raise ValueError("onset_timeout_s must be in (0, 15] or None")
         if not 0 < self.trailing_silence_s <= 10.0:
             raise ValueError("trailing_silence_s must be in (0, 10]")
         if self.short_trailing_silence_s <= 0:
@@ -321,10 +326,59 @@ _HEADPHONE_HINTS = (
 )
 
 
+# PortAudio snapshots the device list when it initializes, so a long-lived
+# runtime keeps reporting whatever was plugged in at launch. Reinitializing is
+# the only way to see hardware connected since — but it must never happen under
+# a live InputStream, so capture marks PortAudio as in use while it holds one.
+_PORTAUDIO_LOCK = threading.Lock()
+_OPEN_INPUT_STREAMS = 0
+
+
+class _PortAudioInUse:
+    """Mark PortAudio busy so nothing reinitializes it under a live stream."""
+
+    def __enter__(self) -> "_PortAudioInUse":
+        global _OPEN_INPUT_STREAMS
+        with _PORTAUDIO_LOCK:
+            _OPEN_INPUT_STREAMS += 1
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        global _OPEN_INPUT_STREAMS
+        with _PORTAUDIO_LOCK:
+            _OPEN_INPUT_STREAMS -= 1
+
+
+def refresh_output_devices(sounddevice: Any | None = None) -> bool:
+    """Re-read the device list so hardware plugged in mid-session is seen.
+
+    Without this, plugging in headphones after the runtime started leaves
+    barge-in looking at the speakers it had already refused to arm on, and no
+    amount of waiting fixes it. Costs about 1.5 ms.
+
+    Returns False (leaving the stale list in place) when a capture stream is
+    open, because tearing PortAudio down under one would take the turn with it.
+    A stale device name is a wrong answer; a dead capture is a lost utterance.
+    """
+
+    module = sounddevice or _load_sounddevice()
+    with _PORTAUDIO_LOCK:
+        if _OPEN_INPUT_STREAMS:
+            return False
+        try:
+            module._terminate()
+            module._initialize()
+        except Exception:
+            # Private PortAudio entry points, or an injected fake without them.
+            return False
+    return True
+
+
 def default_output_name(sounddevice: Any | None = None) -> str:
     """Name of the current default output device, or '' if unknowable."""
 
     module = sounddevice or _load_sounddevice()
+    refresh_output_devices(module)
     try:
         default = module.default.device
         index = default[1] if isinstance(default, (list, tuple)) else default
@@ -637,7 +691,10 @@ class AdaptiveCaptureState:
                 self._utterance_elapsed_s = self._speech_run_s
                 self.speech_duration_s = self._speech_run_s
                 started_now = True
-            elif self.elapsed_s + 1e-9 >= self.config.onset_timeout_s:
+            elif (
+                self.config.onset_timeout_s is not None
+                and self.elapsed_s + 1e-9 >= self.config.onset_timeout_s
+            ):
                 self.stop(CaptureStopReason.ONSET_TIMEOUT)
 
         else:
@@ -883,7 +940,7 @@ class AudioRecorder:
         blocksize = max(1, round(device_info.sample_rate * self.config.frame_ms / 1000))
         deadline = self._clock() + seconds
         try:
-            with factory(
+            with _PortAudioInUse(), factory(
                 samplerate=device_info.sample_rate,
                 channels=1,
                 dtype="float32",
@@ -972,7 +1029,7 @@ class AudioRecorder:
         speech_started_at: float | None = None
 
         try:
-            with factory(**stream_kwargs):
+            with _PortAudioInUse(), factory(**stream_kwargs):
                 while not state.finished:
                     if control.cancelled:
                         state.stop(CaptureStopReason.CANCELLED)
@@ -986,7 +1043,10 @@ class AudioRecorder:
 
                     now = self._clock()
                     if state.phase is CapturePhase.WAITING_FOR_SPEECH:
-                        if now - started_at >= self.config.onset_timeout_s:
+                        if (
+                            self.config.onset_timeout_s is not None
+                            and now - started_at >= self.config.onset_timeout_s
+                        ):
                             state.stop(CaptureStopReason.ONSET_TIMEOUT)
                             break
                     elif speech_started_at is not None:

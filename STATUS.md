@@ -82,10 +82,30 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
   speakers this is arithmetic, not tuning. Barge-in therefore checks the
   default output device and **declines to arm** unless it is recognisably
   headphones, reporting `barge_in.reason = "shared_output"` in
-  `diagnostics(privacy)` rather than interrupting itself. Plug in AirPods and
-  it arms with nothing to configure. `VOX_BARGE_IN_REQUIRE_HEADPHONES=0`
-  overrides deliberately. On speakers, the **Reply button / ⌃⌥⌘R** is the
-  interruption path and needs no acoustics.
+  `diagnostics(privacy)` rather than interrupting itself.
+  `VOX_BARGE_IN_REQUIRE_HEADPHONES=0` overrides deliberately. On speakers, the
+  **Reply button / ⌃⌥⌘R** is the interruption path and needs no acoustics.
+  The device list is **re-read on every availability check** — PortAudio
+  snapshots devices at process start, so headphones plugged in after the runtime
+  launched were invisible and barge-in kept refusing on the speakers it no
+  longer used. Skipped while a capture stream is open, because reinitializing
+  PortAudio under a live `InputStream` would take the turn with it.
+- **Barge-in is verified live on headphones** (2026-07-26, HUAWEI FreeClip 2).
+  Recognition is by device *name*, so these open-ear buds are not on the
+  headphone list and needed the override — but they measured **+27.6 dB in the
+  user's favour** (bleed p90 −63.3 armed, voice median −37.2), the near-exact
+  inverse of the −24 dB on speakers, a ~52 dB swing. The reason is causal, not
+  luck: connecting them moves *both* input and output to the earbuds, so the mic
+  in use sits inches from the mouth and isolated from the driver.
+  Three long replies with the mic open produced **zero false interrupts**; a
+  deliberate interruption returned `spoken.status: "barge_in"` with the
+  transcript **"Pineapple is something I don't like actually."** — the planted
+  opening word survived, which is the pre-roll splice proven end to end.
+  **Cost of it on Bluetooth:** opening the mic drags the earbuds from A2DP into
+  the HFP call profile (their input resolves at 16 kHz, the MacBook mic at 48),
+  so an armed reply is louder and narrower-band for its whole duration. That is
+  the price of barge-in working at all on earbuds, and it is why the mic closing
+  mid-reply used to be audible as a volume collapse.
 - **Barge-in mechanism (off by default).** `VOX_BARGE_IN_ENABLED=1` opens the mic
   *during* playback: start talking and the current sentence dies mid-word, the
   remaining spans and the one being synthesized ahead are abandoned, and the
@@ -94,7 +114,12 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
   subprocess, so no reference signal exists), so the gate carries it: a short
   0.8s noise window re-reads the room fast enough that speaker bleed becomes
   the new floor within a sentence, the margin above it doubles, onset needs
-  0.3s of sustained speech, and the turn ducks slightly. An empty
+  0.3s of sustained speech, and the turn ducks slightly. **The armed mic has no
+  onset timeout** — what ends it is the reply finishing, not a clock. It used to
+  inherit the ordinary 15s onset timeout and close itself partway through a long
+  answer: measured dying at **15.1s of a 72s reply**, leaving 79% of it silently
+  uninterruptible, with the vanishing menu-bar mic badge as the only clue. An
+  empty
   transcript after a barge-in is reported as silence, never as a user
   utterance. `vox barge-in calibrate` measures bleed vs voice on any given
   hardware and says plainly when the gap is too small. Honest while armed: `microphone_open`, `mic_armed_for_barge_in`,
@@ -230,9 +255,6 @@ claude mcp add --scope local --transport http vox \
 Honest list — these are built, committed, and green in tests, but no human has
 used them:
 
-- **Barge-in.** The whole mechanism has only ever run against fakes. It
-  self-disables on this machine's speakers (correctly — see above), so proving
-  it needs one session wearing headphones. `PLAN.md` step 1.
 - **Companion beyond two turns.** Live-verified for one answer plus one
   escalation. The `budget_turns` loop, the STOP/PAUSE intents inside it, and
   `voice_survey(agent="companion")` as the interview path are untested aloud.
@@ -240,10 +262,13 @@ used them:
   but one exchange still ran 26 s. It is a prompt, not a mechanism, and nothing
   enforces it.
 
-Three of this session's worst bugs — an echo gate that did nothing, a floor
-that cut people off mid-sentence, a scope check that answered code questions —
-were all already marked done and were all found by *using* the thing, never by
-the suite. Verify aloud before believing green.
+Verifying barge-in aloud cost one session and found **three more** bugs that the
+276-test suite was green on: a session that wedged in `SPEAKING` forever after a
+cancel while armed (bricking every later turn), an armed mic that closed itself
+15s into a 72s reply, and a device list that never noticed headphones plugged in
+after launch. One of them had an existing test that asserted the microphone
+closed but never that the state machine recovered — it passed throughout. Verify
+aloud before believing green, and assert the state, not just the device.
 
 ## Next steps
 

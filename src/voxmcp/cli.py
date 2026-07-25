@@ -22,6 +22,8 @@ from mcp.client.streamable_http import streamablehttp_client
 from mcp.types import Implementation
 
 from . import __version__
+from .config import load_user_settings
+from .errors import ConfigurationError
 from .installer import TransactionalInstaller
 
 
@@ -229,6 +231,15 @@ def create_cli(
     @click.version_option(version=__version__, prog_name="vox")
     def cli() -> None:
         """Control the persistent local Vox voice runtime."""
+
+        # The CLI must read the same configuration the runtime does, or a knob
+        # set with `vox set` is honoured by the daemon and silently ignored by
+        # the tool that measures it — calibration would report against defaults
+        # the runtime is not using.
+        try:
+            load_user_settings()
+        except ConfigurationError as exc:
+            raise click.ClickException(str(exc)) from exc
 
     @cli.command("status")
     def status_command() -> None:
@@ -460,7 +471,17 @@ def create_cli(
     )
     @click.option("--safety-db", type=click.FloatRange(min=0.0, max=20.0), default=6.0,
                   show_default=True, help="Headroom subtracted from the measured gap.")
-    def barge_in_calibrate(seconds: float, safety_db: float) -> None:
+    @click.option(
+        "--countdown",
+        type=click.FloatRange(min=0.0, max=30.0),
+        default=None,
+        help=(
+            "Skip the keypress and start the voice pass after this many seconds. "
+            "Use 0 for no pause. Required when an agent drives calibration, since "
+            "nothing is there to press a key."
+        ),
+    )
+    def barge_in_calibrate(seconds: float, safety_db: float, countdown: float | None) -> None:
         """Measure speaker bleed against your voice and print a real margin.
 
         Barge-in has no acoustic echo cancellation to lean on, so the gate is
@@ -468,7 +489,12 @@ def create_cli(
         your actual hardware instead of guessing.
         """
 
-        measurement = _calibrate_barge_in(dependencies, seconds=seconds, safety_db=safety_db)
+        measurement = _calibrate_barge_in(
+            dependencies,
+            seconds=seconds,
+            safety_db=safety_db,
+            countdown=countdown,
+        )
         click.echo(json.dumps(measurement, indent=2, sort_keys=True))
 
     @cli.command("doctor")
@@ -745,11 +771,29 @@ def _measure_input(seconds: float) -> Any:
     return recorder.measure(seconds, device=os.environ.get("VOX_INPUT_DEVICE"))
 
 
+def _announce(dependencies: "_Dependencies", message: str) -> None:
+    """Say one line through the runtime, best-effort, blocking until spoken.
+
+    Calibration may be driven from a terminal the user is not looking at, so
+    the instructions have to be audible. It blocks so the announcement cannot
+    still be playing once a measurement window opens and land in the numbers.
+    A runtime that will not speak must not abort the measurement.
+    """
+
+    try:
+        result = dependencies.caller("speak", {"message": message})
+        if inspect.isawaitable(result):
+            asyncio.run(result)
+    except Exception:
+        pass
+
+
 def _calibrate_barge_in(
     dependencies: "_Dependencies",
     *,
     seconds: float,
     safety_db: float,
+    countdown: float | None = None,
 ) -> dict[str, Any]:
     import threading
 
@@ -780,7 +824,15 @@ def _calibrate_barge_in(
 
     click.echo("")
     click.echo(f"Now speak normally for {seconds:.0f} seconds, at your usual distance.")
-    click.pause(info="Press any key when you are ready to talk...")
+    if countdown is None:
+        click.pause(info="Press any key when you are ready to talk...")
+    elif countdown > 0:
+        # An agent driving this has no keyboard to offer, so the wait has to be
+        # a clock. Spoken so the user hears it start even while looking away.
+        click.echo(f"Starting in {countdown:.0f} seconds — start talking on 'go'.")
+        _announce(dependencies, f"Calibrating. Start talking in {countdown:.0f} seconds.")
+        time.sleep(countdown)
+        click.echo("Go.")
     voice = _measure_input(seconds)
 
     bleed_armed_p90 = bleed.p90_dbfs + duck_offset_db
@@ -813,10 +865,12 @@ def _calibrate_barge_in(
             "VOX_BARGE_IN_MAX_VAD_MARGIN_DB": recommended,
             "VOX_BARGE_IN_SPEECH_MARGIN_DB": recommended,
         },
+        # `vox set` writes ~/.vox/settings.json and restarts the runtime.
+        # launchctl setenv never reaches it — launchd hands the daemon none of
+        # that environment, so anything set that way is silently inert.
         "apply": (
-            f"launchctl setenv VOX_BARGE_IN_MAX_VAD_MARGIN_DB {recommended} && "
-            f"launchctl setenv VOX_BARGE_IN_SPEECH_MARGIN_DB {recommended} && "
-            f"launchctl kickstart -k gui/$(id -u)/com.vox.runtime"
+            f"vox set VOX_BARGE_IN_MAX_VAD_MARGIN_DB={recommended} "
+            f"VOX_BARGE_IN_SPEECH_MARGIN_DB={recommended}"
         ),
         "usable": usable,
         "verdict": (

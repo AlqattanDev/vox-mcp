@@ -195,6 +195,25 @@ def test_short_trailing_silence_clamps_to_a_lower_ceiling() -> None:
         CaptureConfig(short_utterance_speech_s=4.0, long_utterance_speech_s=3.0)
 
 
+def test_state_waits_indefinitely_when_onset_timeout_is_disabled() -> None:
+    # The barge-in capture must stay open for as long as the reply lasts, and
+    # what ends it is the reply finishing rather than a clock. Inheriting the
+    # ordinary onset timeout closed the microphone at 15.1 s of a measured 72 s
+    # answer, leaving 79% of it silently uninterruptible.
+    state = AdaptiveCaptureState(1_000, config(onset_timeout_s=None), speech_vote)
+    for _ in range(2_000):  # 40 s of silence, far past the 15 s hard bound
+        decision = state.feed(frame(0.001))
+        assert decision.stop_reason is None
+
+    assert state.finished is False
+    assert state.elapsed_s > 15.0
+
+    # ...and it still hears speech whenever it eventually arrives.
+    for _ in range(40):
+        state.feed(frame(0.9))
+    assert state.speech_detected is True
+
+
 def test_state_times_out_if_speech_never_starts() -> None:
     state = AdaptiveCaptureState(
         1_000,
