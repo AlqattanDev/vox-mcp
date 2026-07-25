@@ -7,7 +7,54 @@ from pathlib import Path
 import pytest
 
 from voxmcp.companion import CompanionReply, _extract, _resolve_grokctl, ask_companion
-from voxmcp.intents import companion_may_answer, is_non_speech_transcript
+from voxmcp.intents import (
+    companion_may_answer,
+    companion_should_stop,
+    is_non_speech_transcript,
+)
+
+
+# Ways a person actually asks the companion to stop. The global intent parser
+# requires the command to be the whole utterance, so every one of these except a
+# bare "stop" used to be answered as small talk while the loop carried on.
+STOP_REQUESTS = [
+    "stop",
+    "i think its time you stop",
+    "ok you can stop now",
+    "stop talking",
+    "shut up",
+    "be quiet",
+    "thats enough",
+    "that is enough",
+    "enough now",
+    "enough of that",
+    "were done",
+    "go away",
+    "leave me alone",
+    "alright you will pass it along but you are still talking i thought stop will stop you",
+]
+
+# Must NOT read as a stop request — these are ordinary conversation, and two of
+# them are already on the small-talk whitelist.
+NOT_STOP_REQUESTS = [
+    "fair enough",
+    "good enough",
+    "thats cool",
+    "i quit smoking last year",
+    "yeah alright",
+    "hey man",
+    "how are you",
+]
+
+
+@pytest.mark.parametrize("utterance", STOP_REQUESTS)
+def test_a_spoken_request_to_stop_is_obeyed(utterance: str) -> None:
+    assert companion_should_stop(utterance) is True
+
+
+@pytest.mark.parametrize("utterance", NOT_STOP_REQUESTS)
+def test_ordinary_talk_is_not_a_stop_request(utterance: str) -> None:
+    assert companion_should_stop(utterance) is False
 
 
 ANSWERABLE = [

@@ -39,7 +39,12 @@ from .diagnostics import static_diagnostics
 from .earcons import earcons_enabled, ensure_earcons
 from .errors import BusyError, PrivacyError, ServiceUnavailableError, VoxError
 from .eventlog import JsonlEventLogger, read_events
-from .intents import classify_spoken_intent, companion_may_answer, is_non_speech_transcript
+from .intents import (
+    classify_spoken_intent,
+    companion_may_answer,
+    companion_should_stop,
+    is_non_speech_transcript,
+)
 from .agents import AgentVoices, FALLBACK_VOICES
 from .last_heard import LastHeardStore
 from .notes import NotesStore
@@ -1987,7 +1992,10 @@ class VoxEngine:
                     break
                 silences = 0
                 transcript = str(heard.get("transcript") or "")
-                if heard.get("control", {}).get("action") in {"stop", "pause"}:
+                if heard.get("control", {}).get("action") in {
+                    "stop",
+                    "pause",
+                } or companion_should_stop(transcript):
                     outcome, reason = "completed", "user_stopped"
                     turns.append({"heard": transcript, "said": None})
                     break

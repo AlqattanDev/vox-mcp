@@ -238,6 +238,45 @@ _SMALL_TALK_SIGNAL = re.compile(
 )
 
 
+# Asking the companion to stop, phrased as a person actually phrases it. Kept
+# separate from _PHRASES because the global parser requires the command to be
+# the whole utterance — correct when prose must never be commandeered, wrong
+# here, where small talk is the only thing in scope and there is no sentence in
+# which "stop" deserves an answer rather than obedience.
+# "enough" is pinned to explicit shapes so "fair enough" and "good enough" stay
+# ordinary conversation, and there is no bare "quit" because Ali was discussing
+# quitting smoking at the time.
+_COMPANION_STOP_REQUEST = re.compile(
+    r"""(?:
+        \b stop \b
+      | \b shut \s+ up \b
+      | \b be \s+ quiet \b
+      | \b shush \b
+      | \b thats \s+ enough \b | \b that \s+ is \s+ enough \b
+      | \b enough \s+ now \b | \b enough \s+ of \s+ (?:that|this|it) \b
+      | \b we \s* re \s+ done \b | \b we \s+ are \s+ done \b
+      | \b go \s+ away \b
+      | \b leave \s+ me \s+ alone \b
+    )""",
+    re.VERBOSE,
+)
+
+
+def companion_should_stop(text: str) -> bool:
+    """True when the user is asking the companion to stop talking.
+
+    "I think it's time you stop" drew a cheerful "I'll pass that along" and the
+    loop carried on; the next thing said aloud was "I thought stop will stop
+    you". Obeying costs a round trip back to the real agent, which is exactly
+    what the user asked for.
+    """
+
+    normalized = normalize_utterance(text)
+    if not normalized:
+        return False
+    return bool(_COMPANION_STOP_REQUEST.search(normalized))
+
+
 def companion_may_answer(text: str) -> bool:
     """True only when the companion can safely answer without the real agent.
 
