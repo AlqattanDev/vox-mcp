@@ -26,11 +26,55 @@ Default turn bounds are deliberately generous for this user’s speaking style:
 
 - 300 ms pre-roll so first syllables survive detection.
 - 15 seconds to begin speaking.
-- 1.2 seconds of trailing silence to end a normal utterance.
-- Up to 300 seconds for a long dictated turn.
+- 0.6 to 1.6 seconds of trailing silence to end an utterance, scaled to how much
+  was actually said (see below).
+- Up to 75 seconds for a long dictated turn.
 
 All four are configurable. Unlike VoiceMode, the speech-onset timeout and
 trailing-silence timeout are separate.
+
+### Trailing silence scales with the utterance
+
+A one-word answer and a rambling paragraph should not wait the same amount of
+time to be considered finished. Vox measures *speech* duration — time in frames
+classified as speech, which pauses while you pause and resumes when you start
+again — and interpolates the trailing-silence requirement from it:
+
+| Speech so far | Silence needed to close |
+|---|---|
+| Up to 1.5s (“keep”, “remove”, “yeah do it”) | 0.6s |
+| 1.5s → 3.0s | Interpolated, 0.6s → 1.6s |
+| Over 3.0s | 1.6s |
+
+A long answer keeps the full patience it has always had, so nothing gets cut
+off mid-thought; a short one stops making you wait for it. Because the clock
+keys on speech and not wall time, pausing mid-sentence to think does not
+demote a long answer to the fast path. Tune with
+`VOX_SHORT_TRAILING_SILENCE_SECONDS`, `VOX_SHORT_UTTERANCE_SPEECH_SECONDS`, and
+`VOX_LONG_UTTERANCE_SPEECH_SECONDS`.
+
+## The voice turn contract
+
+The microphone and the speaker are fast. Measured over real exchanges, Vox owns
+2–4 seconds of a turn — time to first audio, Whisper, trailing silence — and
+the agent owns 25–40. Almost all of that is the agent doing desk work (reading
+files, running searches, composing a long answer with tables) inside what is
+supposed to be a conversation.
+
+So the contract is on the agent, not the runtime. It ships in the MCP server
+instructions, the `voice_mode` prompt, and the `converse` tool description:
+
+- **One or two sentences.** Answer first, then stop. Length is latency.
+- **No tool calls between conversation turns.** Finish investigating before
+  opening the mic, not after.
+- **Nothing read aloud that belongs on screen** — no tables, code, file paths,
+  or lists. Say the conclusion.
+- **Announce work before doing it.** `speak("reading the audio path now")`
+  beats going quiet; unexplained silence reads as a crash.
+- **Low reasoning effort for conversational turns.** Save the deep thinking for
+  the work, not for deciding what to say back.
+- **`wait_for_response=false` for status updates and sign-offs.** Never make the
+  user confirm that you finished.
 
 ## Session and turn controls
 

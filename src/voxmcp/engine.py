@@ -176,6 +176,15 @@ class VoxEngine:
         capture = CaptureConfig(
             onset_timeout_s=float(os.environ.get("VOX_ONSET_TIMEOUT_SECONDS", "15")),
             trailing_silence_s=float(os.environ.get("VOX_TRAILING_SILENCE_SECONDS", "1.6")),
+            short_trailing_silence_s=float(
+                os.environ.get("VOX_SHORT_TRAILING_SILENCE_SECONDS", "0.6")
+            ),
+            short_utterance_speech_s=float(
+                os.environ.get("VOX_SHORT_UTTERANCE_SPEECH_SECONDS", "1.5")
+            ),
+            long_utterance_speech_s=float(
+                os.environ.get("VOX_LONG_UTTERANCE_SPEECH_SECONDS", "3.0")
+            ),
             min_duration_s=float(os.environ.get("VOX_MIN_UTTERANCE_SECONDS", "0.5")),
             max_duration_s=float(os.environ.get("VOX_MAX_UTTERANCE_SECONDS", "75")),
             pre_roll_s=float(os.environ.get("VOX_PRE_ROLL_SECONDS", "0.3")),

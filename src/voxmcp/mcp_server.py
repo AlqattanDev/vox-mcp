@@ -244,7 +244,12 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
         instructions=(
             "Vox is local-only voice I/O. Start an explicit voice session before "
             "listening. The microphone is permitted only during listen/converse; "
-            "cancel ends the current turn, while stop ends the session."
+            "cancel ends the current turn, while stop ends the session.\n"
+            "Voice turn contract: a spoken turn is a conversation, not a report. "
+            "Keep spoken messages to one or two sentences and do not call other "
+            "tools between conversation turns — the user is sitting in silence "
+            "while you work, and that silence is the slowest part of voice mode. "
+            "Put detail on screen, never in the speaker."
         ),
         mask_error_details=True,
         strict_input_validation=True,
@@ -352,7 +357,11 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
 
     @server.tool(
         name="converse",
-        description="Speak a message locally and optionally listen for one response.",
+        description=(
+            "Speak a message locally and optionally listen for one response. "
+            "Speak one or two sentences, not a report: do not call other tools between "
+            "conversation turns, and put detail on screen rather than in the spoken message."
+        ),
         annotations=LOCAL_ACTION,
     )
     async def converse(
@@ -755,7 +764,21 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
             "The microphone listens only during listen/converse. Treat cancel as current-turn "
             "cancellation, not session shutdown. Use pause or wait when the user needs time, "
             "and voice_session(action='stop') only for an explicit stop or session end. Keep a "
-            "visible verbatim transcript unless the user opts out."
+            "visible verbatim transcript unless the user opts out.\n"
+            "\n"
+            "Voice turn contract. The microphone and the speaker are fast; the pause between "
+            "turns is you. Honour these while a voice session is live:\n"
+            "- Speak one or two sentences. Answer first, then stop. Length is latency.\n"
+            "- Do not call other tools between conversation turns. Finish investigating before "
+            "you open the mic, not after.\n"
+            "- Never read tables, code, file paths, or lists aloud. Say the conclusion; leave the "
+            "detail on screen where it can be read.\n"
+            "- If you must go and work, say so first — speak('reading the audio path now, one "
+            "minute') beats going silent. Unexplained silence reads as a crash.\n"
+            "- Use low reasoning effort for conversational turns. Save deep thinking for the "
+            "work itself, not for deciding what to say back.\n"
+            "- For status updates and sign-offs pass wait_for_response=false. Do not make the "
+            "user confirm that you finished."
         )
 
     @server.custom_route("/health", methods=["GET"], include_in_schema=False)

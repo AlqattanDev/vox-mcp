@@ -36,11 +36,21 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
 - **Streamed TTS.** Long replies speak sentence-by-sentence; the next span
   synthesizes while the current one plays, so audio starts after the first
   sentence. Off via `VOX_STREAM_TTS=0`.
-- **Snappier endpointing.** Trailing-silence 1.6s (was 1.2 — stops cutting off
-  mid-thought); a single utterance caps at 75s (was 300 — kills the multi-minute
-  "listens forever" hang). Env: `VOX_TRAILING_SILENCE_SECONDS`,
-  `VOX_MAX_UTTERANCE_SECONDS`. These are the MCP tool defaults too, which govern
-  live usage.
+- **Endpointing scales with the utterance.** Trailing silence runs 0.6s for a
+  short answer and 1.6s for a long one, interpolated over 1.5s–3.0s of measured
+  *speech* (not wall time, so pausing to think keeps a long answer on the long
+  deadline). A one-word "keep" stops making you wait a second and a half; a
+  rambling turn keeps every bit of the patience it had. A single utterance caps
+  at 75s. Env: `VOX_TRAILING_SILENCE_SECONDS`,
+  `VOX_SHORT_TRAILING_SILENCE_SECONDS`, `VOX_SHORT_UTTERANCE_SPEECH_SECONDS`,
+  `VOX_LONG_UTTERANCE_SPEECH_SECONDS`, `VOX_MAX_UTTERANCE_SECONDS`. Lowering the
+  ceiling below the floor clamps instead of raising.
+- **Voice turn contract.** The runtime owns 2–4s of a spoken turn; the agent owns
+  25–40. That gap is desk work done inside a conversation, so the contract ships
+  where hosts read it — MCP server instructions, the `voice_mode` prompt, and the
+  `converse` tool description: one or two sentences, no tool calls between turns,
+  detail on screen not in the speaker, announce work before going quiet. See
+  `docs/EXPERIENCE.md`.
 - **IO modes.** `talk` (default, both) · `narrate` (agent speaks, no mic) ·
   `dictate` (listen only, TTS skipped). Panel cycles; `voice_session`
   `set_mode` / `cycle_mode`; persisted in `~/.vox/state/io_mode`.
@@ -99,7 +109,7 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
 | `com.vox.runtime` | ~73 MB | ~73 MB |
 | **total** | **~2.7 GB** | **~3.2 GB** |
 
-Tests: `.venv/bin/python -m pytest tests/` — **205 passing**.
+Tests: `.venv/bin/python -m pytest tests/` — **210 passing**.
 
 **Slash commands** (in `~/.claude/commands/`, global): `/speak` reads the
 agent's last reply aloud (no mic); `/listen` opens the mic for one utterance

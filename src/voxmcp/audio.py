@@ -93,6 +93,9 @@ class CaptureConfig:
 
     onset_timeout_s: float = 15.0
     trailing_silence_s: float = 1.6
+    short_trailing_silence_s: float = 0.6
+    short_utterance_speech_s: float = 1.5
+    long_utterance_speech_s: float = 3.0
     min_duration_s: float = 0.5
     max_duration_s: float = 75.0
     pre_roll_s: float = 0.3
@@ -113,6 +116,18 @@ class CaptureConfig:
             raise ValueError("onset_timeout_s must be in (0, 15]")
         if not 0 < self.trailing_silence_s <= 10.0:
             raise ValueError("trailing_silence_s must be in (0, 10]")
+        if self.short_trailing_silence_s <= 0:
+            raise ValueError("short_trailing_silence_s must be positive")
+        if self.short_trailing_silence_s > self.trailing_silence_s:
+            # Clamped rather than rejected: a caller who lowers
+            # trailing_silence_s below the short default wants a faster close,
+            # not a startup crash.  The floor simply collapses onto the ceiling
+            # and the utterance-length scaling turns itself off.
+            object.__setattr__(self, "short_trailing_silence_s", self.trailing_silence_s)
+        if self.short_utterance_speech_s < 0:
+            raise ValueError("short_utterance_speech_s must not be negative")
+        if self.short_utterance_speech_s > self.long_utterance_speech_s:
+            raise ValueError("short_utterance_speech_s must not exceed long_utterance_speech_s")
         if not 0 <= self.min_duration_s <= 300.0:
             raise ValueError("min_duration_s must be in [0, 300]")
         if not 0 < self.max_duration_s <= 300.0:
@@ -349,6 +364,33 @@ class AdaptiveCaptureState:
             self.noise_floor_dbfs + self.config.speech_margin_db,
         )
 
+    def _effective_trailing_silence_s(self) -> float:
+        """How much silence ends *this* utterance, scaled to how much was said.
+
+        A one-word answer and a rambling paragraph should not wait the same
+        time to be called finished.  This keys on ``speech_duration_s`` rather
+        than wall time: it only grows on speech-classified frames and resumes
+        growing after a mid-utterance pause, so stopping to think does not
+        demote a long answer onto the fast path.  Between the two anchors the
+        value is interpolated — a hard cliff would give 1.49 s of speech a
+        0.6 s close and 1.51 s a 1.6 s close, which reads as the runtime
+        randomly changing its mind.
+        """
+
+        config = self.config
+        low = config.short_utterance_speech_s
+        high = config.long_utterance_speech_s
+        if high <= low:
+            return config.trailing_silence_s
+        speech = self.speech_duration_s
+        if speech <= low:
+            return config.short_trailing_silence_s
+        if speech >= high:
+            return config.trailing_silence_s
+        ratio = (speech - low) / (high - low)
+        span = config.trailing_silence_s - config.short_trailing_silence_s
+        return config.short_trailing_silence_s + ratio * span
+
     def _remember_pre_roll(self, frame: FloatAudio) -> None:
         # Even with pre-roll disabled, retain the short run of frames used to
         # confirm speech.  Otherwise the first 60 ms of an utterance disappears
@@ -452,7 +494,7 @@ class AdaptiveCaptureState:
 
             if (
                 self._utterance_elapsed_s + 1e-9 >= self.config.min_duration_s
-                and self.trailing_silence_s + 1e-9 >= self.config.trailing_silence_s
+                and self.trailing_silence_s + 1e-9 >= self._effective_trailing_silence_s()
             ):
                 self.stop(CaptureStopReason.TRAILING_SILENCE)
             elif self._utterance_elapsed_s + 1e-9 >= self.config.max_duration_s:

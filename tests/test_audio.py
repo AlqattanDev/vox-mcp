@@ -106,6 +106,84 @@ def test_trailing_silence_cannot_end_before_minimum_turn_duration() -> None:
     assert decision.stop_reason is CaptureStopReason.TRAILING_SILENCE
 
 
+def adaptive_config(**overrides: Any) -> CaptureConfig:
+    """Endpointing config with the real trailing-silence scaling in play."""
+
+    values: dict[str, Any] = {
+        "trailing_silence_s": 1.6,
+        "short_trailing_silence_s": 0.6,
+        "short_utterance_speech_s": 1.5,
+        "long_utterance_speech_s": 3.0,
+        "min_duration_s": 0.0,
+        "max_duration_s": 30.0,
+        "speech_start_s": 0.02,
+    }
+    values.update(overrides)
+    return config(**values)
+
+
+def feed_speech(state: AdaptiveCaptureState, seconds: float) -> None:
+    for _ in range(round(seconds / 0.02)):
+        state.feed(frame(0.2))
+
+
+def silence_until_stop(state: AdaptiveCaptureState, limit_s: float = 5.0) -> float:
+    """Feed silence until the utterance endpoints; return the silence spent."""
+
+    for index in range(round(limit_s / 0.02)):
+        decision = state.feed(frame(0.001))
+        if decision.stop_reason is not None:
+            return (index + 1) * 0.02
+    raise AssertionError("capture never endpointed")
+
+
+def test_short_answer_endpoints_on_the_short_trailing_silence() -> None:
+    # "keep" — well under short_utterance_speech_s, so it should not wait 1.6s.
+    state = AdaptiveCaptureState(1_000, adaptive_config(), speech_vote)
+    feed_speech(state, 0.4)
+    assert silence_until_stop(state) == pytest.approx(0.6, abs=0.02)
+
+
+def test_long_answer_keeps_the_full_trailing_silence() -> None:
+    # A rambling turn must retain every bit of the patience it has today.
+    state = AdaptiveCaptureState(1_000, adaptive_config(), speech_vote)
+    feed_speech(state, 4.0)
+    assert silence_until_stop(state) == pytest.approx(1.6, abs=0.02)
+
+
+def test_medium_answer_interpolates_between_the_two_anchors() -> None:
+    # 2.25s of speech sits at the midpoint of the 1.5s..3.0s ramp, so it should
+    # want the midpoint of 0.6s..1.6s rather than either extreme.
+    state = AdaptiveCaptureState(1_000, adaptive_config(), speech_vote)
+    feed_speech(state, 2.25)
+    assert silence_until_stop(state) == pytest.approx(1.1, abs=0.03)
+
+
+def test_pausing_mid_thought_does_not_demote_a_long_answer() -> None:
+    # Speech duration, not wall time, drives the scaling: thinking mid-sentence
+    # must not hand a long answer the short-answer deadline.
+    state = AdaptiveCaptureState(1_000, adaptive_config(), speech_vote)
+    feed_speech(state, 2.0)
+    for _ in range(20):  # 400 ms of hesitation, short of any close
+        assert state.feed(frame(0.001)).stop_reason is None
+    feed_speech(state, 2.0)  # 4.0s of speech in total
+    assert silence_until_stop(state) == pytest.approx(1.6, abs=0.02)
+
+
+def test_short_trailing_silence_clamps_to_a_lower_ceiling() -> None:
+    # Lowering the ceiling below the floor collapses the ramp instead of
+    # raising: VOX_TRAILING_SILENCE_SECONDS=0.4 must not crash the runtime.
+    clamped = CaptureConfig(
+        trailing_silence_s=0.4, save_latest=False, latest_wav_path=None
+    )
+    assert clamped.short_trailing_silence_s == pytest.approx(0.4)
+
+    with pytest.raises(ValueError, match="short_trailing_silence_s"):
+        CaptureConfig(short_trailing_silence_s=0.0)
+    with pytest.raises(ValueError, match="short_utterance_speech_s"):
+        CaptureConfig(short_utterance_speech_s=4.0, long_utterance_speech_s=3.0)
+
+
 def test_state_times_out_if_speech_never_starts() -> None:
     state = AdaptiveCaptureState(
         1_000,
