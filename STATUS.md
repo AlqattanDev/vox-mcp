@@ -4,6 +4,19 @@ Local-only voice runtime (Whisper STT + Kokoro TTS) on `127.0.0.1:8766`.
 **Shared session** — no exclusive owner. Grok, Fable, Claude, Codex all join
 the same session; each keeps its own agent voice; audio is FIFO-queued only.
 
+## Settings
+
+`~/.vox/settings.json`, edited with **`vox set VOX_COMPANION_ENABLED=1`**
+(`vox set` alone prints it; `--unset NAME` removes; restarts the runtime unless
+`--no-restart`). A real environment variable still wins, so
+`VOX_BARGE_IN_ENABLED=1 voxd` overrides for one run.
+
+This exists because launchd hands the runtime **none** of the shell environment
+and does not reliably pass `launchctl setenv` — every `VOX_*` knob was
+unreachable in the installed deployment, and nothing set that way survived a
+reboot. The file is the configuration that actually arrives. Non-`VOX_`-prefixed
+keys are ignored rather than injected into the process environment.
+
 ## Where it lives
 
 Repo `~/vox-mcp` → private `AlqattanDev/vox-mcp`. Launch agent
@@ -43,10 +56,16 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
   from how far the room wanders above it — bounded 3–15 dB. Read from *raw*
   levels, never from frames a classifier already labelled: labelling first is
   circular, so in a loud room every frame reads as speech and the floor never
-  rises to meet it. Verified across four simulated rooms nearly 40 dB apart
-  (silent bedroom → café), plus live: one word **7.24 s → 1.6 s capture** with
-  nothing configured, which beat the hand-tuned value it replaced.
-  `VOX_MINIMUM_SPEECH_DBFS` remains a hard backstop, not part of setup.
+  rises to meet it. **During an utterance the floor may only fall** — talk for
+  longer than the window without pausing and its quietest tenth stops being the
+  room and becomes you, so the floor climbs into your voice and the turn
+  endpoints mid-word (Ali hit exactly this live). A *stationary* window is
+  exempt, since a flat level is a drone and must still be learned; speech
+  varies syllable to syllable and a fan does not. Verified across four
+  simulated rooms nearly 40 dB apart (silent bedroom → café), plus live: one
+  word **7.24 s → 1.6 s capture** with nothing configured, beating the
+  hand-tuned value it replaced. `VOX_MINIMUM_SPEECH_DBFS` is a hard backstop,
+  not part of setup.
 - **Endpointing scales with the utterance.** Trailing silence runs 0.6s for a
   short answer and 1.6s for a long one, interpolated over 1.5s–3.0s of measured
   *speech* (not wall time, so pausing to think keeps a long answer on the long
@@ -84,9 +103,12 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
 - **Companion tier (off by default).** `VOX_COMPANION_ENABLED=1` + the
   `companion` tool: hand over a brief before a long stretch of work and a
   second Kokoro voice keeps the user company instead of leaving dead air.
-  ~2.5s per turn vs 25–40s for a real agent turn. **Never answers anything
-  about the project** — `intents.companion_may_answer` is a whitelist (small
-  talk only) and everything else escalates with the full transcript attached.
+  **Verified live end to end**: "So how you doing man?" → answered in its own
+  voice in **3.1 s**; the next turn mentioned code and escalated without
+  calling the backend at all. **Never answers anything about the project** —
+  `companion_may_answer` requires a positive small-talk *signal*, so a
+  greeting does not launder a work question riding along with it, and anything
+  unmarked escalates with the full transcript attached.
   Backend is `grokctl ask` on Ali's xAI OAuth (no metered key, no new
   credential), so **voxmcp still opens zero outbound sockets** and
   `config.local_only` stays an unqualified true; `diagnostics(privacy)` carries
@@ -177,7 +199,7 @@ full 1.6 s — and is never cut off mid-thought.
 | `com.vox.runtime` | ~73 MB | ~73 MB |
 | **total** | **~2.7 GB** | **~3.2 GB** |
 
-Tests: `.venv/bin/python -m pytest tests/` — **260 passing**.
+Tests: `.venv/bin/python -m pytest tests/` — **276 passing**.
 
 **Slash commands** (in `~/.claude/commands/`, global): `/speak` reads the
 agent's last reply aloud (no mic); `/listen` opens the mic for one utterance

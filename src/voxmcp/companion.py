@@ -56,15 +56,33 @@ def _resolve_grokctl() -> tuple[str, ...] | None:
     override = os.environ.get("VOX_COMPANION_COMMAND", "").strip()
     if override:
         return tuple(override.split())
-    binary = shutil.which("grokctl")
+    binary = shutil.which("grokctl") or _first_existing(
+        Path.home() / ".bun" / "bin" / "grokctl",
+        Path("/opt/homebrew/bin/grokctl"),
+    )
     if binary:
-        return (binary,)
+        return (str(binary),)
     # The repo checkout is the normal case on this machine; grokctl is a bun
-    # project and is not always on PATH as a shim.
+    # project and is not always on PATH as a shim. launchd starts the runtime
+    # with a minimal PATH that contains neither bun nor anything installed by
+    # a version manager, so the well-known locations are checked directly —
+    # relying on which() alone meant the companion was simply "missing" on the
+    # installed runtime while working perfectly from a shell.
     entry = Path.home() / "grokctl" / "src" / "cli.ts"
-    bun = shutil.which("bun")
+    bun = shutil.which("bun") or _first_existing(
+        Path.home() / ".bun" / "bin" / "bun",
+        Path("/opt/homebrew/bin/bun"),
+        Path("/usr/local/bin/bun"),
+    )
     if bun and entry.is_file():
-        return (bun, "run", str(entry))
+        return (str(bun), "run", str(entry))
+    return None
+
+
+def _first_existing(*candidates: Path) -> Path | None:
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
     return None
 
 

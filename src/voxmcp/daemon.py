@@ -10,6 +10,7 @@ from typing import Any
 
 from fastmcp import FastMCP
 
+from .config import load_user_settings
 from .mcp_server import get_engine, mcp
 
 
@@ -56,6 +57,10 @@ def run_http(
 
 
 def main() -> None:
+    # Before anything reads os.environ. launchd does not hand this process the
+    # shell's environment, so the settings file is the only configuration that
+    # reaches the installed runtime at all.
+    load_user_settings()
     _start_parent_watchdog()
     try:
         run_http()

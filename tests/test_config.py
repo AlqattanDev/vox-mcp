@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 
 import pytest
@@ -101,3 +103,61 @@ def test_config_rejects_unsafe_paths_and_ranges(tmp_path: Path) -> None:
         VoxConfig(state_dir=tmp_path, tool_timeout_seconds=0)
     with pytest.raises(ConfigurationError):
         VoxConfig(state_dir=tmp_path, local_only=False)
+
+
+def test_settings_file_reaches_a_runtime_launchd_started(tmp_path: Path, monkeypatch) -> None:
+    # launchd hands the runtime none of the shell's environment and does not
+    # reliably pass `launchctl setenv`, so every VOX_* knob was unreachable in
+    # the installed deployment. The file is the configuration that arrives.
+    from voxmcp.config import load_user_settings
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({
+        "VOX_COMPANION_ENABLED": "1",
+        "VOX_BARGE_IN_ENABLED": True,
+        "VOX_TRAILING_SILENCE_SECONDS": 1.2,
+        "PATH": "/nope",            # not VOX_-prefixed; must be ignored
+    }))
+    monkeypatch.delenv("VOX_COMPANION_ENABLED", raising=False)
+    monkeypatch.delenv("VOX_BARGE_IN_ENABLED", raising=False)
+    monkeypatch.delenv("VOX_TRAILING_SILENCE_SECONDS", raising=False)
+    original_path = os.environ.get("PATH")
+
+    applied = load_user_settings(settings)
+
+    assert applied["VOX_COMPANION_ENABLED"] == "1"
+    assert os.environ["VOX_BARGE_IN_ENABLED"] == "1"       # JSON true -> "1"
+    assert os.environ["VOX_TRAILING_SILENCE_SECONDS"] == "1.2"
+    # Never inject arbitrary names into the process environment.
+    assert "PATH" not in applied
+    assert os.environ.get("PATH") == original_path
+    assert VoxConfig.from_env().companion_enabled is True
+
+
+def test_a_real_environment_variable_still_wins(tmp_path: Path, monkeypatch) -> None:
+    # So a one-off `VOX_BARGE_IN_ENABLED=1 voxd` overrides the file for one run.
+    from voxmcp.config import load_user_settings
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"VOX_COMPANION_ENABLED": "0"}))
+    monkeypatch.setenv("VOX_COMPANION_ENABLED", "1")
+
+    load_user_settings(settings)
+
+    assert os.environ["VOX_COMPANION_ENABLED"] == "1"
+
+
+def test_a_missing_settings_file_is_not_an_error(tmp_path: Path) -> None:
+    from voxmcp.config import load_user_settings
+
+    assert load_user_settings(tmp_path / "absent.json") == {}
+
+
+def test_unreadable_settings_fail_loudly(tmp_path: Path) -> None:
+    # A typo'd settings file must not silently mean "defaults".
+    from voxmcp.config import load_user_settings
+
+    broken = tmp_path / "settings.json"
+    broken.write_text("{not json")
+    with pytest.raises(ConfigurationError):
+        load_user_settings(broken)

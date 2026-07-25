@@ -679,3 +679,55 @@ def test_only_recognised_headphones_count_as_isolated_output() -> None:
     for name in ("MacBook Pro Speakers", "Studio Display Speakers", "",
                  "BlackHole 2ch", "Soundcore Desk Speaker", "unknown"):
         assert output_is_isolated(name) is False, name
+
+
+def test_talking_without_pausing_is_never_cut_off_mid_sentence() -> None:
+    # A rolling floor read from recent audio will climb into the speaker's own
+    # voice if they talk for longer than the window: the quietest tenth stops
+    # being the room and becomes them, so the speech stops clearing its own
+    # gate and the turn endpoints mid-word. Ali hit this live on a sentence
+    # that ran past the 3 s window. During an utterance the floor may only fall.
+    state = AdaptiveCaptureState(
+        1_000,
+        adaptive_config(max_duration_s=60.0),
+        lambda _samples, _sr: True,  # WebRTC endorsing every frame
+    )
+
+    feed_speech(state, 0.4)  # get past onset
+    assert state.phase is CapturePhase.CAPTURING
+
+    # Twelve unbroken seconds — four times the noise window. Real speech varies
+    # syllable to syllable even when nobody pauses, which is exactly what tells
+    # it apart from a drone.
+    rng = np.random.default_rng(11)
+    for index in range(600):
+        loudness = 0.2 * float(rng.uniform(0.35, 1.0))
+        decision = state.feed(frame(loudness))
+        assert decision.stop_reason is None, (
+            f"cut off after {state.speech_duration_s:.1f}s of continuous speech"
+        )
+
+    # And it still ends when the speaker actually stops.
+    assert silence_until_stop(state) == pytest.approx(1.6, abs=0.03)
+
+
+def test_during_an_utterance_the_floor_may_fall_but_never_climb() -> None:
+    # The rule that stops a long sentence being cut off, stated directly.
+    # Rising into the speaker's own voice is what truncates them; falling is
+    # how a room that quietens mid-turn still gets tracked.
+    rng = np.random.default_rng(5)
+    state = AdaptiveCaptureState(1_000, adaptive_config(), speech_vote)
+
+    for _ in range(60):  # settle on a room around -30 dBFS
+        state._observe_room(-30.0)
+    settled = state.noise_floor_dbfs
+    assert settled == pytest.approx(-30.0, abs=0.5)
+
+    state.phase = CapturePhase.CAPTURING
+    for _ in range(300):  # someone talking loudly, without pausing
+        state._observe_room(-14.0 + float(rng.uniform(-8.0, 0.0)))
+    assert state.noise_floor_dbfs <= settled + 0.01, "floor climbed into the speaker"
+
+    for _ in range(300):  # the room itself drops away underneath them
+        state._observe_room(-58.0)
+    assert state.noise_floor_dbfs < settled - 10.0

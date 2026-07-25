@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -162,6 +163,49 @@ class VoxConfig:
             barge_in_enabled=_env_bool(env, "VOX_BARGE_IN_ENABLED", False),
             companion_enabled=_env_bool(env, "VOX_COMPANION_ENABLED", False),
         )
+
+
+def user_settings_path() -> Path:
+    """Where persistent runtime settings live."""
+
+    return Path(os.environ.get("VOX_HOME", "~/.vox")).expanduser() / "settings.json"
+
+
+def load_user_settings(path: Path | None = None) -> dict[str, str]:
+    """Fold ``~/.vox/settings.json`` into the environment, without overriding it.
+
+    The runtime is started by launchd, which does not inherit the shell's
+    environment and does not see ``launchctl setenv`` reliably — so every
+    ``VOX_*`` knob was unreachable in the installed deployment, and nothing set
+    that way survived a reboot regardless. A file the runtime reads itself is
+    the only form of configuration that actually persists here.
+
+    A real environment variable still wins, so a one-off
+    ``VOX_BARGE_IN_ENABLED=1 voxd`` overrides the file for that run.
+    """
+
+    settings = path or user_settings_path()
+    try:
+        raw = json.loads(settings.read_text())
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigurationError(f"{settings} is not readable JSON: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ConfigurationError(f"{settings} must contain a JSON object")
+
+    applied: dict[str, str] = {}
+    for key, value in raw.items():
+        name = str(key).strip()
+        if not name.startswith("VOX_"):
+            # Refuse to inject arbitrary names into the process environment.
+            continue
+        if name in os.environ:
+            continue
+        rendered = "1" if value is True else "0" if value is False else str(value)
+        os.environ[name] = rendered
+        applied[name] = rendered
+    return applied
 
 
 def _env_float(env: Mapping[str, str], key: str, default: float) -> float:

@@ -18,6 +18,12 @@ ANSWERABLE = [
     "ok cool",
     "thanks",
     "haha nice",
+    "yeah alright",      # short enough not to be a request
+    "man im tired",
+    # Real utterances from the live verification run.
+    "so man how are you doing today hows things",
+    "hello hi how are you",
+    "im just waiting man",
 ]
 
 MUST_ESCALATE = [
@@ -33,6 +39,13 @@ MUST_ESCALATE = [
     "did the deploy work",
     # Long enough that it is far more likely a real request than a pleasantry.
     "so anyway i was thinking about the whole architecture and whether we should change it",
+    # Ali actually said this and a permissive fallback answered it.
+    "okay so tell me exactly like what all the changes that",
+    "are you done yet",
+    "how long is this going to take",
+    "is it working now",
+    # A greeting does not launder a work question riding along with it.
+    "hello hi how are you so im asking you about the code of vox what changes did we do",
 ]
 
 

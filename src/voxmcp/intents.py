@@ -185,6 +185,28 @@ _WORK_TOPIC = re.compile(
       | can \s+ you \s+ (?:fix|change|add|write|implement|refactor|check|look)
       | show \s+ me
       | what \s+ (?:did|are) \s+ you \s+ (?:do|doing|change|changing)
+      | change | changes | changed | fix | fixed | broke | broken | working
+      | tell \s+ me | explain | walk \s+ me \s+ through | status | progress
+      | done \s+ yet | finished \s+ yet | how \s+ long
+    )\b""",
+    re.VERBOSE,
+)
+
+
+# Positive markers of chit-chat. Presence of one of these is what earns an
+# answer; absence sends the utterance back to the real agent.
+_SMALL_TALK_SIGNAL = re.compile(
+    r"""\b(?:
+        hi | hey | hello | yo | salam | morning | evening | night
+      | how \s+ (?:are|r) \s+ (?:you|u) | how(?:s|\s+is|\s+are)? \s+ (?:it|things|life|you)
+      | whats \s+ up | sup | you \s+ (?:there|still \s+ there)
+      | thanks | thank \s+ you | cheers | appreciate
+      | tired | bored | hungry | sleepy | exhausted | stressed
+      | nice | cool | lol | haha | funny | true | fair
+      | bye | goodnight | later | see \s+ you
+      | im \s+ (?:back|here|good|fine|ok|okay|tired|bored)
+      | just \s+ (?:waiting|chilling|here)
+      | nothing \s+ much | never \s* mind | my \s+ bad | sorry
     )\b""",
     re.VERBOSE,
 )
@@ -210,10 +232,17 @@ def companion_may_answer(text: str) -> bool:
         return False
     if normalized in _COMPANION_SMALL_TALK:
         return True
-    # Past the whitelist, length alone is suspicious: a long utterance during a
-    # wait is far more likely to be a real request than a pleasantry.
-    if len(normalized.split()) > 12:
-        return False
     if _CODE_SHAPED.search(normalized) or _WORK_TOPIC.search(normalized):
         return False
-    return True
+    # Past the exact phrases, an utterance is answered only when it carries a
+    # positive marker of chit-chat — not merely because nothing flagged it.
+    # Matching signals rather than whole utterances is what lets "so man, how
+    # are you doing today?" through while "tell me exactly what all the
+    # changes" still goes to the agent that knows the code.
+    words = normalized.split()
+    if len(words) > 16:
+        return False
+    if _SMALL_TALK_SIGNAL.search(normalized):
+        return True
+    # Otherwise only things too short to be a request at all.
+    return len(words) <= 4 and all(len(word) <= 12 for word in words)

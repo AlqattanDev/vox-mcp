@@ -397,6 +397,55 @@ def create_cli(
     def control_repeat() -> None:
         _invoke_and_print(dependencies, "voice_control", {"action": "repeat"})
 
+    @cli.command("set")
+    @click.argument("assignments", nargs=-1)
+    @click.option("--unset", multiple=True, help="Remove a setting.")
+    @click.option("--restart/--no-restart", default=True, show_default=True)
+    def set_command(assignments: tuple[str, ...], unset: tuple[str, ...], restart: bool) -> None:
+        """Persist runtime settings, e.g. `vox set VOX_COMPANION_ENABLED=1`.
+
+        Settings live in ~/.vox/settings.json because the runtime is started by
+        launchd, which never sees your shell environment. With no arguments this
+        prints the current file.
+        """
+
+        from .config import user_settings_path
+
+        path = user_settings_path()
+        try:
+            current = json.loads(path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            current = {}
+
+        if not assignments and not unset:
+            click.echo(json.dumps(current, indent=2, sort_keys=True))
+            return
+
+        for item in assignments:
+            key, _, value = item.partition("=")
+            key = key.strip()
+            if not _ or not key.startswith("VOX_"):
+                raise click.ClickException(
+                    f"expected VOX_NAME=value, got {item!r}"
+                )
+            current[key] = value.strip()
+        for key in unset:
+            current.pop(key.strip(), None)
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(current, indent=2, sort_keys=True) + "\n")
+        temporary.replace(path)
+        click.echo(json.dumps(current, indent=2, sort_keys=True))
+
+        if restart:
+            subprocess.run(
+                ["/bin/launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{RUNTIME_LABEL}"],
+                capture_output=True,
+                check=False,
+            )
+            click.echo(f"restarted {RUNTIME_LABEL}", err=True)
+
     @cli.group("barge-in")
     def barge_in_group() -> None:
         """Measure and tune the echo gate that lets you interrupt playback."""

@@ -119,6 +119,11 @@ class CaptureConfig:
     # A low percentile of raw levels has no such loop — speech has gaps, and a
     # room's quietest moments are the room.
     noise_window_s: float = 3.0
+    # How flat a window has to be before it counts as a drone rather than a
+    # voice. Speech varies syllable to syllable even when nobody pauses; a fan
+    # does not. This is what separates "the room got louder, learn it" from
+    # "the speaker is still talking, do not climb into their voice".
+    stationary_spread_db: float = 2.0
     queue_capacity_frames: int = 512
     source_stall_timeout_s: float = 2.0
     save_latest: bool = True
@@ -501,9 +506,24 @@ class AdaptiveCaptureState:
         if len(self._recent_dbfs) < 12:
             return
         window = sorted(self._recent_dbfs)
-        floor = window[max(0, round(0.10 * (len(window) - 1)))]
+        floor = max(-96.0, min(-3.0, window[max(0, round(0.10 * (len(window) - 1)))]))
         median = window[len(window) // 2]
-        self.noise_floor_dbfs = max(-96.0, min(-3.0, floor))
+
+        stationary = (median - floor) <= self.config.stationary_spread_db
+        if (
+            self.phase is CapturePhase.CAPTURING
+            and floor > self.noise_floor_dbfs
+            and not stationary
+        ):
+            # Never let the floor climb while someone is mid-sentence. Talk for
+            # longer than the window without pausing and the window fills with
+            # your own voice, so its quietest tenth stops being the room and
+            # becomes you — the floor rises into your speech, the speech stops
+            # clearing the gate, and the turn endpoints mid-word. The room does
+            # not get louder because you are talking, so during an utterance the
+            # floor may only fall.
+            return
+        self.noise_floor_dbfs = floor
         self.noise_spread_db = max(0.0, median - floor)
 
     def _effective_trailing_silence_s(self) -> float:
