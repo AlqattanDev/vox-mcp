@@ -10,7 +10,7 @@ import pytest
 from voxmcp.audio import AudioRecorder, CaptureConfig, CaptureResult, CaptureStopReason
 from voxmcp.config import VoxConfig
 from voxmcp.engine import VoxEngine
-from voxmcp.errors import BusyError
+from voxmcp.errors import BusyError, VoxError
 from voxmcp.eventlog import JsonlEventLogger
 from voxmcp.lease import LeaseManager, OperationGate
 from voxmcp.speech import SpeechResult
@@ -598,6 +598,48 @@ async def test_session_stop_drains_queued_turns(tmp_path: Path):
     assert status["operation"]["busy"] is False
 
 
+class TextAwaitingRecorder:
+    """Holds the microphone open until text is delivered, like the real device.
+
+    A listen only blocks the host's turn because the capture genuinely runs for
+    as long as the user might speak. Reproducing that is the whole point: the
+    typed text has to end a capture that is already in progress.
+    """
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+
+    def capture(self, *, device=None, control=None, on_speech_started=None):
+        self.started.set()
+        while control is not None and not control.text_delivered:
+            if control.cancelled:
+                break
+            threading.Event().wait(0.005)
+        return CaptureResult(
+            samples=np.array([], dtype=np.float32),
+            sample_rate=16000,
+            reason=CaptureStopReason.DELIVERED_TEXT,
+            speech_detected=False,
+            elapsed_s=1,
+            audio_duration_s=0,
+            speech_duration_s=0,
+            trailing_silence_s=0,
+            noise_floor_dbfs=-60.0,
+            latest_wav_path=None,
+        )
+
+
+class RefusingSpeech(FakeSpeech):
+    """Fails the test if anything tries to transcribe."""
+
+    def __init__(self) -> None:
+        self.transcribe_calls = 0
+
+    async def transcribe(self, path, **kwargs):
+        self.transcribe_calls += 1
+        raise AssertionError("delivered text must never reach Whisper")
+
+
 class HoldingRecorder:
     """Blocks inside capture until cancelled or released — models a stuck listen."""
 
@@ -947,6 +989,76 @@ async def test_armed_but_unused_barge_in_releases_the_microphone(tmp_path: Path)
     assert engine.barge_in_armed is False
     assert engine.microphone_open is False
     assert result["session"]["state"] == "idle"
+
+
+@pytest.mark.asyncio
+async def test_typed_text_ends_a_listen_and_becomes_the_turn(tmp_path: Path):
+    # Ali's complaint, verbatim: "I need to wait for you to listen to everything
+    # I said, then you will get the message I sent — which just wastes a turn."
+    recorder = TextAwaitingRecorder()
+    speech = RefusingSpeech()
+    engine = make_engine(tmp_path, recorder=recorder, speech_client=speech)
+
+    async def deliver_when_listening():
+        for _ in range(400):
+            if recorder.started.is_set() and engine.microphone_open:
+                break
+            await asyncio.sleep(0.005)
+        return await engine.control("claude", "deliver_text", text="typed instead of spoken")
+
+    deliverer = asyncio.create_task(deliver_when_listening())
+    heard = await engine.listen("claude")
+    signalled = await deliverer
+
+    assert signalled["delivered"] is True
+    assert heard["status"] == "completed"
+    assert heard["transcript"] == "typed instead of spoken"
+    assert heard["backend"] == "delivered_text"
+    # No audio was transcribed, and the session is free for the next turn.
+    assert speech.transcribe_calls == 0
+    assert heard["session"]["state"] == "idle"
+    assert engine.microphone_open is False
+
+
+@pytest.mark.asyncio
+async def test_typed_text_is_classified_for_intent_like_speech(tmp_path: Path):
+    # Delivered text runs the same path as a transcript, so typing a control
+    # command works exactly as saying it does.
+    recorder = TextAwaitingRecorder()
+    engine = make_engine(tmp_path, recorder=recorder, speech_client=RefusingSpeech())
+
+    async def deliver_when_listening():
+        for _ in range(400):
+            if recorder.started.is_set() and engine.microphone_open:
+                break
+            await asyncio.sleep(0.005)
+        await engine.control("claude", "deliver_text", text="stop")
+
+    deliverer = asyncio.create_task(deliver_when_listening())
+    heard = await engine.listen("claude")
+    await deliverer
+
+    assert heard["transcript"] == "stop"
+    assert heard["control"] == {"action": "stop", "session_ended": True}
+
+
+@pytest.mark.asyncio
+async def test_delivering_text_with_no_listen_running_is_a_no_op(tmp_path: Path):
+    # Nothing is blocking the turn, so there is nothing to shortcut — the caller
+    # should just send the message normally rather than get a false success.
+    engine = make_engine(tmp_path)
+
+    result = await engine.control("claude", "deliver_text", text="nobody is listening")
+
+    assert result == {"status": "no_listen_active", "delivered": False}
+
+
+@pytest.mark.asyncio
+async def test_delivering_empty_text_is_rejected(tmp_path: Path):
+    engine = make_engine(tmp_path)
+
+    with pytest.raises(VoxError):
+        await engine.control("claude", "deliver_text", text="   ")
 
 
 def test_armed_capture_stays_open_for_the_whole_reply(tmp_path: Path):

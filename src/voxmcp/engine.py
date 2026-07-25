@@ -529,6 +529,29 @@ class VoxEngine:
         except IllegalStateTransition:
             pass
 
+    def _deliver_text(self, text: str | None) -> dict[str, Any]:
+        """Hand typed text to the listen that is currently blocking the turn.
+
+        A running listen holds the host's turn open, so anything typed while the
+        microphone is live waits for the mic to time out before it is read —
+        the user sits through a listen they have already decided not to use.
+        This ends that capture immediately and the text becomes the turn.
+
+        A no-op when no listen is active: there is nothing to shortcut, and the
+        caller should just send the message normally.
+        """
+
+        value = (text or "").strip()
+        if not value:
+            raise VoxError("deliver_text requires non-empty text")
+        with self._active_lock:
+            control = self._capture_control
+            microphone_open = self._microphone_active
+        if control is None or not microphone_open:
+            return {"status": "no_listen_active", "delivered": False}
+        control.deliver_text(value)
+        return {"status": "delivered", "delivered": True, "chars": len(value)}
+
     def _signal_cancel(
         self,
         *,
@@ -1145,6 +1168,29 @@ class VoxEngine:
             duration_s=round(capture.audio_duration_s, 3),
             speech=capture.speech_detected,
         )
+        if capture.reason is CaptureStopReason.DELIVERED_TEXT:
+            # The user typed instead of speaking. There is no audio to
+            # transcribe — deliberately, it was discarded — so Whisper is
+            # skipped and the typed text becomes the turn. Returning a
+            # SpeechResult here rather than a special case means everything
+            # downstream is unchanged: the text is recorded for recovery and
+            # classified for intent exactly as speech is, so typing "stop"
+            # stops the session just like saying it.
+            # Read from the local control, not self._capture_control: the
+            # finally above has already cleared the published reference, so
+            # going through it would always find the text gone.
+            typed = control.delivered_text or ""
+            # Still moves through PROCESSING even though there is nothing to
+            # transcribe: the turn is settled by the same code as a spoken one,
+            # and complete_turn is only legal from PROCESSING or SPEAKING.
+            self.state.begin_processing(client_id=client_id)
+            self._log("listening.delivered_text", client_id=client_id, chars=len(typed))
+            return capture, SpeechResult(
+                backend="delivered_text",
+                elapsed_ms=0,
+                text=typed,
+            )
+
         if (
             capture.reason is CaptureStopReason.CANCELLED
             or not capture.speech_detected
@@ -1713,6 +1759,7 @@ class VoxEngine:
         action: str,
         *,
         offset: int = 0,
+        text: str | None = None,
         **_: Any,
     ) -> dict[str, Any]:
         action = action.lower().strip()
@@ -1725,6 +1772,8 @@ class VoxEngine:
         if action in {"manual_end", "push_to_talk_end"}:
             signal = self._signal_cancel(manual_end=True, cancel_task=False)
             return {"status": "manual_end_signalled", **signal}
+        if action == "deliver_text":
+            return self._deliver_text(text)
         if action in {"repeat", "skip_back"}:
             await self._claim(client_id)
             replay = self.store.replay(offset)

@@ -408,6 +408,22 @@ def create_cli(
     def control_repeat() -> None:
         _invoke_and_print(dependencies, "voice_control", {"action": "repeat"})
 
+    @control_group.command("deliver-text")
+    @click.argument("text", nargs=-1, required=True)
+    def control_deliver_text(text: tuple[str, ...]) -> None:
+        """End an in-flight listen and send TEXT as the turn instead.
+
+        For when you would rather type than talk while the mic is already open:
+        the listen returns your text immediately instead of making you wait it
+        out. A no-op when nothing is listening.
+        """
+
+        _invoke_and_print(
+            dependencies,
+            "voice_control",
+            {"action": "deliver_text", "text": " ".join(text)},
+        )
+
     @cli.command("set")
     @click.argument("assignments", nargs=-1)
     @click.option("--unset", multiple=True, help="Remove a setting.")

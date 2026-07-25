@@ -71,6 +71,10 @@ class CaptureStopReason(str, Enum):
     # so a mid-utterance interruption is never lost, unlike CANCELLED which
     # discards audio on purpose for privacy.
     INTERRUPTED = "interrupted"
+    # The user typed instead of speaking. The listen ends immediately and the
+    # typed text becomes the turn, so a message sent while the microphone is
+    # open is not stuck behind it. Audio is discarded: they chose not to speak.
+    DELIVERED_TEXT = "delivered_text"
     SOURCE_ENDED = "source_ended"
     DEVICE_ERROR = "device_error"
 
@@ -256,6 +260,9 @@ class CaptureControl:
         self._cancel = threading.Event()
         self._manual_end = threading.Event()
         self._interrupt = threading.Event()
+        self._delivered_text = threading.Event()
+        self._text = ""
+        self._text_lock = threading.Lock()
         self._level = 0.0
         self._level_lock = threading.Lock()
 
@@ -297,6 +304,36 @@ class CaptureControl:
         """
 
         self._interrupt.set()
+
+    def deliver_text(self, value: str) -> None:
+        """End the listen now and make ``value`` the turn instead of audio.
+
+        A running listen blocks the host's turn, so a message typed while the
+        microphone is open sits queued until the listen finishes on its own —
+        the user waits out a mic they have already decided not to use, and the
+        turn is spent. This hands the text straight into the capture that is
+        holding things up.
+
+        The text is published before the event is set: a waiter that observed
+        the event first could read an empty string.
+        """
+
+        with self._text_lock:
+            self._text = value
+        self._delivered_text.set()
+
+    @property
+    def delivered_text(self) -> str | None:
+        """The typed text, or None when nothing was delivered."""
+
+        if not self._delivered_text.is_set():
+            return None
+        with self._text_lock:
+            return self._text
+
+    @property
+    def text_delivered(self) -> bool:
+        return self._delivered_text.is_set()
 
     @property
     def cancelled(self) -> bool:
@@ -733,7 +770,14 @@ class AdaptiveCaptureState:
         if not self.finished or self._stop_reason is None:
             raise RuntimeError("capture has not finished")
 
-        if self._stop_reason is CaptureStopReason.CANCELLED or not self._capture_parts:
+        if (
+            self._stop_reason
+            in {CaptureStopReason.CANCELLED, CaptureStopReason.DELIVERED_TEXT}
+            or not self._capture_parts
+        ):
+            # Delivered text discards audio for the same reason a cancel does:
+            # the user chose not to speak, so whatever the room said meanwhile
+            # is not their turn and must not be transcribed or persisted.
             audio = np.empty(0, dtype=np.float32)
         else:
             audio = np.concatenate(self._capture_parts).astype(np.float32, copy=False)
@@ -855,7 +899,8 @@ class AudioRecorder:
             and self.config.latest_wav_path is not None
             and result.speech_detected
             and result.samples.size
-            and result.reason is not CaptureStopReason.CANCELLED
+            and result.reason
+            not in {CaptureStopReason.CANCELLED, CaptureStopReason.DELIVERED_TEXT}
         ):
             latest = write_wav_atomic(
                 self.config.latest_wav_path,
@@ -1033,6 +1078,12 @@ class AudioRecorder:
                 while not state.finished:
                     if control.cancelled:
                         state.stop(CaptureStopReason.CANCELLED)
+                        break
+                    if control.text_delivered:
+                        # Checked before manual_end so the reason names what
+                        # actually happened: the user typed rather than ended a
+                        # spoken turn, and the engine skips Whisper entirely.
+                        state.stop(CaptureStopReason.DELIVERED_TEXT)
                         break
                     if control.interrupted:
                         state.stop(CaptureStopReason.INTERRUPTED)

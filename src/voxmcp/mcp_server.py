@@ -311,7 +311,7 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
                 client_id=client_id,
                 **options,
             )
-        if action in {"cancel", "repeat", "status"}:
+        if action in {"cancel", "repeat", "status", "deliver_text"}:
             return await _invoke(
                 current_engine(),
                 "control",
@@ -490,17 +490,29 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
 
     @server.tool(
         name="voice_control",
-        description="Control the active turn: cancel, end, repeat, wait, mute, or resume.",
+        description=(
+            "Control the active turn: cancel, end, repeat, wait, mute, resume, or "
+            "deliver_text. deliver_text ends an in-flight listen and makes the "
+            "supplied text the user's turn, so a typed message is not stuck behind "
+            "a microphone they chose not to use."
+        ),
         annotations=LOCAL_ACTION,
     )
     async def voice_control(
         ctx: Context,
         action: Literal[
-            "cancel", "end_turn", "repeat", "wait", "mute", "unmute", "resume", "status"
+            "cancel", "end_turn", "repeat", "wait", "mute", "unmute", "resume",
+            "status", "deliver_text",
         ],
         seconds: float | None = None,
+        text: str | None = None,
     ) -> Any:
-        return await dispatch_control(action, _client_id(ctx), seconds=seconds)
+        return await dispatch_control(
+            action,
+            _client_id(ctx),
+            seconds=seconds,
+            extra={"text": text} if text is not None else None,
+        )
 
     @server.tool(
         name="service",
@@ -861,6 +873,7 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
             "repeat",
             "note",
             "reply",
+            "deliver_text",
         }
         if action not in allowed:
             return JSONResponse({"ok": False, "error": "unsupported_action"}, status_code=400)

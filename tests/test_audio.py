@@ -626,6 +626,46 @@ def test_live_capture_cancel_wakes_without_waiting_for_onset_timeout() -> None:
     assert completed[0].reason is CaptureStopReason.CANCELLED
 
 
+def test_live_capture_ends_at_once_when_text_is_delivered() -> None:
+    # Typing while the mic is open should not mean waiting the mic out. The
+    # capture stops on the delivered text rather than on any audio condition.
+    backend = FakeSoundDevice()
+    control = CaptureControl()
+    recorder = AudioRecorder(
+        config(onset_timeout_s=15.0, source_stall_timeout_s=2.0),
+        sounddevice=backend,
+        speech_classifier=speech_vote,
+    )
+    completed: list[Any] = []
+
+    worker = threading.Thread(target=lambda: completed.append(recorder.capture(control=control)))
+    worker.start()
+    assert backend.entered.wait(timeout=0.5)
+    started = time.monotonic()
+    control.deliver_text("here is what I typed")
+    worker.join(timeout=0.5)
+
+    assert not worker.is_alive()
+    assert time.monotonic() - started < 0.5
+    assert completed[0].reason is CaptureStopReason.DELIVERED_TEXT
+    # The user chose not to speak, so whatever the room said meanwhile is not
+    # their turn: no audio survives and nothing is left to transcribe.
+    assert completed[0].samples.size == 0
+    assert completed[0].latest_wav_path is None
+    assert control.delivered_text == "here is what I typed"
+
+
+def test_delivered_text_is_readable_only_once_set() -> None:
+    control = CaptureControl()
+    assert control.text_delivered is False
+    assert control.delivered_text is None
+
+    control.deliver_text("typed")
+
+    assert control.text_delivered is True
+    assert control.delivered_text == "typed"
+
+
 class FakeProcess:
     def __init__(self) -> None:
         self.pid = 12345

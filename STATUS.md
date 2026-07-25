@@ -179,6 +179,19 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
   surfaces as that agent's `undelivered_heard` on its next turn. The agent-picker
   note moved into **More…**. Inherent limit: a reply after a full sign-off waits
   for the agent's next action (host-injection is the `deliver_text` PLAN item).
+- **Type instead of talking, without waiting the mic out.** `deliver_text` ends
+  an in-flight listen and makes the supplied string the turn:
+  `vox control deliver-text "..."`, the `deliver_text` action on
+  `voice_control`, or a POST to `/control`. A running listen holds the host's
+  turn open, so a message typed while the mic was live used to sit queued until
+  the listen timed out — the user waiting out a microphone they had already
+  decided not to use, spending the turn on nothing. Verified live: the listen
+  returned the typed text with `backend: delivered_text` and **`stt_ms: 0`**.
+  Audio is discarded exactly as a cancel discards it, because choosing to type
+  means whatever the room said meanwhile is not the user's turn. The text runs
+  the same path a transcript does, so it is recorded for recovery and
+  classified for intent — typing "stop" ends the session just like saying it.
+  A no-op when nothing is listening, so the caller sends the message normally.
 - **Addressed notes (`note` control / panel button).** Speak one utterance
   without waiting for an agent to open the mic. The button first pops an agent
   picker (each agent = a project/voice); the note is **addressed to that agent**
@@ -272,10 +285,12 @@ aloud before believing green, and assert the state, not just the device.
 
 ## Next steps
 
-- **Type-while-listening fusion** (see `PLAN.md`). When Ali types while the mic
-  is open, deliver the typed text immediately instead of waiting out the listen.
-  Needs a host-side Claude Code integration; the 75s cap already softens the
-  wasted-turn wait.
+- **Fire `deliver_text` automatically when Ali types.** The runtime primitive is
+  built and verified; what is missing is the host half — something must POST it
+  when a prompt is submitted while a listen is in flight. Today it takes an
+  explicit `vox control deliver-text`. A Claude Code `UserPromptSubmit` hook is
+  the candidate; whether it fires during an already-running tool call is the
+  open question, and no polling hack that guesses when Ali is typing.
 - **Speak while the agent is still composing.** The streamed-TTS win is inside
   one `speak` call; starting speech before the reply is fully written is a
   client concern (Claude Code sends the whole message in one tool call). Would
