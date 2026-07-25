@@ -77,9 +77,8 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
   the new floor within a sentence, the margin above it doubles, onset needs
   0.3s of sustained speech, and the turn ducks slightly. An empty
   transcript after a barge-in is reported as silence, never as a user
-  utterance. **Run `vox barge-in calibrate` first** — it measures bleed vs
-  voice on your hardware and says plainly when the gap is too small.
-  Honest while armed: `microphone_open`, `mic_armed_for_barge_in`,
+  utterance. `vox barge-in calibrate` measures bleed vs voice on any given
+  hardware and says plainly when the gap is too small. Honest while armed: `microphone_open`, `mic_armed_for_barge_in`,
   `barge_in_enabled` on `/health` and `diagnostics(privacy)`; the glyph goes
   red and the panel reads "Speaking · cut in".
 - **Companion tier (off by default).** `VOX_COMPANION_ENABLED=1` + the
