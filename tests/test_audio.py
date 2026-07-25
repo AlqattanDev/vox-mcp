@@ -664,3 +664,18 @@ def test_playback_is_cancellable_and_registry_cleans_temporary_audio() -> None:
     assert process.killed is False
     assert registry.get(handle.id) is None
     assert not temporary.exists()
+
+
+def test_only_recognised_headphones_count_as_isolated_output() -> None:
+    # Playback the microphone can hear makes barge-in undecidable, so anything
+    # unrecognised has to be assumed shared. Guessing wrong the other way means
+    # the agent interrupting itself on its own voice.
+    from voxmcp.audio import output_is_isolated
+
+    for name in ("AirPods Pro", "Ali's AirPods", "Sony WH-1000XM5 Headphones",
+                 "Beats Studio Buds", "USB Headset", "External Headphones"):
+        assert output_is_isolated(name) is True, name
+
+    for name in ("MacBook Pro Speakers", "Studio Display Speakers", "",
+                 "BlackHole 2ch", "Soundcore Desk Speaker", "unknown"):
+        assert output_is_isolated(name) is False, name

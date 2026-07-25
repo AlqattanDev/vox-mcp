@@ -56,7 +56,18 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
   `VOX_SHORT_TRAILING_SILENCE_SECONDS`, `VOX_SHORT_UTTERANCE_SPEECH_SECONDS`,
   `VOX_LONG_UTTERANCE_SPEECH_SECONDS`, `VOX_MAX_UTTERANCE_SECONDS`. Lowering the
   ceiling below the floor clamps instead of raising.
-- **Barge-in (off by default).** `VOX_BARGE_IN_ENABLED=1` opens the mic
+- **Barge-in needs headphones, and knows it.** Measured on this MacBook: Kokoro
+  through the built-in speakers returns into the mic at **−22 dBFS p90 / −17.6
+  peak**, while Ali's own voice peaks at **−29.8** (median −46). *The user is
+  ~24 dB quieter than his own echo* — no threshold separates them, so on
+  speakers this is arithmetic, not tuning. Barge-in therefore checks the
+  default output device and **declines to arm** unless it is recognisably
+  headphones, reporting `barge_in.reason = "shared_output"` in
+  `diagnostics(privacy)` rather than interrupting itself. Plug in AirPods and
+  it arms with nothing to configure. `VOX_BARGE_IN_REQUIRE_HEADPHONES=0`
+  overrides deliberately. On speakers, the **Reply button / ⌃⌥⌘R** is the
+  interruption path and needs no acoustics.
+- **Barge-in mechanism (off by default).** `VOX_BARGE_IN_ENABLED=1` opens the mic
   *during* playback: start talking and the current sentence dies mid-word, the
   remaining spans and the one being synthesized ahead are abandoned, and the
   pre-roll makes your opening words the reply — one capture serves both the
@@ -167,7 +178,7 @@ full 1.6 s — and is never cut off mid-thought.
 | `com.vox.runtime` | ~73 MB | ~73 MB |
 | **total** | **~2.7 GB** | **~3.2 GB** |
 
-Tests: `.venv/bin/python -m pytest tests/` — **255 passing**.
+Tests: `.venv/bin/python -m pytest tests/` — **260 passing**.
 
 **Slash commands** (in `~/.claude/commands/`, global): `/speak` reads the
 agent's last reply aloud (no mic); `/listen` opens the mic for one utterance

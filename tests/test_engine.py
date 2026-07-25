@@ -148,7 +148,7 @@ def make_engine(tmp_path: Path, *, speech=True, recorder=None, player=None, spee
         state_dir=tmp_path / "state", idle_timeout_seconds=600, barge_in_enabled=barge_in
     )
     store = AudioStore(tmp_path / "audio")
-    return VoxEngine(
+    engine = VoxEngine(
         config=config,
         home=tmp_path,
         state=VoiceStateMachine(snapshot_path=config.snapshot_path, idle_timeout_seconds=600),
@@ -162,6 +162,13 @@ def make_engine(tmp_path: Path, *, speech=True, recorder=None, player=None, spee
         lease=LeaseManager(ttl_seconds=600),
         gate=OperationGate(),
     )
+    if barge_in:
+        # These fixtures exercise the barge-in *mechanism*. Whether it is
+        # allowed to arm on this machine's speakers is policy, tested on its
+        # own above, and must not depend on what is plugged in while the suite
+        # runs.
+        engine._barge_in_require_headphones = False
+    return engine
 
 
 @pytest.mark.asyncio
@@ -1140,3 +1147,45 @@ async def test_the_armed_gate_is_stricter_where_it_actually_decides(tmp_path: Pa
     # own bleed becomes the floor within a sentence.
     assert armed.speech_start_s > normal.speech_start_s
     assert armed.noise_window_s < normal.noise_window_s
+
+
+@pytest.mark.asyncio
+async def test_barge_in_declines_when_playback_reaches_the_microphone(tmp_path: Path, monkeypatch):
+    # Measured on this MacBook: Kokoro through the built-in speakers reads
+    # -22 dBFS p90 while Ali's own voice peaks at -29.8. He is quieter than his
+    # own echo, so no threshold separates them. Arming anyway would mean the
+    # agent interrupting itself; it declines and says why instead.
+    from voxmcp import engine as engine_module
+
+    monkeypatch.setattr(engine_module, "default_output_name", lambda: "MacBook Pro Speakers")
+    engine = make_engine(tmp_path, barge_in=True)
+    engine._barge_in_require_headphones = True  # the shipped default
+
+    availability = engine.barge_in_availability()
+
+    assert availability["available"] is False
+    assert availability["reason"] == "shared_output"
+    assert "headphones" in availability["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_barge_in_arms_itself_on_headphones(tmp_path: Path, monkeypatch):
+    # Nothing to configure: plug in AirPods and it becomes available.
+    from voxmcp import engine as engine_module
+
+    monkeypatch.setattr(engine_module, "default_output_name", lambda: "Ali's AirPods Pro")
+    engine = make_engine(tmp_path, barge_in=True)
+    engine._barge_in_require_headphones = True  # the shipped default
+
+    assert engine.barge_in_availability()["available"] is True
+
+
+@pytest.mark.asyncio
+async def test_speakers_can_be_overridden_deliberately(tmp_path: Path, monkeypatch):
+    from voxmcp import engine as engine_module
+
+    monkeypatch.setattr(engine_module, "default_output_name", lambda: "MacBook Pro Speakers")
+    engine = make_engine(tmp_path, barge_in=True)
+    engine._barge_in_require_headphones = False
+
+    assert engine.barge_in_availability()["available"] is True

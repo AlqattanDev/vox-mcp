@@ -301,6 +301,47 @@ class CaptureControl:
         return self._interrupt.is_set()
 
 
+# Substrings that mean the agent's voice reaches your ears and not the mic.
+# Matched against the default output device name, which is all CoreAudio will
+# reliably tell us: no property distinguishes "sound-isolated" from "loud desk
+# speaker", so anything unrecognised is treated as a speaker.
+_HEADPHONE_HINTS = (
+    "headphone",
+    "headset",
+    "airpod",
+    "earpod",
+    "earbud",
+    "beats",
+    "buds",
+)
+
+
+def default_output_name(sounddevice: Any | None = None) -> str:
+    """Name of the current default output device, or '' if unknowable."""
+
+    module = sounddevice or _load_sounddevice()
+    try:
+        default = module.default.device
+        index = default[1] if isinstance(default, (list, tuple)) else default
+        return str(module.query_devices(index, "output").get("name") or "")
+    except Exception:
+        return ""
+
+
+def output_is_isolated(name: str) -> bool:
+    """True only when playback demonstrably will not reach the microphone.
+
+    Fails toward 'speakers'. An unrecognised device is assumed to be shared
+    with the room, because the cost of guessing wrong is the agent
+    interrupting itself on its own voice.
+    """
+
+    lowered = name.strip().casefold()
+    if not lowered:
+        return False
+    return any(hint in lowered for hint in _HEADPHONE_HINTS)
+
+
 def _notify_speech_started(callback: Callable[[], None]) -> None:
     """Fire an onset callback without letting it take the capture down.
 

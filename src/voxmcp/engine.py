@@ -22,6 +22,8 @@ from typing import Any
 import httpx
 
 from .audio import (
+    default_output_name,
+    output_is_isolated,
     AudioPlayer,
     AudioRecorder,
     CaptureConfig,
@@ -170,6 +172,9 @@ class VoxEngine:
         self._barge_in_cancel_grace_s = max(
             0.0, float(os.environ.get("VOX_BARGE_IN_CANCEL_GRACE_S", "0.05"))
         )
+        self._barge_in_require_headphones = os.environ.get(
+            "VOX_BARGE_IN_REQUIRE_HEADPHONES", "1"
+        ).strip().lower() not in {"0", "false", "no", "off"}
 
         self._active_lock = threading.RLock()
         self._active_task: asyncio.Task[Any] | None = None
@@ -578,6 +583,33 @@ class VoxEngine:
     def barge_in_armed(self) -> bool:
         with self._active_lock:
             return self._barge_in_control is not None
+
+    def barge_in_availability(self) -> dict[str, Any]:
+        """Whether barge-in can honestly run right now, and why not if it cannot.
+
+        Measured on this MacBook: Kokoro coming back through the built-in
+        speakers reads at −22 dBFS p90 while the user's own voice peaks at
+        −29.8. The user is quieter than the echo, so no threshold separates
+        them — on speakers this is not a tuning problem, it is arithmetic.
+        Rather than let it arm and interrupt itself, it declines and says so.
+        """
+
+        if not self.config.barge_in_enabled:
+            return {"available": False, "reason": "disabled", "output_device": None}
+        name = default_output_name()
+        isolated = output_is_isolated(name)
+        if not isolated and self._barge_in_require_headphones:
+            return {
+                "available": False,
+                "reason": "shared_output",
+                "output_device": name or "unknown",
+                "detail": (
+                    "Playback goes to a device the microphone can hear, so talking over "
+                    "Vox cannot be told apart from Vox. Use headphones, or set "
+                    "VOX_BARGE_IN_REQUIRE_HEADPHONES=0 to try anyway."
+                ),
+            }
+        return {"available": True, "reason": "ok", "output_device": name or "unknown"}
 
     def _on_barge_in_onset(self) -> None:
         """Kill playback the instant the user starts talking.
@@ -1330,7 +1362,7 @@ class VoxEngine:
                     speed=speed,
                     instructions=instructions,
                     interruptible=True,
-                    barge_in=effective_wait and self.config.barge_in_enabled,
+                    barge_in=effective_wait and self.barge_in_availability()["available"],
                 )
             result: dict[str, Any] = {"spoken": spoken, "io_mode": mode}
             if spoken.get("status") == "barge_in":
@@ -1737,6 +1769,7 @@ class VoxEngine:
             # interrupt by talking. That is a real widening of when the mic is
             # live, so it is reported here and not only in the tuning knobs.
             "barge_in_enabled": self.config.barge_in_enabled,
+            "barge_in": self.barge_in_availability(),
             "mic_armed_for_barge_in": self.barge_in_armed,
             "control_token_path": str(self.control_token_path),
             # local_only above is a true statement about this process: Vox

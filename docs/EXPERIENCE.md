@@ -102,6 +102,20 @@ instructions, the `voice_mode` prompt, and the `converse` tool description:
 
 ## Talking over Vox (barge-in)
 
+**Barge-in needs headphones.** Not as a preference — as arithmetic. Measured on
+a MacBook Pro: Kokoro coming back through the built-in speakers reads −22 dBFS
+p90, while the user's own voice peaks at −29.8. The user is roughly 24 dB
+*quieter than his own echo*, so any gate that lets him through lets Kokoro
+through many times over. No amount of tuning fixes a negative gap.
+
+So barge-in checks the default output device and refuses to arm unless it is
+recognisably headphones, reporting `shared_output` instead of interrupting
+itself. Plug in AirPods and it arms; unplug them and it stops. Nothing to
+configure, and `VOX_BARGE_IN_REQUIRE_HEADPHONES=0` overrides it deliberately.
+
+On speakers the **Reply button and ⌃⌥⌘R** are the interruption path: same
+outcome, no acoustics involved.
+
 Off by default. `VOX_BARGE_IN_ENABLED=1` opens the microphone alongside
 playback so interrupting is something you *do* rather than a button you press.
 Start talking and the sentence being spoken stops mid-word, the rest of the
