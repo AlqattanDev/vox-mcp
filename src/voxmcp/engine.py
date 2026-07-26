@@ -165,6 +165,15 @@ class VoxEngine:
         self._barge_in_max_vad_margin_db = float(
             os.environ.get("VOX_BARGE_IN_MAX_VAD_MARGIN_DB", "24.0")
         )
+        # The *floor* of the required rise, and the only knob that can guarantee
+        # a separation rather than merely permit one: the rise is
+        # clamp(k * spread, vad_margin, max_vad_margin), so raising the ceiling
+        # allows a big requirement while raising this one enforces it. Default is
+        # the ordinary floor, so barge-in behaves exactly as before until
+        # calibration says otherwise.
+        self._barge_in_vad_margin_db = float(
+            os.environ.get("VOX_BARGE_IN_VAD_MARGIN_DB", "0") or "0"
+        )
         # A short window so the floor re-reads the room quickly once our own
         # playback becomes part of it: the speaker bleed has to count as the
         # new silence within a sentence, not within a paragraph.
@@ -1085,11 +1094,20 @@ class VoxEngine:
         against the silence Kokoro is no longer providing.
         """
 
+        base = self.recorder.config
+        # Only raise the floor, never lower it, and never above the ceiling —
+        # CaptureConfig rejects vad_margin_db > max_vad_margin_db, and a bad pair
+        # here would take barge-in down with a ValueError mid-turn.
+        vad_margin_db = min(
+            self._barge_in_max_vad_margin_db,
+            max(base.vad_margin_db, self._barge_in_vad_margin_db),
+        )
         return replace(
-            self.recorder.config,
+            base,
             speech_start_s=self._barge_in_speech_start_s,
             speech_margin_db=self._barge_in_speech_margin_db,
             noise_spread_k=self._barge_in_noise_spread_k,
+            vad_margin_db=vad_margin_db,
             max_vad_margin_db=self._barge_in_max_vad_margin_db,
             noise_window_s=self._barge_in_noise_window_s,
             # No onset timeout: this capture ends when the reply does, and

@@ -853,12 +853,20 @@ def _calibrate_barge_in(
 
     bleed_armed_p90 = bleed.p90_dbfs + duck_offset_db
     gap_db = voice.median_dbfs - bleed_armed_p90
-    # The gate the VAD path enforces is a rise above the floor, and during
-    # playback the floor is the bleed. So the rise that separates you from
-    # Kokoro is the gap, less a safety band. This is the knob that bites when
-    # webrtcvad is installed; speech_margin_db only governs the fallback.
-    recommended = max(6.0, round(gap_db - safety_db, 1))
     usable = gap_db >= safety_db + 6.0
+    # The gate enforces a rise above the floor, and during playback the floor is
+    # the bleed — so the rise that separates the user from Kokoro is the gap less
+    # a safety band. It has to be applied to VOX_BARGE_IN_VAD_MARGIN_DB, the
+    # *floor* of the required rise: the rise is
+    # clamp(k * spread, vad_margin, max_vad_margin), so the floor is the only
+    # value that guarantees a separation. This used to recommend the ceiling
+    # instead, which was backwards in the case that matters — a small gap
+    # produced a small number, and lowering the ceiling loosens the gate, so
+    # following the advice on speakers would have made Kokoro interrupt itself
+    # more readily. The ceiling is only raised here so it cannot sit below the
+    # floor, which CaptureConfig rejects outright.
+    recommended = round(gap_db - safety_db, 1) if usable else None
+    ceiling = max(24.0, recommended) if recommended is not None else None
 
     return {
         "device": voice.device,
@@ -877,26 +885,39 @@ def _calibrate_barge_in(
             "peak_dbfs": round(voice.peak_dbfs, 1),
         },
         "gap_db": round(gap_db, 1),
-        "recommended": {
-            "VOX_BARGE_IN_MAX_VAD_MARGIN_DB": recommended,
-            "VOX_BARGE_IN_SPEECH_MARGIN_DB": recommended,
-        },
+        # No numbers when the hardware cannot support barge-in: there is no
+        # setting that manufactures a gap, and printing one invites someone to
+        # apply it and conclude the feature is broken rather than impossible.
+        "recommended": (
+            {
+                "VOX_BARGE_IN_VAD_MARGIN_DB": recommended,
+                "VOX_BARGE_IN_MAX_VAD_MARGIN_DB": ceiling,
+                "VOX_BARGE_IN_SPEECH_MARGIN_DB": recommended,
+            }
+            if usable
+            else None
+        ),
         # `vox set` writes ~/.vox/settings.json and restarts the runtime.
         # launchctl setenv never reaches it — launchd hands the daemon none of
         # that environment, so anything set that way is silently inert.
         "apply": (
-            f"vox set VOX_BARGE_IN_MAX_VAD_MARGIN_DB={recommended} "
+            f"vox set VOX_BARGE_IN_VAD_MARGIN_DB={recommended} "
+            f"VOX_BARGE_IN_MAX_VAD_MARGIN_DB={ceiling} "
             f"VOX_BARGE_IN_SPEECH_MARGIN_DB={recommended}"
+            if usable
+            else None
         ),
         "usable": usable,
         "verdict": (
-            f"Your voice sits {gap_db:.1f} dB above the loudest speaker bleed. "
-            f"Set VOX_BARGE_IN_SPEECH_MARGIN_DB={recommended}."
+            f"Your voice sits {gap_db:.1f} dB above the loudest bleed at armed "
+            f"volume. Require a {recommended} dB rise."
             if usable
             else (
-                f"Only {gap_db:.1f} dB separates your voice from the speaker bleed — too "
-                "little to gate on reliably. Expect Kokoro to interrupt itself. Lower the "
-                "output volume, move the microphone, or use headphones."
+                f"Only {gap_db:.1f} dB separates your voice from the playback bleed — too "
+                "little to gate on reliably, and no setting invents the difference. "
+                "Expect Kokoro to interrupt itself. Use headphones, or leave barge-in off "
+                "and interrupt with the Reply button / control-option-command-R, which "
+                "needs no acoustics at all."
             )
         ),
     }

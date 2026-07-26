@@ -122,7 +122,14 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
   empty
   transcript after a barge-in is reported as silence, never as a user
   utterance. `vox barge-in calibrate` measures bleed vs voice on any given
-  hardware and says plainly when the gap is too small. Honest while armed: `microphone_open`, `mic_armed_for_barge_in`,
+  hardware and says plainly when the gap is too small; `--countdown N` replaces
+  the keypress so an agent can drive it. It recommends
+  **`VOX_BARGE_IN_VAD_MARGIN_DB`**, the *floor* of the required rise — the rise
+  is `clamp(k × spread, floor, ceiling)`, so only the floor can guarantee a
+  separation rather than merely permit one. When the gap is too small it
+  recommends **nothing at all**, because no setting invents a difference that
+  is not in the acoustics. Ali's own hardware needs no tuning: zero false
+  interrupts across three long replies on defaults. Honest while armed: `microphone_open`, `mic_armed_for_barge_in`,
   `barge_in_enabled` on `/health` and `diagnostics(privacy)`; the glyph goes
   red and the panel reads "Speaking · cut in".
 - **Companion tier (off by default).** `VOX_COMPANION_ENABLED=1` + the
