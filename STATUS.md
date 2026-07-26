@@ -285,12 +285,15 @@ aloud before believing green, and assert the state, not just the device.
 
 ## Next steps
 
-- **Fire `deliver_text` automatically when Ali types.** The runtime primitive is
-  built and verified; what is missing is the host half — something must POST it
-  when a prompt is submitted while a listen is in flight. Today it takes an
-  explicit `vox control deliver-text`. A Claude Code `UserPromptSubmit` hook is
-  the candidate; whether it fires during an already-running tool call is the
-  open question, and no polling hack that guesses when Ali is typing.
+- **Confirm the `UserPromptSubmit` hook fires during a running tool call.** The
+  hook is installed (`.claude/settings.json` →
+  `scripts/claude_code_deliver_text.sh`) and the script is verified end to end:
+  no-op with the mic closed, and with the mic open it delivers and the listen
+  returns `backend: delivered_text`. What is unproven is the host half — hooks
+  load at session start, so this needs a fresh Claude Code session, and then
+  typing while a listen is in flight. If the hook does not fire mid-tool-call
+  then `vox control deliver-text` stays the manual path; no poller that guesses
+  when Ali is typing.
 - **Speak while the agent is still composing.** The streamed-TTS win is inside
   one `speak` call; starting speech before the reply is fully written is a
   client concern (Claude Code sends the whole message in one tool call). Would
