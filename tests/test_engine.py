@@ -1074,6 +1074,104 @@ def test_armed_capture_stays_open_for_the_whole_reply(tmp_path: Path):
     assert engine.recorder.config.onset_timeout_s is not None
 
 
+class CueCountingPlayer(FakePlayer):
+    """Counts the two earcons apart, so a doubled cue is visible."""
+
+    def __init__(self, start: Path, stop: Path):
+        self.start = start
+        self.stop = stop
+        self.starts = 0
+        self.stops = 0
+
+    def play_file(self, path, *args, **kwargs):
+        if path == self.start:
+            self.starts += 1
+        elif path == self.stop:
+            self.stops += 1
+        return FakeHandle()
+
+
+class RepeatThenAnswerSpeech(FakeSpeech):
+    """Asks for a repeat once, then answers — two mic opens in one listen."""
+
+    def __init__(self) -> None:
+        self.transcripts = ["say that again", "hello world"]
+
+    async def transcribe(self, path, **kwargs):
+        text = self.transcripts.pop(0) if self.transcripts else "hello world"
+        return SpeechResult("whisper.cpp", 20, text=text)
+
+
+@pytest.mark.asyncio
+async def test_the_start_cue_fires_once_per_opened_microphone(tmp_path: Path):
+    """One "I can hear you now" per mic, including down the repeat path.
+
+    Ali heard the cue twice before getting a word in. It was not one mic
+    cueing twice — it was two mics, because a false endpoint ended the first
+    turn on a 0.1 s blip and the next listen opened behind it. That cause is
+    fixed at the endpointer; this pins the other half so a retry path can
+    never start announcing a window it did not open.
+    """
+
+    store = AudioStore(tmp_path / "audio")
+    start, stop = tmp_path / "start.wav", tmp_path / "stop.wav"
+    player = CueCountingPlayer(start, stop)
+    engine = make_engine(
+        tmp_path, player=player, speech_client=RepeatThenAnswerSpeech()
+    )
+    # Set directly so the cue paths run for real without synthesizing audio.
+    engine._earcon_paths = (start, stop, tmp_path / "error.wav")
+
+    result = await engine.listen("claude")
+
+    assert result["transcript"] == "hello world"
+    # Two captures: the repeat, then the answer. Two windows, two cues, and a
+    # close cue for each of them — never a second announcement on one mic.
+    events = [
+        json.loads(line)["event"]
+        for line in Path(engine.config.event_log_path).read_text().splitlines()
+    ]
+    assert events.count("listening.started") == 2
+    assert player.starts == 2
+    assert player.stops == 2
+
+
+@pytest.mark.asyncio
+async def test_a_requested_trailing_silence_reaches_the_recorder_intact(tmp_path: Path):
+    """Ask for 1.2 s and the capture actually closes at 1.2 s.
+
+    Measured live: `listen(trailing_silence_s=1.2)` and
+    `converse(trailing_silence_s=0.9)` both came back reporting 0.6 — the
+    utterance-length floor sat underneath every request and won for anything
+    short of a paragraph, so the number the caller passed never applied and the
+    number reported back was one nobody had asked for.
+
+    Drives the real `listen`; the config asserted on is the one the production
+    path built and handed to the capture.
+    """
+
+    engine = make_engine(tmp_path, recorder=AudioRecorder(CaptureConfig()))
+    seen: list[CaptureConfig] = []
+    store = AudioStore(tmp_path / "audio")
+    stub = FakeRecorder(store.latest_stt, speech=False)
+
+    async def spy(client_id: str, *, recorder=None, language=None):
+        seen.append(recorder.config)
+        # Nothing may touch a device here; the assertion is about the config
+        # the engine chose, so the capture itself is stubbed out past it.
+        return stub.capture(), None
+
+    engine._capture_once = spy  # type: ignore[method-assign]
+    await engine.listen("claude", trailing_silence_s=1.2)
+
+    assert len(seen) == 1
+    chosen = seen[0]
+    assert chosen.trailing_silence_s == 1.2
+    # The floor collapses onto the request rather than undercutting it, which is
+    # what makes 1.2 the close for a one-word answer as well as a paragraph.
+    assert chosen.short_trailing_silence_s == 1.2
+
+
 @pytest.mark.asyncio
 async def test_cancel_while_armed_releases_playback_and_the_microphone(tmp_path: Path):
     # A cancel arriving mid-speech must reach the armed capture too, or it

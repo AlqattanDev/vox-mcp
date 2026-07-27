@@ -107,16 +107,30 @@ again — and interpolates the trailing-silence requirement from it:
 
 | Speech so far | Silence needed to close |
 |---|---|
-| Up to 1.5s (“keep”, “remove”, “yeah do it”) | 0.6s |
+| Under 0.5s (a breath, a click, a first syllable) | 1.6s |
+| 0.5s → 1.5s (“keep”, “remove”, “yeah do it”) | 0.6s |
 | 1.5s → 3.0s | Interpolated, 0.6s → 1.6s |
 | Over 3.0s | 1.6s |
+
+The floor under the fast path is what keeps it from firing on nothing. Scaling
+the close to how much was said assumes something *was* said, and a 0.1s blip is
+the least likely thing in the range to be a finished sentence — it used to get
+the quickest hang-up in it, ending turns before they started. Under
+`VOX_MIN_SPEECH_SECONDS` the fast path is off and the full window applies, so
+the sentence has room to arrive. A genuine one-word answer sits near that line
+and waits the long window; a second of latency on “yes” costs less than losing
+the sentence after it.
 
 A long answer keeps the full patience it has always had, so nothing gets cut
 off mid-thought; a short one stops making you wait for it. Because the clock
 keys on speech and not wall time, pausing mid-sentence to think does not
 demote a long answer to the fast path. Tune with
-`VOX_SHORT_TRAILING_SILENCE_SECONDS`, `VOX_SHORT_UTTERANCE_SPEECH_SECONDS`, and
-`VOX_LONG_UTTERANCE_SPEECH_SECONDS`.
+`VOX_SHORT_TRAILING_SILENCE_SECONDS`, `VOX_MIN_SPEECH_SECONDS`,
+`VOX_SHORT_UTTERANCE_SPEECH_SECONDS`, and `VOX_LONG_UTTERANCE_SPEECH_SECONDS`.
+
+Passing `trailing_silence_s` to `listen`/`converse` overrides the whole table:
+the value you name becomes the close for every utterance length, rather than a
+ceiling with the 0.6s floor still underneath it.
 
 ## The voice turn contract
 

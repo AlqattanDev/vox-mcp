@@ -304,6 +304,7 @@ class VoxEngine:
             short_trailing_silence_s=float(
                 os.environ.get("VOX_SHORT_TRAILING_SILENCE_SECONDS", "0.6")
             ),
+            min_speech_s=float(os.environ.get("VOX_MIN_SPEECH_SECONDS", "0.5")),
             short_utterance_speech_s=float(
                 os.environ.get("VOX_SHORT_UTTERANCE_SPEECH_SECONDS", "1.5")
             ),
@@ -1552,6 +1553,17 @@ class VoxEngine:
                     trailing_silence_s
                     if trailing_silence_s is not None
                     else self.recorder.config.trailing_silence_s
+                ),
+                # A caller who names a number gets that number. The
+                # utterance-length scaling silently overrode it for anything
+                # short of a paragraph — ask for 1.2 s, get the 0.6 s default
+                # floor, which is what the runtime then reported back. Naming
+                # the close collapses the scaling onto it rather than leaving a
+                # floor nobody asked for underneath.
+                short_trailing_silence_s=(
+                    trailing_silence_s
+                    if trailing_silence_s is not None
+                    else self.recorder.config.short_trailing_silence_s
                 ),
                 # A short onset_timeout is the "reply window": if the user does
                 # not start speaking within it, the listen returns no_speech fast

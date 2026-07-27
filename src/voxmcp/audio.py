@@ -113,6 +113,16 @@ class CaptureConfig:
     onset_timeout_s: float | None = 5.0
     trailing_silence_s: float = 1.6
     short_trailing_silence_s: float = 0.6
+    # How much speech has to exist before the fast close is allowed to end the
+    # turn. Under this, what tripped the gate is a breath, a click, or the first
+    # phoneme of a sentence that has not arrived yet — not an utterance. Giving
+    # *those* the shortest possible close is backwards, and it is what ended
+    # turns mid-sentence: measured 0.10 s and 0.36 s of speech closing at 0.6 s
+    # while Ali was still drawing breath to answer, twice in one minute.
+    # A genuine one-word "yes" sits near this line and now waits the full
+    # window instead; a second of latency on "yes" costs less than losing the
+    # sentence after it.
+    min_speech_s: float = 0.5
     short_utterance_speech_s: float = 1.5
     long_utterance_speech_s: float = 3.0
     min_duration_s: float = 0.5
@@ -162,6 +172,8 @@ class CaptureConfig:
             # not a startup crash.  The floor simply collapses onto the ceiling
             # and the utterance-length scaling turns itself off.
             object.__setattr__(self, "short_trailing_silence_s", self.trailing_silence_s)
+        if self.min_speech_s < 0:
+            raise ValueError("min_speech_s must not be negative")
         if self.short_utterance_speech_s < 0:
             raise ValueError("short_utterance_speech_s must not be negative")
         if self.short_utterance_speech_s > self.long_utterance_speech_s:
@@ -794,14 +806,21 @@ class AdaptiveCaptureState:
         value is interpolated — a hard cliff would give 1.49 s of speech a
         0.6 s close and 1.51 s a 1.6 s close, which reads as the runtime
         randomly changing its mind.
+
+        Below ``min_speech_s`` the fast path is off entirely.  Scaling the close
+        to how much was said assumes something *was* said; a 0.1 s blip is the
+        least likely thing in the range to be a finished sentence and used to
+        get the quickest hang-up in it.
         """
 
         config = self.config
+        speech = self.speech_duration_s
+        if speech < config.min_speech_s:
+            return config.trailing_silence_s
         low = config.short_utterance_speech_s
         high = config.long_utterance_speech_s
         if high <= low:
             return config.trailing_silence_s
-        speech = self.speech_duration_s
         if speech <= low:
             return config.short_trailing_silence_s
         if speech >= high:

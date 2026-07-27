@@ -157,10 +157,51 @@ def silence_until_stop(state: AdaptiveCaptureState, limit_s: float = 5.0) -> flo
 
 
 def test_short_answer_endpoints_on_the_short_trailing_silence() -> None:
-    # "keep" — well under short_utterance_speech_s, so it should not wait 1.6s.
+    # "no, keep it" — well under short_utterance_speech_s, so it should not wait
+    # 1.6s. Long enough to be a sentence someone finished, which is the line the
+    # fast close now sits behind.
     state = AdaptiveCaptureState(1_000, adaptive_config(), speech_vote)
-    feed_speech(state, 0.4)
+    feed_speech(state, 0.9)
     assert silence_until_stop(state) == pytest.approx(0.6, abs=0.02)
+
+
+def test_a_blip_does_not_get_the_fastest_hang_up_in_the_range() -> None:
+    """The likeliest false endpoint used to close quickest of all.
+
+    Measured live: 0.10 s and 0.36 s of speech, both ending on
+    ``trailing_silence`` at 0.6 s while Ali was still drawing breath — the turn
+    was over before his sentence started, twice inside a minute. Scaling the
+    close to how much was said assumes something was said; under
+    ``min_speech_s`` nothing has been, so the full window applies and the
+    sentence has room to arrive.
+    """
+
+    state = AdaptiveCaptureState(1_000, adaptive_config(), speech_vote)
+    feed_speech(state, 0.2)
+    assert state.speech_duration_s < state.config.min_speech_s
+    assert silence_until_stop(state) == pytest.approx(1.6, abs=0.02)
+
+
+def test_the_guard_is_bounded_by_the_full_window_not_the_max_duration() -> None:
+    # The guard escalates the close, it never removes it: a blip that is never
+    # followed by speech still ends on trailing_silence rather than holding the
+    # microphone open to max_duration.
+    state = AdaptiveCaptureState(1_000, adaptive_config(), speech_vote)
+    feed_speech(state, 0.1)
+    spent = silence_until_stop(state, limit_s=10.0)
+    assert spent == pytest.approx(1.6, abs=0.02)
+    assert spent < state.config.max_duration_s
+
+
+def test_naming_the_close_applies_it_to_every_utterance_length() -> None:
+    # What the engine builds when a caller passes trailing_silence_s explicitly:
+    # floor collapsed onto the request. Proven here at the endpointer, so the
+    # engine-side test only has to show it produces this config.
+    named = adaptive_config(trailing_silence_s=1.2, short_trailing_silence_s=1.2)
+    for speech_s in (0.2, 0.9, 2.25, 4.0):
+        state = AdaptiveCaptureState(1_000, named, speech_vote)
+        feed_speech(state, speech_s)
+        assert silence_until_stop(state) == pytest.approx(1.2, abs=0.03), speech_s
 
 
 def test_long_answer_keeps_the_full_trailing_silence() -> None:

@@ -74,9 +74,14 @@ Package is `src/voxmcp/`.
   short answer and 1.6s for a long one, interpolated over 1.5s–3.0s of measured
   *speech* (not wall time, so pausing to think keeps a long answer on the long
   deadline). A one-word "keep" stops making you wait a second and a half; a
-  rambling turn keeps every bit of the patience it had. A single utterance caps
-  at 75s. Env: `VOX_TRAILING_SILENCE_SECONDS`,
-  `VOX_SHORT_TRAILING_SILENCE_SECONDS`, `VOX_SHORT_UTTERANCE_SPEECH_SECONDS`,
+  rambling turn keeps every bit of the patience it had. **Below 0.5s of speech
+  the fast path is off** and the full window applies — a breath or a first
+  syllable is not a finished sentence, and giving it the quickest close is what
+  ended turns before they started. A caller who passes `trailing_silence_s`
+  gets that number for every utterance length, floor included. A single
+  utterance caps at 75s. Env: `VOX_TRAILING_SILENCE_SECONDS`,
+  `VOX_SHORT_TRAILING_SILENCE_SECONDS`, `VOX_MIN_SPEECH_SECONDS`,
+  `VOX_SHORT_UTTERANCE_SPEECH_SECONDS`,
   `VOX_LONG_UTTERANCE_SPEECH_SECONDS`, `VOX_MAX_UTTERANCE_SECONDS`. Lowering the
   ceiling below the floor clamps instead of raising.
 - **Barge-in needs headphones, and knows it.** Measured on this MacBook: Kokoro
@@ -236,7 +241,7 @@ Who owns the seconds in a spoken turn, from `~/.vox/state/events.jsonl`:
 |---|---|---|
 | Kokoro synth, first span | 0.55–0.89 s | vox |
 | Whisper STT | 257–661 ms | vox |
-| Trailing silence | 0.6 s short / 1.6 s long | vox |
+| Trailing silence | 0.6 s short / 1.6 s long (1.6 s under 0.5 s of speech) | vox |
 | **Agent turn** (you stop → next word) | **9.2 / 26.2 / 18.9 s** (mean 18.1) | the agent |
 
 Baseline before the voice turn contract was 25.4 / 40.8 / 24.3 s (mean 30.2).
@@ -258,7 +263,7 @@ full 1.6 s — and is never cut off mid-thought.
 | `com.vox.runtime` | ~73 MB | ~73 MB |
 | **total** | **~2.7 GB** | **~3.2 GB** |
 
-Tests: `.venv/bin/python -m pytest tests/` — **408 passing**.
+Tests: `.venv/bin/python -m pytest tests/` — **413 passing**.
 
 **Slash commands** (in `~/.claude/commands/`, global): `/speak` reads the
 agent's last reply aloud (no mic); `/listen` opens the mic for one utterance
