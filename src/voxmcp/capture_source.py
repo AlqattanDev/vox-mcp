@@ -91,6 +91,7 @@ class PersistentCaptureSource:
         self._guard_until = 0.0
         self._subscribed = False
         self._ungated = 0
+        self._unguarded = 0
         self._dropped_frames = 0
 
     # ------------------------------------------------------------------ state
@@ -162,9 +163,15 @@ class PersistentCaptureSource:
                 put_frame(AudioDeviceError(f"Audio input status: {status}"))
                 return
             # Everything below the gate happens on the realtime thread, so it
-            # stays to three cheap reads. A closed gate drops the frame here,
-            # before it is ever copied — nothing to leak, nothing to drain.
-            if self._clock() < self._guard_until:
+            # stays to cheap reads. A closed gate drops the frame here, before it
+            # is ever copied — nothing to leak, nothing to drain.
+            #
+            # The guard is skipped for a subscriber that asked to bypass it. It
+            # exists to keep the Bluetooth open transient out of the *endpointer*;
+            # for a raw capture there is nothing to fool, and dropping frames here
+            # would silently eat the first second of a hold-to-talk dictation the
+            # user is already speaking into.
+            if self._unguarded <= 0 and self._clock() < self._guard_until:
                 return
             if not self._gate.is_set() and self._ungated <= 0:
                 return
@@ -273,6 +280,7 @@ class PersistentCaptureSource:
         control: CaptureControl,
         *,
         respect_gate: bool = True,
+        respect_guard: bool = True,
     ) -> Iterator[FloatAudio]:
         """Subscribe to the stream for one capture, observing ``control``.
 
@@ -290,6 +298,11 @@ class PersistentCaptureSource:
         ``respect_gate=False`` is for the armed barge-in capture, which is its
         own explicit consent act with its own hardened thresholds and must be
         able to hear an interruption while the turn gate is shut.
+
+        ``respect_guard=False`` is for dictation.  The open guard keeps the
+        Bluetooth transient out of the *endpointer*; a raw capture has no onset
+        detection to fool, so honouring it there would only throw away the first
+        second of a hold the user is already speaking into.
         """
 
         with self._lock:
@@ -301,6 +314,8 @@ class PersistentCaptureSource:
             self._subscribed = True
             if not respect_gate:
                 self._ungated += 1
+            if not respect_guard:
+                self._unguarded += 1
         assert frames is not None
 
         released = threading.Event()
@@ -313,6 +328,8 @@ class PersistentCaptureSource:
                 self._subscribed = False
                 if not respect_gate:
                     self._ungated -= 1
+                if not respect_guard:
+                    self._unguarded -= 1
 
         pump = self._pump(control, frames, respect_gate=respect_gate, release=release)
         # A generator that is subscribed but never iterated would otherwise hold

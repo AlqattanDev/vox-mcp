@@ -275,10 +275,20 @@ class CaptureControl:
         self._text = ""
         self._text_lock = threading.Lock()
         self._level = 0.0
+        # A rolling window of measured levels, so a UI polling slower than the
+        # frame rate still gets every sample rather than one in four. Frames are
+        # 20 ms, so this fills at ~50 Hz; dropping the oldest is right because a
+        # stale level is worth less than a fresh one.
+        self._levels: deque[float] = deque(maxlen=128)
+        # How many levels have ever been published. Readers use it to find what is
+        # new to *them*, which is why reading is not destructive: a drain would
+        # mean two readers each saw half a waveform, and `vox doctor` polling
+        # /health would visibly freeze the status app's meter.
+        self._level_seq = 0
         self._level_lock = threading.Lock()
 
     def publish_level(self, dbfs: float) -> None:
-        """Record the latest frame loudness for the menu-bar meter.
+        """Record the latest frame loudness for the waveform.
 
         dBFS runs from near-silence (~-96) to full-scale (0); speech sits
         around -30..-10.  Map it to a 0..1 value where -60 dBFS reads as a
@@ -289,6 +299,8 @@ class CaptureControl:
         level = 0.0 if level < 0.0 else 1.0 if level > 1.0 else level
         with self._level_lock:
             self._level = level
+            self._levels.append(level)
+            self._level_seq += 1
 
     @property
     def level(self) -> float:
@@ -296,6 +308,27 @@ class CaptureControl:
 
         with self._level_lock:
             return self._level
+
+    def levels_since(self, seq: int) -> tuple[list[float], int]:
+        """Levels published after ``seq``, oldest first, with the new sequence.
+
+        Pass back the sequence returned last time to get only what has arrived
+        since.  Reading does not consume, so any number of readers can each keep
+        their own position — `/health` has more callers than the status app, and a
+        destructive read let whichever polled first steal the waveform.
+
+        ``seq=0`` yields the whole window, which is what a reader that has just
+        started (or one whose capture was replaced, resetting the count) wants.
+        """
+
+        with self._level_lock:
+            available = len(self._levels)
+            fresh = self._level_seq - seq
+            # Negative means a new capture reset the count; larger than the window
+            # means the reader fell behind and the rest is already overwritten.
+            count = max(0, min(available, fresh)) if fresh >= 0 else available
+            levels = list(self._levels)[available - count :] if count else []
+            return levels, self._level_seq
 
     def cancel(self) -> None:
         """Cancel the turn and discard audio captured by this call."""

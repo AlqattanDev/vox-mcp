@@ -387,6 +387,40 @@ Speaking animates a synthetic pulse rather than a waveform, because playback is
 an opaque `afplay` subprocess with no readable level and a fake waveform reading
 as mic input would be the same dishonesty as the lit dot. `VOX_HUD=0` disables.
 
+**The waveform carries the microphone's real 50 Hz detail at a 12.5 Hz poll.**
+Frames are 20 ms, so levels are measured 50 times a second while the app polls
+`/health` 12.5 times a second — taking one sample per poll threw three of every
+four away and drew a staircase. `CaptureControl` keeps a rolling 128-level window
+plus a published count; `/health?levels_since=N` returns everything newer than
+`N` alongside `mic_levels_seq` to ask from next time, and the app pushes the whole
+burst in one redraw. Measured live: **50 Hz, 4–5 samples per burst.**
+
+Reading is **not** destructive, and that matters: `/health` has more callers than
+the status app (`vox doctor`, `vox status`, any agent's probe), and a drain let
+whichever polled first take the samples — running the doctor visibly froze the
+pill mid-dictation. Each reader carries its own cursor instead. A cursor from a
+finished capture reads as a reset and yields the whole window, because the next
+capture is a new waveform. Verified: a second reader at the app's own poll rate
+receives all 50 Hz with **zero** lost to the app.
+
+Two bugs that had to be fixed for any of it to show:
+
+- **`/health` read the level from the listen and barge-in controls only**, never
+  `_dictation_control`. `mic_level` was hard-zeroed for the whole of a dictation
+  no matter what the capture measured, so the bars sat dead flat in the one mode
+  that runs from other apps.
+- **Skipping the open guard's *wait* was not enough.** The realtime callback drops
+  frames while `_clock() < _guard_until` too, so dictation opened the gate
+  immediately and then discarded the first **1.0 s of audio** — worse than
+  waiting, and silent. `frames(..., respect_guard=False)` is the opt-out, taken
+  by the raw path only: the guard exists to keep the transient out of the
+  *endpointer*, and a raw capture has no onset detection to fool. The counter is
+  released with the subscription, so the next endpointed turn is protected again.
+
+Bars are drawn at whatever count fits the view rather than a fixed 34 — the panel
+and the pill are different widths, and a fixed count ran the pill's waveform
+straight past its own edge.
+
 **Dictation and read-aloud need no MCP client and no voice session.** Dictation
 uses `capture_raw_from_frames` — a genuinely raw path, not the endpointer in a
 costume. The first attempt reused `AdaptiveCaptureState` with a classifier that
@@ -420,7 +454,8 @@ loopback — test capture by speaking.
 `VOX_STREAM_OPEN_GUARD_SECONDS` (1.0), `VOX_STREAM_IDLE_RELEASE_SECONDS` (2.0),
 `VOX_CLIPBOARD_TRANSCRIPT` (1), `VOX_HUD` (1), `VOX_DICTATION_CLEANUP`
 (`rules`), `VOX_DICTATION_MAX_SECONDS` (120). `/health` carries `gate_open` and
-`stream_open`, which are not the same thing.
+`stream_open`, which are not the same thing, plus `mic_levels` +
+`mic_levels_seq` for the waveform (`?levels_since=N`).
 
 ## Next steps
 

@@ -372,6 +372,107 @@ def test_capture_publishes_live_level_for_the_meter() -> None:
     assert control.level > 0.5
 
 
+def test_levels_since_hands_over_every_sample_not_just_the_latest() -> None:
+    """A reader slower than the frame rate must not lose three samples in four.
+
+    Frames are 20 ms, so levels are measured at ~50 Hz while the status app polls
+    at 12.5 Hz. Reading only the newest value turned a smooth signal into a
+    staircase; the window is what decouples the two rates.
+    """
+
+    control = CaptureControl()
+    assert control.levels_since(0) == ([], 0)
+
+    for dbfs in (-60.0, -30.0, 0.0):
+        control.publish_level(dbfs)
+    levels, seq = control.levels_since(0)
+    assert levels == pytest.approx([0.0, 0.5, 1.0])
+    assert seq == 3
+
+    # Asking again from the same cursor yields nothing new, so a burst is never
+    # drawn twice.
+    assert control.levels_since(seq) == ([], 3)
+
+    control.publish_level(-30.0)
+    levels, seq = control.levels_since(seq)
+    assert levels == pytest.approx([0.5])
+    assert seq == 4
+
+
+def test_reading_levels_does_not_consume_them() -> None:
+    """`/health` has more callers than the status app.
+
+    A destructive read let whichever polled first steal the waveform, so running
+    `vox doctor` froze the meter. Two readers must each see the whole signal.
+    """
+
+    control = CaptureControl()
+    for dbfs in (-60.0, -30.0, 0.0):
+        control.publish_level(dbfs)
+
+    app_levels, app_seq = control.levels_since(0)
+    doctor_levels, doctor_seq = control.levels_since(0)
+    assert app_levels == pytest.approx(doctor_levels)
+    assert app_seq == doctor_seq == 3
+
+    # And each keeps its own position independently.
+    control.publish_level(-30.0)
+    assert control.levels_since(app_seq)[0] == pytest.approx([0.5])
+    assert len(control.levels_since(0)[0]) == 4
+
+
+def test_the_level_window_is_bounded_and_keeps_the_newest() -> None:
+    """Nobody polling must not grow without limit, and stale levels are worthless."""
+
+    control = CaptureControl()
+    for index in range(400):
+        control.publish_level(-60.0 + index * 0.1)
+    levels, seq = control.levels_since(0)
+    assert len(levels) == 128
+    assert seq == 400
+    # The tail, not the head: the last thing published is the last thing read.
+    assert levels[-1] == pytest.approx(control.level)
+
+    # A reader that fell further behind than the window gets what survives, not
+    # a slice of nothing.
+    assert len(control.levels_since(1)[0]) == 128
+
+
+def test_a_reader_whose_capture_was_replaced_starts_over() -> None:
+    """Each capture is a new control, so the sequence restarts at zero.
+
+    A reader still holding the old cursor would compute a negative delta; it must
+    fall back to the whole window rather than drawing nothing forever.
+    """
+
+    fresh = CaptureControl()
+    for dbfs in (-30.0, -20.0):
+        fresh.publish_level(dbfs)
+    levels, seq = fresh.levels_since(500)  # a cursor from the previous capture
+    assert len(levels) == 2
+    assert seq == 2
+
+
+def test_raw_dictation_capture_also_fills_the_level_buffer(tmp_path: Path) -> None:
+    """Dictation is where the waveform matters most — it runs from other apps."""
+
+    control = CaptureControl()
+
+    def loud_frames() -> Any:
+        for index in range(8):
+            if index == 5:
+                control.end_utterance()
+            yield frame(0.6)
+
+    recorder = AudioRecorder(config(), speech_classifier=speech_vote)
+    recorder.capture_raw_from_frames(
+        loud_frames(), 1_000, destination=tmp_path / "dictation.wav", control=control
+    )
+    drained, _ = control.levels_since(0)
+    assert len(drained) >= 5
+    assert max(drained) > 0.5
+
+
 def test_interrupt_preserves_audio_and_persists_recovery_wav(tmp_path: Path) -> None:
     # A host/transport drop (not a deliberate user cancel) must keep the speech
     # and write it to the recovery wav so a mid-utterance crash is recoverable.

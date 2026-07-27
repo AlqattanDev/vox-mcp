@@ -219,6 +219,81 @@ def test_the_open_guard_swallows_the_bluetooth_stream_open_transient() -> None:
     source.close()
 
 
+@pytest.mark.timeout(10)
+def test_a_subscriber_can_opt_out_of_the_guard(tmp_path) -> None:
+    """Dictation must hear the first second, transient and all.
+
+    The guard protects the *endpointer* from the Bluetooth open transient. A raw
+    dictation capture has no onset detection to fool, so honouring it there just
+    deletes the opening of a hold the user is already speaking into — the exact
+    failure that skipping the guard's *wait* was meant to prevent. Skipping the
+    wait alone is not enough: the callback drops frames too.
+    """
+
+    clock = Clock()
+    source, device, _ = build(clock=clock, open_guard_s=1.0)
+    source.open()
+    source.open_gate()
+
+    control = CaptureControl()
+    # Subscribe before emitting: the callback decides whether to keep a frame at
+    # the moment it arrives, so a subscriber that registers late has already lost
+    # the frames it was about to ask for.
+    subscription = source.frames(control, respect_guard=False)
+    # Every one of these lands well inside the guard, and would be dropped in the
+    # realtime callback if the subscriber respected it.
+    device.emit(*[frame(0.4) for _ in range(12)])
+
+    def held() -> Iterator[Any]:
+        for index, value in enumerate(subscription):
+            yield value
+            if index >= 9:  # the key came up
+                control.end_utterance()
+
+    result = recorder().capture_raw_from_frames(
+        held(), source.sample_rate, destination=tmp_path / "dictated.wav", control=control
+    )
+
+    assert result.samples is not None and result.samples.size > 0
+    assert float(np.max(np.abs(result.samples))) == pytest.approx(0.4, abs=1e-6)
+    # And the levels the waveform draws were published for those frames.
+    assert len(control.levels_since(0)[0]) >= 10
+    source.close()
+
+
+@pytest.mark.timeout(10)
+def test_opting_out_of_the_guard_does_not_leak_past_the_capture() -> None:
+    """One raw capture must not leave the next endpointed turn unprotected."""
+
+    clock = Clock()
+    source, device, _ = build(clock=clock, open_guard_s=0.5)
+    source.open()
+    source.open_gate()
+
+    control = CaptureControl()
+    frames = source.frames(control, respect_guard=False)
+    control.end_utterance()
+    for _ in frames:  # drain so the generator finishes and releases
+        pass
+
+    # A fresh guard, and an ordinary subscriber must be shielded by it again.
+    source.close()
+    source.open()
+    source.open_gate()
+    clock.advance(0.24)
+    device.emit(*[frame(0.9) for _ in range(18)])  # the pop
+    clock.advance(0.4)
+    device.emit(*[frame(0.3) for _ in range(5)])
+    device.emit(*[frame(0.0) for _ in range(10)])
+
+    next_control = CaptureControl()
+    result = recorder().capture_from_frames(
+        source.frames(next_control), source.sample_rate, control=next_control
+    )
+    assert float(np.max(np.abs(result.samples))) == pytest.approx(0.3, abs=1e-6)
+    source.close()
+
+
 # ------------------------------------------------------------ turn control
 
 

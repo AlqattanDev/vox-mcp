@@ -1504,8 +1504,11 @@ async def test_the_device_is_released_when_the_turn_ends(tmp_path: Path):
     engine._stream_idle_release_s = 0.05
     try:
         await engine.listen("claude")
-        assert await wait_for(lambda: not engine.stream_open)
-        assert mic.closes == 1
+        # Wait on the *device*, not on stream_open: _close_source drops its
+        # reference before handing the actual close to a thread, so the flag
+        # flips first and the hardware follows.
+        assert await wait_for(lambda: mic.closes == 1)
+        assert engine.stream_open is False
         assert engine.gate_open is False
         assert engine.microphone_open is False
 
@@ -1801,8 +1804,97 @@ async def test_dictation_gives_the_device_back_when_the_key_comes_up(tmp_path: P
         await asyncio.sleep(0.2)
         await engine.dictate("http-control", "dictate_end")
 
-        assert await wait_for(lambda: not engine.stream_open)
-        assert mic.closes == 1
+        # The device itself, not just the flag: _close_source drops its reference
+        # before the actual close runs on a thread.
+        assert await wait_for(lambda: mic.closes == 1)
+        assert engine.stream_open is False
+    finally:
+        await engine.session("http-control", "stop")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_the_waveform_gets_levels_during_a_dictation(tmp_path: Path):
+    """`/health` used to read the level from the listen and barge-in controls only.
+
+    A dictation publishes through its own control, so `mic_level` was hard-zeroed
+    for the whole hold no matter what the capture measured — the waveform sat dead
+    flat in the one mode that runs from other apps. Levels arrive as a *burst* of
+    everything measured since the last poll, because frames are 20 ms and the app
+    polls at 12.5 Hz.
+    """
+
+    engine, _ = make_live_engine(tmp_path)
+    try:
+        await engine.dictate("http-control", "dictate_start")
+        assert await wait_for(lambda: engine.microphone_open)
+
+        # Poll the way the status app does: hand back the cursor from last time so
+        # each sample is drawn exactly once.
+        levels: list[float] = []
+        bursts: list[int] = []
+        seq = 0
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and len(levels) < 5:
+            health = await engine.health(levels_since=seq)
+            seq = health["mic_levels_seq"]
+            levels.extend(health["mic_levels"])
+            bursts.append(len(health["mic_levels"]))
+            await asyncio.sleep(0.08)
+
+        assert len(levels) >= 5, "the waveform received nothing to draw"
+        assert max(levels) > 0, "every sample was silence"
+        # More than one sample per poll, which is the whole point of a burst.
+        assert max(bursts) > 1
+    finally:
+        await engine.dictate("http-control", "dictate_end")
+        await engine.session("http-control", "stop")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_a_second_health_reader_cannot_starve_the_waveform(tmp_path: Path):
+    """`/health` has more callers than the status app.
+
+    `vox doctor`, `vox status` and any agent's health probe all hit it. A
+    destructive read let whichever polled first take the samples, so running the
+    doctor froze the pill's waveform mid-dictation. Both readers must see the
+    whole signal.
+    """
+
+    engine, _ = make_live_engine(tmp_path)
+    try:
+        await engine.dictate("http-control", "dictate_start")
+        assert await wait_for(lambda: engine.microphone_open)
+        await asyncio.sleep(0.3)
+
+        # A poll from something that is not the status app, first.
+        doctor = await engine.health()
+        app = await engine.health()
+        assert doctor["mic_levels"], "nothing was measured to compare"
+        # Not depleted: the second reader still sees everything the first did. The
+        # mic is live, so it may also have picked up frames that arrived in
+        # between — hence a prefix rather than equality.
+        assert len(app["mic_levels"]) >= len(doctor["mic_levels"])
+        assert app["mic_levels"][: len(doctor["mic_levels"])] == doctor["mic_levels"]
+        assert app["mic_levels_seq"] >= doctor["mic_levels_seq"]
+    finally:
+        await engine.dictate("http-control", "dictate_end")
+        await engine.session("http-control", "stop")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_the_waveform_is_empty_when_the_microphone_is_shut(tmp_path: Path):
+    """A stale level must never make the meter look like it is hearing you."""
+
+    engine, _ = make_live_engine(tmp_path)
+    try:
+        await engine.listen("claude")
+        health = await engine.health()
+        assert health["microphone_open"] is False
+        assert health["mic_level"] == 0.0
+        assert health["mic_levels"] == []
     finally:
         await engine.session("http-control", "stop")
 

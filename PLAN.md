@@ -135,6 +135,18 @@ Select text, press **⇧⌘§**. Press again to stop.
 
 - **Warming** (dim, flat bars) for the ~1 s between the tap and the blip, then
   **listening** (red, bars moving with your actual voice), then gone.
+- **The waveform must track your voice, not tick like a clock.** It receives
+  ~50 Hz of measured level in bursts of four or five per poll, so loud syllables
+  and pauses should be visibly distinct. If it looks like a slow staircase, the
+  burst is not arriving — check `curl -s '127.0.0.1:8766/health?levels_since=0'`
+  during a hold and confirm `mic_levels` has several entries and a rising
+  `mic_levels_seq`.
+- **Run `vox doctor` while dictating.** The waveform must not stutter or freeze:
+  reading levels is non-destructive precisely so a second `/health` caller cannot
+  steal them.
+- **The first word of a dictation must survive.** The raw path opts out of the
+  open guard; if the opening syllable is ever missing, the callback is dropping
+  frames again.
 - **Dictating** is teal, not red. Glance at it mid-hold and confirm you can tell
   at a glance that the words are going to the cursor rather than to an agent.
 - **Speaking** is blue and pulses. It is deliberately not a level meter.

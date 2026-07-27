@@ -126,7 +126,11 @@ final class VoxHUD {
     }
 
     /// Drive the HUD from one status poll. `nil` hides it.
-    func apply(_ next: HUDState?, level: CGFloat) {
+    ///
+    /// `levels` is every level the runtime measured since the last poll, oldest
+    /// first — a burst, not a single reading, which is what lets the bars carry
+    /// the microphone's real ~50 Hz detail at a 12.5 Hz poll rate.
+    func apply(_ next: HUDState?, levels: [CGFloat]) {
         guard let next else {
             hide()
             return
@@ -145,12 +149,19 @@ final class VoxHUD {
             meter.settle()
         case .listening, .dictating:
             meter.active = true
-            meter.push(level)
+            meter.push(levels)
         case .speaking:
-            // A synthetic breath, not a level. There is no output signal to read.
+            // A synthetic breath, not a level. There is no output signal to read,
+            // so this is the one place the bars are generated rather than
+            // measured — and it is a slow sine precisely so it cannot be mistaken
+            // for a waveform of anything.
             meter.active = true
-            pulse += 0.35
-            meter.push(0.25 + 0.3 * (1 + CGFloat(sin(Double(pulse)))) / 2)
+            meter.push(
+                (0..<4).map { _ in
+                    pulse += 0.12
+                    return 0.25 + 0.3 * (1 + CGFloat(sin(Double(pulse)))) / 2
+                }
+            )
         }
     }
 

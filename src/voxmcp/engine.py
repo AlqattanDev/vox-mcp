@@ -2023,7 +2023,11 @@ class VoxEngine:
             future = loop.run_in_executor(
                 None,
                 lambda: recorder.capture_raw_from_frames(
-                    held.frames(control),
+                    # respect_guard=False, or the callback would keep dropping
+                    # frames for the whole open guard and swallow the first
+                    # second of the hold — the very thing skipping the wait was
+                    # supposed to prevent.
+                    held.frames(control, respect_guard=False),
                     held.sample_rate,
                     destination=destination,
                     control=control,
@@ -2842,19 +2846,39 @@ class VoxEngine:
         with self._active_lock:
             return self._microphone_active
 
-    async def health(self) -> dict[str, Any]:
+    async def health(self, *, levels_since: int = 0) -> dict[str, Any]:
+        """Runtime state, plus the waveform samples newer than ``levels_since``.
+
+        The caller passes back the ``mic_levels_seq`` it last saw so it receives
+        only what has arrived since. Reading is non-destructive, so a second
+        caller — `vox doctor`, another agent's health probe — cannot steal the
+        status app's waveform.
+        """
+
         status = await self.status()
         session = status["session"]
         undelivered = status.get("undelivered_heard") or {"present": False}
         with self._active_lock:
             mic_active = self._microphone_active
-            # An armed capture publishes levels too; without it the waveform
-            # would sit flat through the one window where the mic is open but
-            # the session still reads SPEAKING.
-            control = self._capture_control or self._barge_in_control
-        # Live loudness for the menu-bar waveform; 0 whenever the mic is closed
+            # Every capture that can hold the microphone, in the order they can
+            # be live. An armed capture publishes levels through the window where
+            # the mic is open but the session still reads SPEAKING, and a
+            # *dictation* publishes through the whole hold — leaving it out meant
+            # the waveform sat dead flat for the one mode used from other apps.
+            control = (
+                self._capture_control or self._barge_in_control or self._dictation_control
+            )
+        # Live loudness for the waveform; 0 and empty whenever the mic is closed,
         # so a stale value can never make the meter look like it is hearing you.
         mic_level = control.level if (mic_active and control is not None) else 0.0
+        # Every level measured since the caller's last poll, oldest first. Frames
+        # are 20 ms, so this carries ~50 Hz of real detail regardless of how often
+        # the app asks — a single sample per poll threw three of every four away
+        # and made a 12.5 Hz staircase out of a smooth signal.
+        if mic_active and control is not None:
+            mic_levels, mic_levels_seq = control.levels_since(levels_since)
+        else:
+            mic_levels, mic_levels_seq = [], 0
         return {
             "status": "ok",
             "state": status["state"],
@@ -2870,6 +2894,8 @@ class VoxEngine:
             "barge_in_enabled": self.config.barge_in_enabled,
             "mic_armed_for_barge_in": status.get("mic_armed_for_barge_in", False),
             "mic_level": round(mic_level, 3),
+            "mic_levels": [round(value, 3) for value in mic_levels],
+            "mic_levels_seq": mic_levels_seq,
             # Kept deliberately compact and transcript-free for the native
             # status panel. This makes an automatic idle stop explainable
             # instead of looking like a crash.

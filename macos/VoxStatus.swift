@@ -169,11 +169,18 @@ enum TextInjector {
     }
 }
 
-/// A live scrolling waveform of the microphone level. Fed one 0..1 sample per
-/// status poll; it keeps a short rolling history and draws it as centred bars,
-/// so the panel visibly reacts to your voice instead of showing dead text.
+/// A live scrolling waveform of the microphone level.
+///
+/// Fed every level the runtime measured since the last poll — frames are 20 ms,
+/// so that is ~50 Hz of real detail arriving in bursts of four or so. Taking one
+/// sample per poll instead threw three of every four away and turned a smooth
+/// signal into a 12.5 Hz staircase.
 final class LevelMeterView: NSView {
-    private var history: [CGFloat] = Array(repeating: 0, count: 34)
+    private static let capacity = 64
+    private static let barWidth: CGFloat = 3
+    private static let gap: CGFloat = 2
+
+    private var history: [CGFloat] = Array(repeating: 0, count: LevelMeterView.capacity)
     /// Whether the mic is live. Idle draws a calm baseline in a muted colour;
     /// active draws in the system accent so it reads as "hearing you."
     var active = false { didSet { needsDisplay = true } }
@@ -185,11 +192,14 @@ final class LevelMeterView: NSView {
     override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: 30) }
     override var isFlipped: Bool { false }
 
-    /// Push the newest loudness sample and scroll the waveform left.
-    func push(_ level: CGFloat) {
-        let clamped = max(0, min(1, level))
-        history.removeFirst()
-        history.append(clamped)
+    /// Push one burst of samples, oldest first, and scroll the waveform left.
+    /// One redraw for the whole burst, not one per sample.
+    func push(_ levels: [CGFloat]) {
+        guard !levels.isEmpty else { return }
+        for level in levels {
+            history.removeFirst()
+            history.append(max(0, min(1, level)))
+        }
         needsDisplay = true
     }
 
@@ -200,21 +210,33 @@ final class LevelMeterView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        let count = history.count
-        guard count > 0, bounds.width > 0 else { return }
-        let gap: CGFloat = 3
-        let barWidth = max(2, (bounds.width - gap * CGFloat(count - 1)) / CGFloat(count))
+        guard bounds.width > 0 else { return }
+        let pitch = LevelMeterView.barWidth + LevelMeterView.gap
+        // Draw as many bars as actually fit and show the newest of them. The
+        // history is one length; the panel and the pill are different widths, and
+        // a fixed bar count overflowed the narrower one straight past its edge.
+        let fits = max(1, min(history.count, Int((bounds.width + LevelMeterView.gap) / pitch)))
+        let visible = history.suffix(fits)
         let midY = bounds.midY
         let maxHalf = bounds.height / 2 - 1
         let color = active ? (tint ?? NSColor.controlAccentColor) : NSColor.tertiaryLabelColor
         color.setFill()
-        for (index, sample) in history.enumerated() {
+        // Right-align, so the newest sample sits at a fixed edge instead of the
+        // whole waveform shifting whenever the visible count changes.
+        let inset = bounds.width - (CGFloat(fits) * pitch - LevelMeterView.gap)
+        for (index, sample) in visible.enumerated() {
             // A small floor keeps a visible resting waveform instead of a blank
             // strip; real signal lifts the bars well above it.
             let half = max(1.5, sample * maxHalf)
-            let x = CGFloat(index) * (barWidth + gap)
-            let rect = NSRect(x: x, y: midY - half, width: barWidth, height: half * 2)
-            NSBezierPath(roundedRect: rect, xRadius: barWidth / 2, yRadius: barWidth / 2).fill()
+            let x = inset + CGFloat(index) * pitch
+            let rect = NSRect(
+                x: x, y: midY - half, width: LevelMeterView.barWidth, height: half * 2
+            )
+            NSBezierPath(
+                roundedRect: rect,
+                xRadius: LevelMeterView.barWidth / 2,
+                yRadius: LevelMeterView.barWidth / 2
+            ).fill()
         }
     }
 }
@@ -245,6 +267,10 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var notesWaiting: [String] = []
     private var lastSpokenAgent: String?
     private var micLevel: CGFloat = 0
+    /// Levels received from the last poll, awaiting one push into the meters.
+    private var pendingLevels: [CGFloat] = []
+    /// How far through the runtime's level stream we have drawn.
+    private var levelsSeq = 0
     private var hotKeyRefs: [EventHotKeyRef] = []
     // ⌘§ is tap-or-hold, and which one it is cannot be known at key-down. The
     // pending work item is the undecided state; the flag remembers that the
@@ -728,7 +754,15 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func refreshStatus() {
-        var request = URLRequest(url: baseURL.appendingPathComponent("health"))
+        // Ask only for the waveform samples we have not drawn yet. Reading is
+        // non-destructive on the runtime side, so anything else polling /health
+        // cannot steal them from us — and we cannot steal them from it.
+        var url = baseURL.appendingPathComponent("health")
+        if var parts = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+            parts.queryItems = [URLQueryItem(name: "levels_since", value: String(levelsSeq))]
+            url = parts.url ?? url
+        }
+        var request = URLRequest(url: url)
         request.timeoutInterval = 1.0
         URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
             guard let self else { return }
@@ -764,6 +798,16 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 // indicator is lit but nothing can be heard yet.
                 self.streamOpen = (payload["stream_open"] as? Bool) ?? false
                 self.micLevel = CGFloat((payload["mic_level"] as? Double) ?? 0)
+                // Every level measured since our last poll, oldest first, with the
+                // cursor to ask from next time. It resets to 0 when a capture
+                // ends, which is exactly right: the next one starts a new
+                // waveform. Buffered here rather than pushed straight into the
+                // meters, because updatePresentation also runs for appearance
+                // changes and panel toggles and must not redraw a stale burst.
+                self.levelsSeq = (payload["mic_levels_seq"] as? Int) ?? 0
+                if let burst = payload["mic_levels"] as? [Double], !burst.isEmpty {
+                    self.pendingLevels = burst.map { CGFloat($0) }
+                }
                 self.detail = (payload["detail"] as? String) ?? "Local-only runtime connected"
                 self.lastStopReason = payload["last_stop_reason"] as? String
                 self.ioMode = (payload["io_mode"] as? String) ?? self.ioMode
@@ -824,10 +868,14 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         stateBadgeLabel.textColor = microphoneOpen ? .systemRed : .secondaryLabelColor
 
         // Live waveform: reacts to the real mic level while listening; settles
-        // to a calm baseline the instant the mic closes.
+        // to a calm baseline the instant the mic closes. Drained here so a
+        // burst is consumed once even though updatePresentation runs for
+        // appearance changes and panel toggles too, not only for polls.
+        let burst = pendingLevels
+        pendingLevels = []
         meterView.active = microphoneOpen
         if microphoneOpen {
-            meterView.push(micLevel)
+            meterView.push(burst)
         } else {
             meterView.settle()
         }
@@ -836,7 +884,7 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // the panel — is on screen, and fall back to the light glyph-tracking
         // cadence the moment neither is.
         let hudShowing = hudEnabled ? hudState(normalized: normalized) : nil
-        if hudEnabled { hud.apply(hudShowing, level: micLevel) }
+        if hudEnabled { hud.apply(hudShowing, levels: burst) }
         setPollInterval(hudShowing != nil || popover.isShown ? 0.08 : 0.4)
 
         detailLabel.stringValue = meterCaption(normalized)

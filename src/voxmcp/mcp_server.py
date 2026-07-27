@@ -843,8 +843,15 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
     async def health_route(request: Request) -> Response:
         if not _loopback_peer(request):
             return JSONResponse({"healthy": False, "error": "loopback_required"}, status_code=403)
+        # ?levels_since=N returns only the waveform samples newer than the ones
+        # this caller already drew. Absent or unparseable means "give me the whole
+        # window", which is what a reader that has just started wants.
         try:
-            payload = await _invoke(current_engine(), "health")
+            levels_since = max(0, int(request.query_params.get("levels_since", "0")))
+        except (TypeError, ValueError):
+            levels_since = 0
+        try:
+            payload = await _invoke(current_engine(), "health", levels_since=levels_since)
         except Exception:
             return JSONResponse({"healthy": False, "error": "health_check_failed"}, status_code=503)
         healthy = not (isinstance(payload, dict) and payload.get("healthy") is False)
