@@ -35,6 +35,7 @@ from .audio import (
 )
 from .capture_source import PersistentCaptureSource
 from .compat import LegacyCompatibility
+from .dictation import clean_dictation
 from .companion import COMPANION_AGENT, ask_companion
 from .config import VoxConfig
 from .diagnostics import static_diagnostics
@@ -206,6 +207,12 @@ class VoxEngine:
         self._stream_open_guard_s = max(
             0.0, float(os.environ.get("VOX_STREAM_OPEN_GUARD_SECONDS", "1.0"))
         )
+        # Hold-to-talk dictation. The cap is a backstop for a key that never
+        # came up, not a limit anyone should reach by talking.
+        self._dictation_max_s = min(
+            300.0, max(1.0, float(os.environ.get("VOX_DICTATION_MAX_SECONDS", "120")))
+        )
+        self._dictation_cleanup = os.environ.get("VOX_DICTATION_CLEANUP", "rules").strip().lower()
 
         self._active_lock = threading.RLock()
         self._active_task: asyncio.Task[Any] | None = None
@@ -232,6 +239,11 @@ class VoxEngine:
         self._last_spoken_agent: str | None = None
         self._audio_tempdir: tempfile.TemporaryDirectory[str] | None = None
         self._source: PersistentCaptureSource | None = None
+        self._dictation_control: CaptureControl | None = None
+        self._dictation_future: asyncio.Future[Any] | None = None
+        # Only set when dictation had to open a stream of its own, which it
+        # then owns and must close.
+        self._dictation_source: PersistentCaptureSource | None = None
         # Turns started by the hotkey rather than by an agent. Held so the tasks
         # are not garbage collected mid-capture.
         self._detached_turns: set[asyncio.Task[Any]] = set()
@@ -1770,6 +1782,128 @@ class VoxEngine:
             "opened": opened,
             "listening": False,
         }
+
+    async def dictate(self, client_id: str, action: str, **_: Any) -> dict[str, Any]:
+        """Hold-to-talk dictation: no agent, no TTS, no MCP session required."""
+
+        action = action.lower().strip()
+        if action == "dictate_start":
+            return await self._dictate_start(client_id)
+        if action == "dictate_end":
+            return await self._dictate_end(client_id)
+        raise VoxError(f"Unknown dictation action: {action}")
+
+    async def _dictate_start(self, client_id: str) -> dict[str, Any]:
+        with self._active_lock:
+            if self._dictation_control is not None:
+                return {"status": "already_dictating"}
+        # Dictation is an explicit, physical act by the user: it outranks
+        # whatever Vox was doing. Any live turn is ended the honest way — the
+        # words already spoken are still transcribed and submitted — and
+        # playback stops so the headset is not talking over the dictation.
+        self._signal_cancel(manual_end=True, cancel_task=False)
+        self.player.cancel_all()
+        if not await self._wait_for_microphone_closed():
+            raise ServiceUnavailableError("microphone is still closing; try again in a moment")
+
+        recorder = self.recorder if isinstance(self.recorder, AudioRecorder) else AudioRecorder()
+        control = CaptureControl()
+        loop = asyncio.get_running_loop()
+        source = await self._ensure_source()
+        owned = False
+        if source is None:
+            # Persistent capture is switched off, but dictation still needs a
+            # stream. Borrow one for the length of the hold and give it back.
+            source = PersistentCaptureSource(
+                recorder.config,
+                device=self.input_device,
+                sounddevice=recorder.sounddevice,
+                stream_factory=recorder.stream_factory,
+                open_guard_s=self._stream_open_guard_s,
+                on_event=self._log,
+            )
+            await asyncio.to_thread(source.open)
+            owned = True
+
+        source.close_gate()
+        remaining = source.guard_remaining_s
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+        source.open_gate()
+        destination = self.store.new_work_path("stt")
+        held = source
+        future = loop.run_in_executor(
+            None,
+            lambda: recorder.capture_raw_from_frames(
+                held.frames(control),
+                held.sample_rate,
+                destination=destination,
+                control=control,
+                max_duration_s=self._dictation_max_s,
+            ),
+        )
+        with self._active_lock:
+            self._dictation_control = control
+            self._dictation_future = future
+            self._dictation_source = source if owned else None
+            self._microphone_active = True
+            self._microphone_closing = False
+
+        def microphone_closed(_future: asyncio.Future[Any]) -> None:
+            held.close_gate()
+            with self._active_lock:
+                self._microphone_active = False
+                self._microphone_closing = False
+
+        future.add_done_callback(microphone_closed)
+        self._log("dictation.started", client_id=client_id)
+        return {"status": "dictating"}
+
+    async def _dictate_end(self, client_id: str) -> dict[str, Any]:
+        with self._active_lock:
+            control = self._dictation_control
+            future = self._dictation_future
+            owned_source = self._dictation_source
+            self._dictation_control = None
+            self._dictation_future = None
+            self._dictation_source = None
+        if control is None or future is None:
+            return {"status": "not_dictating", "text": ""}
+        control.end_utterance()
+        try:
+            capture = await asyncio.wait_for(asyncio.shield(future), timeout=10.0)
+        except Exception as exc:
+            self._log("dictation.failed", client_id=client_id, error=type(exc).__name__)
+            return {"status": "failed", "text": ""}
+        finally:
+            if owned_source is not None:
+                await asyncio.to_thread(owned_source.close)
+
+        if capture.latest_wav_path is None or not capture.speech_detected:
+            self._log("dictation.empty", client_id=client_id, reason=capture.reason.value)
+            return {"status": "no_speech", "text": ""}
+        try:
+            transcription = await self.speech.transcribe(
+                capture.latest_wav_path, language=self.default_language
+            )
+        finally:
+            # Dictation has no recovery story — the text goes straight to the
+            # cursor — so the recording has no reason to outlive the transcribe.
+            capture.latest_wav_path.unlink(missing_ok=True)
+        text = clean_dictation(transcription.text, mode=self._dictation_cleanup)
+        # The event log redacts any field whose name looks like a transcript;
+        # the dictated words are the user's, going to the user's own cursor,
+        # and have no business being written to disk here at all.
+        self._log(
+            "dictation.completed",
+            client_id=client_id,
+            chars=len(text),
+            seconds=round(capture.audio_duration_s, 2),
+            backend=transcription.backend,
+        )
+        if not text:
+            return {"status": "no_speech", "text": ""}
+        return {"status": "dictated", "text": text, "chars": len(text)}
 
     def _open_ended_recorder(self) -> Any:
         """A recorder that will not hang up while the key says "I'm talking"."""

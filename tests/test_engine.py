@@ -1658,3 +1658,147 @@ async def test_the_start_cue_is_never_played_into_an_open_gate(tmp_path: Path):
         assert gate_states == [False]
     finally:
         await engine.session("http-control", "stop")
+
+
+# ---------------------------------------------------------------------------
+# Hold-to-talk dictation: no agent, no TTS, no MCP session.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_dictation_captures_everything_between_press_and_release(tmp_path: Path):
+    """No VAD, no endpointing: the key defines the utterance, not the silence."""
+
+    engine, mic = make_live_engine(tmp_path)
+    try:
+        started = await engine.dictate("http-control", "dictate_start")
+        assert started == {"status": "dictating"}
+        assert await wait_for(lambda: engine.microphone_open)
+
+        # Long enough to span the scripted mic's silent half — which would have
+        # endpointed an ordinary listen, and must not end a dictation.
+        await asyncio.sleep(0.6)
+
+        result = await engine.dictate("http-control", "dictate_end")
+        assert result["status"] == "dictated"
+        assert result["text"] == "Hello world."
+        assert await wait_for(lambda: not engine.microphone_open)
+    finally:
+        await engine.session("http-control", "stop")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_dictation_never_speaks_and_never_takes_an_agent_turn(tmp_path: Path):
+    engine, _ = make_live_engine(tmp_path)
+    log = Path(engine.config.event_log_path)
+    try:
+        await engine.dictate("http-control", "dictate_start")
+        await asyncio.sleep(0.3)
+        await engine.dictate("http-control", "dictate_end")
+    finally:
+        await engine.session("http-control", "stop")
+
+    events = [json.loads(line)["event"] for line in log.read_text().splitlines() if line.strip()]
+    assert not [event for event in events if event.startswith("tts.")]
+    assert "note.captured" not in events
+    assert "dictation.completed" in events
+    # Nothing was addressed to an agent: dictation goes to the cursor, not Vox.
+    assert engine.notes.pending_targets() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_the_dictated_words_are_never_written_to_the_event_log(tmp_path: Path):
+    """They are going to the user's own cursor; the log has no business with them."""
+
+    engine, _ = make_live_engine(tmp_path)
+    log = Path(engine.config.event_log_path)
+    try:
+        await engine.dictate("http-control", "dictate_start")
+        await asyncio.sleep(0.3)
+        result = await engine.dictate("http-control", "dictate_end")
+    finally:
+        await engine.session("http-control", "stop")
+
+    assert result["text"] == "Hello world."
+    assert "Hello world" not in log.read_text()
+    assert "hello world" not in log.read_text()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_dictation_does_not_clobber_the_stt_recovery_recording(tmp_path: Path):
+    """latest.wav is one rolling file an interrupted turn is recovered from."""
+
+    engine, _ = make_live_engine(tmp_path)
+    try:
+        await engine.listen("claude")
+        recovery = engine.store.latest_stt
+        assert recovery.is_file()
+        before = recovery.read_bytes()
+
+        await engine.dictate("http-control", "dictate_start")
+        await asyncio.sleep(0.3)
+        await engine.dictate("http-control", "dictate_end")
+
+        assert recovery.read_bytes() == before
+    finally:
+        await engine.session("http-control", "stop")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_dictation_wins_over_a_turn_that_is_already_listening(tmp_path: Path):
+    """An explicit physical act outranks whatever Vox was doing."""
+
+    engine, mic = make_live_engine(tmp_path)
+    try:
+        listening = asyncio.create_task(engine.listen("claude"))
+        assert await wait_for(lambda: engine.microphone_open)
+
+        await engine.dictate("http-control", "dictate_start")
+        # The interrupted turn ended the honest way: what was already said is
+        # still transcribed rather than thrown away.
+        heard = await listening
+        assert heard["transcript"] == "hello world"
+
+        await asyncio.sleep(0.3)
+        result = await engine.dictate("http-control", "dictate_end")
+        assert result["status"] == "dictated"
+        assert mic.opens == 1  # still one stream for the whole session
+    finally:
+        await engine.session("http-control", "stop")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_ending_a_dictation_nobody_started_is_harmless(tmp_path: Path):
+    engine, _ = make_live_engine(tmp_path)
+    assert await engine.dictate("http-control", "dictate_end") == {
+        "status": "not_dictating",
+        "text": "",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_a_second_press_while_dictating_does_not_start_a_second_capture(tmp_path: Path):
+    engine, _ = make_live_engine(tmp_path)
+    try:
+        assert (await engine.dictate("http-control", "dictate_start"))["status"] == "dictating"
+        assert (await engine.dictate("http-control", "dictate_start"))["status"] == (
+            "already_dictating"
+        )
+        await engine.dictate("http-control", "dictate_end")
+    finally:
+        await engine.session("http-control", "stop")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_an_unknown_dictation_action_is_refused(tmp_path: Path):
+    engine, _ = make_live_engine(tmp_path)
+    with pytest.raises(VoxError):
+        await engine.dictate("http-control", "dictate_sideways")

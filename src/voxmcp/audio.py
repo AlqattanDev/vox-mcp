@@ -983,6 +983,87 @@ class AudioRecorder:
                 state.stop(CaptureStopReason.SOURCE_ENDED)
         return self._finish(state, dropped_frames=0)
 
+    def capture_raw_from_frames(
+        self,
+        frames: Iterable[Any],
+        sample_rate: int,
+        *,
+        destination: Path,
+        control: CaptureControl | None = None,
+        max_duration_s: float = 120.0,
+    ) -> CaptureResult:
+        """Keep every frame, from the first one. No endpointing, no VAD.
+
+        For dictation, where a held key defines the utterance and silence means
+        nothing.  ``AdaptiveCaptureState`` cannot express this: even a
+        classifier that votes speech on every frame is still gated by the
+        adaptive energy threshold, so a quiet start or a soft voice would be
+        dropped from a recording the user explicitly asked for.  A pop at the
+        head of the file is harmless — Whisper shrugs it off — whereas a
+        missing word is not.
+        """
+
+        control = control or CaptureControl()
+        parts: list[FloatAudio] = []
+        captured_s = 0.0
+        reason: CaptureStopReason | None = None
+        for frame in frames:
+            if control.cancelled:
+                reason = CaptureStopReason.CANCELLED
+                break
+            if control.interrupted:
+                reason = CaptureStopReason.INTERRUPTED
+                break
+            if control.manual_end_requested:
+                reason = CaptureStopReason.MANUAL_END
+                break
+            mono = _as_mono_float32(frame)
+            parts.append(mono)
+            captured_s += len(mono) / sample_rate
+            control.publish_level(_dbfs(mono))
+            if captured_s >= max_duration_s:
+                reason = CaptureStopReason.MAX_DURATION
+                break
+        if reason is None:
+            # The source ended itself, which for a gated stream is how the
+            # control flags actually arrive.
+            if control.cancelled:
+                reason = CaptureStopReason.CANCELLED
+            elif control.interrupted:
+                reason = CaptureStopReason.INTERRUPTED
+            elif control.manual_end_requested:
+                reason = CaptureStopReason.MANUAL_END
+            else:
+                reason = CaptureStopReason.SOURCE_ENDED
+
+        if reason is CaptureStopReason.CANCELLED or not parts:
+            empty = np.array([], dtype=np.float32)
+            return CaptureResult(
+                samples=empty,
+                sample_rate=sample_rate,
+                reason=reason,
+                speech_detected=False,
+                elapsed_s=captured_s,
+                audio_duration_s=0.0,
+                speech_duration_s=0.0,
+                trailing_silence_s=0.0,
+                noise_floor_dbfs=-96.0,
+            )
+        audio = np.concatenate(parts).astype(np.float32, copy=False)
+        written = write_wav_atomic(destination, audio, sample_rate)
+        return CaptureResult(
+            samples=audio,
+            sample_rate=sample_rate,
+            reason=reason,
+            speech_detected=True,
+            elapsed_s=captured_s,
+            audio_duration_s=len(audio) / sample_rate,
+            speech_duration_s=captured_s,
+            trailing_silence_s=0.0,
+            noise_floor_dbfs=-96.0,
+            latest_wav_path=written,
+        )
+
     def measure(
         self,
         seconds: float,

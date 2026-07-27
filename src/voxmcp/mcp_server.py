@@ -311,6 +311,14 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
                 client_id=client_id,
                 **options,
             )
+        if action in {"dictate_start", "dictate_end"}:
+            return await _invoke(
+                current_engine(),
+                "dictate",
+                action=action,
+                client_id=client_id,
+                **options,
+            )
         if action in {"cancel", "repeat", "status", "deliver_text", "gate_open", "gate_close"}:
             return await _invoke(
                 current_engine(),
@@ -876,6 +884,8 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
             "deliver_text",
             "gate_open",
             "gate_close",
+            "dictate_start",
+            "dictate_end",
         }
         if action not in allowed:
             return JSONResponse({"ok": False, "error": "unsupported_action"}, status_code=400)
