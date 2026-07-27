@@ -14,6 +14,7 @@ import pytest
 from voxmcp.audio import (
     _dbfs,
     AdaptiveCaptureState,
+    AudioDeviceError,
     AudioPlayer,
     AudioRecorder,
     CaptureConfig,
@@ -22,6 +23,7 @@ from voxmcp.audio import (
     CaptureStopReason,
     LevelMeasurement,
     PlaybackRegistry,
+    WebRTCVADClassifier,
     resolve_input_device,
     write_wav_atomic,
 )
@@ -391,6 +393,44 @@ def test_interrupt_preserves_audio_and_persists_recovery_wav(tmp_path: Path) -> 
     assert result.samples.size > 0  # unlike CANCELLED, audio is kept
     assert result.latest_wav_path == recovery
     assert recovery.is_file() and recovery.stat().st_size > 44
+
+
+def test_frame_driven_capture_reaches_for_vad_like_the_device_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gated turn runs through capture_from_frames; it must not lose VAD.
+
+    The device path builds the classifier lazily when none was injected. This
+    one used to skip that and silently fall back to energy-only detection.
+    """
+
+    calls: list[int] = []
+
+    def fake_create() -> Any:
+        calls.append(1)
+        return speech_vote
+
+    monkeypatch.setattr(WebRTCVADClassifier, "create", staticmethod(fake_create))
+    recorder = AudioRecorder(config(speech_start_s=0.02, trailing_silence_s=0.06))
+    result = recorder.capture_from_frames(
+        iter([frame(0.4)] * 5 + [frame(0.0)] * 5),
+        1_000,
+    )
+    assert calls == [1]
+    assert result.speech_detected is True
+
+
+def test_a_dying_frame_source_is_reported_as_a_device_error() -> None:
+    """A source that raises mid-utterance is a device failure, not silence."""
+
+    def failing_frames() -> Any:
+        yield frame(0.4)
+        yield frame(0.4)
+        raise AudioDeviceError("stream went away")
+
+    recorder = AudioRecorder(config(speech_start_s=0.02), speech_classifier=speech_vote)
+    with pytest.raises(AudioDeviceError, match="stream went away"):
+        recorder.capture_from_frames(failing_frames(), 1_000)
 
 
 def test_atomic_latest_wav_is_private_and_overwritten(tmp_path: Path) -> None:

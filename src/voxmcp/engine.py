@@ -24,6 +24,7 @@ import httpx
 from .audio import (
     default_output_name,
     output_is_isolated,
+    AudioError,
     AudioPlayer,
     AudioRecorder,
     CaptureConfig,
@@ -32,6 +33,7 @@ from .audio import (
     CaptureStopReason,
     PlaybackHandle,
 )
+from .capture_source import PersistentCaptureSource
 from .compat import LegacyCompatibility
 from .companion import COMPANION_AGENT, ask_companion
 from .config import VoxConfig
@@ -190,6 +192,19 @@ class VoxEngine:
             "VOX_BARGE_IN_REQUIRE_HEADPHONES", "1"
         ).strip().lower() not in {"0", "false", "no", "off"}
 
+        # One capture stream per session instead of one per listen. Opening a
+        # stream is what produces the Bluetooth HFP transient that used to open
+        # turns nobody started, so the fix is to stop doing it between turns and
+        # drop frames at the callback whenever no capture is attached.
+        self._persistent_capture = os.environ.get(
+            "VOX_PERSISTENT_CAPTURE", "1"
+        ).strip().lower() not in {"0", "false", "no", "off"}
+        # The transient arrives ~240 ms after the stream engages and decays over
+        # ~350 ms; a guard shorter than half a second does not cover it.
+        self._stream_open_guard_s = max(
+            0.0, float(os.environ.get("VOX_STREAM_OPEN_GUARD_SECONDS", "0.5"))
+        )
+
         self._active_lock = threading.RLock()
         self._active_task: asyncio.Task[Any] | None = None
         self._active_client: str | None = None
@@ -214,6 +229,10 @@ class VoxEngine:
         # addressed back to it without an agent picker.
         self._last_spoken_agent: str | None = None
         self._audio_tempdir: tempfile.TemporaryDirectory[str] | None = None
+        self._source: PersistentCaptureSource | None = None
+        # Turns started by the hotkey rather than by an agent. Held so the tasks
+        # are not garbage collected mid-capture.
+        self._detached_turns: set[asyncio.Task[Any]] = set()
 
     @classmethod
     def default(cls) -> "VoxEngine":
@@ -678,6 +697,63 @@ class VoxEngine:
             pass
         self._log("barge_in.detected", client_id=self._active_client)
 
+    async def _ensure_source(self) -> PersistentCaptureSource | None:
+        """Open the session's capture stream, or return None to capture per-turn.
+
+        A stream that will not open must never take voice down with it: the
+        caller falls back to the old open-per-listen path, which still works,
+        just with the transient it always had.
+        """
+
+        if not self._persistent_capture:
+            return None
+        with self._active_lock:
+            source = self._source
+        if source is not None and source.stream_open:
+            return source
+        if not isinstance(self.recorder, AudioRecorder):
+            # An injected fake recorder owns its own frames; leave it alone.
+            return None
+        source = PersistentCaptureSource(
+            self.recorder.config,
+            device=self.input_device,
+            # The stream has to reach the same hardware the recorder was built
+            # against, injected fakes included — otherwise a test recorder ends
+            # up driving the real microphone.
+            sounddevice=self.recorder.sounddevice,
+            stream_factory=self.recorder.stream_factory,
+            open_guard_s=self._stream_open_guard_s,
+            on_event=self._log,
+        )
+        try:
+            await asyncio.to_thread(source.open)
+        except AudioError as exc:
+            self._log("capture.stream_failed", error=str(exc))
+            return None
+        with self._active_lock:
+            self._source = source
+        return source
+
+    async def _close_source(self) -> None:
+        """Tear the session stream down — the privacy stop, not the gate."""
+
+        with self._active_lock:
+            source = self._source
+            self._source = None
+        if source is None:
+            return
+        await asyncio.to_thread(source.close)
+
+    @property
+    def gate_open(self) -> bool:
+        source = self._source
+        return bool(source is not None and source.gate_open)
+
+    @property
+    def stream_open(self) -> bool:
+        source = self._source
+        return bool(source is not None and source.stream_open)
+
     async def _arm_barge_in(self, client_id: str) -> None:
         """Open the microphone alongside playback, gated against our own voice."""
 
@@ -687,6 +763,9 @@ class VoxEngine:
             armed = AudioRecorder(self.armed_capture_config())
         control = CaptureControl()
         loop = asyncio.get_running_loop()
+        # Resolved before the mic is marked active: opening a stream can block,
+        # and nothing may observe an open microphone that has not been submitted.
+        source = await self._ensure_source()
         # Published before the capture is submitted, never after: the worker
         # can reach speech onset before this coroutine is scheduled again, and
         # initialising _barge_in_fired afterwards would erase that detection.
@@ -699,14 +778,29 @@ class VoxEngine:
             # setting it here is what keeps the panel honest during the window.
             self._microphone_active = True
             self._microphone_closing = False
-        future = loop.run_in_executor(
-            None,
-            lambda: armed.capture(
-                device=self.input_device,
-                control=control,
-                on_speech_started=self._on_barge_in_onset,
-            ),
-        )
+        if source is not None:
+            # Arming attaches to the live stream instead of opening a second
+            # one, which is what used to collapse the headset into call audio
+            # again at disarm. It listens past the closed gate deliberately:
+            # arming is its own consent act, with its own hardened thresholds.
+            future = loop.run_in_executor(
+                None,
+                lambda: armed.capture_from_frames(
+                    source.frames(control, respect_gate=False),
+                    source.sample_rate,
+                    control=control,
+                    on_speech_started=self._on_barge_in_onset,
+                ),
+            )
+        else:
+            future = loop.run_in_executor(
+                None,
+                lambda: armed.capture(
+                    device=self.input_device,
+                    control=control,
+                    on_speech_started=self._on_barge_in_onset,
+                ),
+            )
         with self._active_lock:
             self._barge_in_future = future
 
@@ -1134,15 +1228,31 @@ class VoxEngine:
             self._capture_control = control
         loop = asyncio.get_running_loop()
         selected_recorder = recorder or self.recorder
-        future = loop.run_in_executor(
-            None,
-            lambda: selected_recorder.capture(device=self.input_device, control=control),
-        )
+        source = await self._ensure_source()
+        if source is not None:
+            # The gate is what "the microphone is open" now means: the stream
+            # outlives the turn, but frames only exist while a capture holds it.
+            source.open_gate()
+            future = loop.run_in_executor(
+                None,
+                lambda: selected_recorder.capture_from_frames(
+                    source.frames(control),
+                    source.sample_rate,
+                    control=control,
+                ),
+            )
+        else:
+            future = loop.run_in_executor(
+                None,
+                lambda: selected_recorder.capture(device=self.input_device, control=control),
+            )
         with self._active_lock:
             self._microphone_active = True
             self._microphone_closing = False
 
         def microphone_closed(_future: asyncio.Future[Any]) -> None:
+            if source is not None:
+                source.close_gate()
             with self._active_lock:
                 self._microphone_active = False
                 self._microphone_closing = False
@@ -1592,14 +1702,73 @@ class VoxEngine:
             agent=agent,
         )
 
+    async def _gate_open(self, client_id: str) -> dict[str, Any]:
+        """Open the gate and, if nothing is listening yet, start the turn.
+
+        This is the first tap of the turn key. When a converse is already
+        waiting on the microphone it simply starts receiving frames; otherwise
+        the runtime opens a turn of its own, addressed to whoever last spoke,
+        exactly as the reply hotkey does.
+        """
+
+        source = await self._ensure_source()
+        if source is None:
+            raise ServiceUnavailableError(
+                "no persistent capture stream is available; use end_turn instead"
+            )
+        opened = source.open_gate()
+        with self._active_lock:
+            listening = self._capture_control is not None
+            target = self._last_spoken_agent
+        if listening:
+            self._log("gate.opened", client_id=client_id, started_turn=False)
+            return {
+                "status": "gate_opened",
+                "gate_open": True,
+                "opened": opened,
+                "listening": True,
+            }
+
+        task = asyncio.create_task(
+            self._run_operation(
+                client_id,
+                "note",
+                lambda: self._note_locked(
+                    client_id,
+                    target_agent=target,
+                    recorder=self._open_ended_recorder(),
+                ),
+            )
+        )
+        # Without a strong reference the loop may collect the task mid-capture.
+        self._detached_turns.add(task)
+        task.add_done_callback(self._detached_turns.discard)
+        self._log("gate.opened", client_id=client_id, started_turn=True)
+        return {
+            "status": "gate_opened",
+            "gate_open": True,
+            "opened": opened,
+            "listening": False,
+        }
+
+    def _open_ended_recorder(self) -> Any:
+        """A recorder that will not hang up while the key says "I'm talking"."""
+
+        if not isinstance(self.recorder, AudioRecorder):
+            return self.recorder
+        return AudioRecorder(replace(self.recorder.config, onset_timeout_s=None))
+
     async def _note_locked(
         self,
         client_id: str,
         *,
         target_agent: str | None = None,
         language: str | None = None,
+        recorder: Any | None = None,
     ) -> dict[str, Any]:
-        capture, transcription = await self._capture_once(client_id, language=language)
+        capture, transcription = await self._capture_once(
+            client_id, recorder=recorder, language=language
+        )
         if transcription is None:
             return {
                 "status": (
@@ -1706,6 +1875,9 @@ class VoxEngine:
             self.gate.drain("paused")
             if not await self._wait_for_microphone_closed():
                 raise ServiceUnavailableError("microphone is still closing; Vox remains fail-closed")
+            # Pause is the privacy stop, not the gate: the stream itself goes,
+            # so the device is released and the indicator light goes out.
+            await self._close_source()
             if self.state.state is not SessionState.PAUSED:
                 if self.state.state not in {SessionState.IDLE, SessionState.OFF}:
                     self._return_idle_if_active()
@@ -1721,6 +1893,7 @@ class VoxEngine:
             self.gate.drain("stopped")
             if not await self._wait_for_microphone_closed():
                 raise ServiceUnavailableError("microphone is still closing; Vox remains fail-closed")
+            await self._close_source()
             if self.state.state is not SessionState.OFF:
                 self.state.stop(StopReason.USER_REQUEST, client_id=None)
             # Stop is a global privacy/safety control. Anyone on the local MCP
@@ -1790,6 +1963,17 @@ class VoxEngine:
         if action in {"manual_end", "push_to_talk_end"}:
             signal = self._signal_cancel(manual_end=True, cancel_task=False)
             return {"status": "manual_end_signalled", **signal}
+        if action == "gate_open":
+            return await self._gate_open(client_id)
+        if action == "gate_close":
+            # Manual end first, then the gate: ending the capture is what
+            # transcribes and submits what was said, and the reason has to name
+            # what the user actually did.
+            signal = self._signal_cancel(manual_end=True, cancel_task=False)
+            source = self._source
+            closed = source.close_gate() if source is not None else False
+            self._log("gate.closed", client_id=client_id, ended=signal.get("signalled", False))
+            return {"status": "gate_closed", "gate_open": False, "closed": closed, **signal}
         if action == "deliver_text":
             return self._deliver_text(text)
         if action in {"repeat", "skip_back"}:
@@ -2320,6 +2504,11 @@ class VoxEngine:
             "version": "0.1.0",
             "local_only": True,
             "microphone_open": session["microphone_open"],
+            # With a session-lived stream these two stop being the same thing:
+            # gate_open is whether audio can reach Whisper, stream_open is
+            # merely whether the device is held. The glyph tracks the gate.
+            "gate_open": self.gate_open,
+            "stream_open": self.stream_open,
             "barge_in_enabled": self.config.barge_in_enabled,
             "mic_armed_for_barge_in": status.get("mic_armed_for_barge_in", False),
             "mic_level": round(mic_level, 3),

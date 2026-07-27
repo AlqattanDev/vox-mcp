@@ -892,6 +892,20 @@ class AudioRecorder:
         self._speech_classifier = speech_classifier
         self._clock = clock
 
+    @property
+    def sounddevice(self) -> Any | None:
+        """The injected audio module, if any, so other capture paths match it."""
+
+        return self._sounddevice
+
+    @property
+    def stream_factory(self) -> Callable[..., Any] | None:
+        return self._stream_factory
+
+    @property
+    def speech_classifier(self) -> SpeechClassifier | None:
+        return self._speech_classifier
+
     def _finish(self, state: AdaptiveCaptureState, dropped_frames: int) -> CaptureResult:
         result = state.result(dropped_frames=dropped_frames)
         if (
@@ -922,26 +936,45 @@ class AudioRecorder:
 
         control = control or CaptureControl()
         classifier = self._speech_classifier
+        if classifier is None:
+            # Matches capture(): without this a frame-driven capture silently
+            # runs energy-only, and every gated turn would lose VAD.
+            classifier = WebRTCVADClassifier.create()
         state = AdaptiveCaptureState(sample_rate, self.config, classifier)
-        for frame in frames:
-            if control.cancelled:
-                state.stop(CaptureStopReason.CANCELLED)
-                break
-            if control.interrupted:
-                state.stop(CaptureStopReason.INTERRUPTED)
-                break
-            if control.manual_end_requested:
-                state.stop(CaptureStopReason.MANUAL_END)
-                break
-            decision = state.feed(frame)
-            control.publish_level(decision.dbfs)
-            if decision.speech_started and on_speech_started is not None:
-                _notify_speech_started(on_speech_started)
-            if state.finished:
-                break
+        try:
+            for frame in frames:
+                if control.cancelled:
+                    state.stop(CaptureStopReason.CANCELLED)
+                    break
+                if control.text_delivered:
+                    # Checked before manual_end for the same reason capture()
+                    # does: the reason must name what happened, and the engine
+                    # skips Whisper entirely for a typed turn.
+                    state.stop(CaptureStopReason.DELIVERED_TEXT)
+                    break
+                if control.interrupted:
+                    state.stop(CaptureStopReason.INTERRUPTED)
+                    break
+                if control.manual_end_requested:
+                    state.stop(CaptureStopReason.MANUAL_END)
+                    break
+                decision = state.feed(frame)
+                control.publish_level(decision.dbfs)
+                if decision.speech_started and on_speech_started is not None:
+                    _notify_speech_started(on_speech_started)
+                if state.finished:
+                    break
+        except Exception:
+            # A source that dies mid-utterance is a device failure, not an
+            # empty recording — report it the way capture() does.
+            if not state.finished:
+                state.stop(CaptureStopReason.DEVICE_ERROR)
+            raise
         if not state.finished:
             if control.cancelled:
                 state.stop(CaptureStopReason.CANCELLED)
+            elif control.text_delivered:
+                state.stop(CaptureStopReason.DELIVERED_TEXT)
             elif control.interrupted:
                 state.stop(CaptureStopReason.INTERRUPTED)
             elif control.manual_end_requested:

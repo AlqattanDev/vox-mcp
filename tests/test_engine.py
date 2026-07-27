@@ -2,6 +2,7 @@ import asyncio
 import json
 from pathlib import Path
 import threading
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -1345,3 +1346,261 @@ async def test_speakers_can_be_overridden_deliberately(tmp_path: Path, monkeypat
     engine._barge_in_require_headphones = False
 
     assert engine.barge_in_availability()["available"] is True
+
+
+# ---------------------------------------------------------------------------
+# Persistent capture: one stream per session, a gate in front of it.
+# ---------------------------------------------------------------------------
+
+
+class ScriptedMic:
+    """A fake device that keeps delivering frames on its own thread.
+
+    Speech and silence alternate forever, so any number of turns can run
+    against one stream — which is the whole point of what is being tested.
+    """
+
+    default = SimpleNamespace(device=(1, 2))
+
+    SAMPLE_RATE = 1_000
+    SPEECH_FRAMES = 10
+    SILENT_FRAMES = 10
+
+    def __init__(self) -> None:
+        self.opens = 0
+        self.closes = 0
+        self._running = threading.Event()
+        self._counter = 0
+        self._lock = threading.Lock()
+
+    def query_devices(self, device, kind):
+        assert kind == "input"
+        return {
+            "name": "Scripted mic",
+            "default_samplerate": float(self.SAMPLE_RATE),
+            "max_input_channels": 1,
+        }
+
+    def InputStream(self, **kwargs):  # noqa: N802 - sounddevice API
+        owner = self
+        callback = kwargs["callback"]
+        block = kwargs["blocksize"]
+
+        class Stream:
+            def start(self):
+                owner.opens += 1
+                owner._running.set()
+
+                def pump():
+                    period = owner.SPEECH_FRAMES + owner.SILENT_FRAMES
+                    while owner._running.is_set():
+                        with owner._lock:
+                            index = owner._counter
+                            owner._counter += 1
+                        amplitude = 0.4 if index % period < owner.SPEECH_FRAMES else 0.0
+                        frame = np.full(block, amplitude, dtype=np.float32)
+                        callback(frame.reshape(-1, 1), block, None, None)
+                        time.sleep(0.002)
+
+                threading.Thread(target=pump, daemon=True).start()
+
+            def stop(self):
+                owner._running.clear()
+
+            def close(self):
+                owner.closes += 1
+
+            # The open-per-listen fallback still uses the stream as a context
+            # manager, so the same fake has to serve both paths.
+            def __enter__(self):
+                self.start()
+                return self
+
+            def __exit__(self, *_exc):
+                self.stop()
+                self.close()
+                return None
+
+        return Stream()
+
+
+def make_live_engine(tmp_path: Path):
+    """An engine whose recorder is the real one, over a scripted device."""
+
+    mic = ScriptedMic()
+    store = AudioStore(tmp_path / "audio")
+    recorder = AudioRecorder(
+        CaptureConfig(
+            onset_timeout_s=5.0,
+            trailing_silence_s=0.12,
+            short_trailing_silence_s=0.12,
+            min_duration_s=0.0,
+            max_duration_s=3.0,
+            pre_roll_s=0.0,
+            speech_start_s=0.06,
+            frame_ms=20,
+            save_latest=True,
+            latest_wav_path=store.latest_stt,
+        ),
+        sounddevice=mic,
+    )
+    engine = make_engine(tmp_path, recorder=recorder)
+    engine._stream_open_guard_s = 0.0
+    return engine, mic
+
+
+async def wait_for(predicate, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(0.01)
+    return False
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_a_session_opens_one_stream_and_reuses_it_across_turns(tmp_path: Path):
+    """The churn is the bug: two opens per turn is what fires the HFP pop."""
+
+    engine, mic = make_live_engine(tmp_path)
+    try:
+        first = await engine.listen("claude")
+        second = await engine.listen("claude")
+        assert first["transcript"] == "hello world"
+        assert second["transcript"] == "hello world"
+        assert mic.opens == 1
+        assert mic.closes == 0
+        assert engine.stream_open is True
+    finally:
+        await engine.session("http-control", "stop")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_between_turns_the_stream_stays_open_but_the_gate_is_shut(tmp_path: Path):
+    """Stream open is not the same as being able to hear you."""
+
+    engine, mic = make_live_engine(tmp_path)
+    try:
+        await engine.listen("claude")
+        assert engine.stream_open is True
+        assert engine.gate_open is False
+        assert engine.microphone_open is False
+
+        health = await engine.health()
+        assert health["stream_open"] is True
+        assert health["gate_open"] is False
+        assert health["microphone_open"] is False
+    finally:
+        await engine.session("http-control", "stop")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_stopping_the_session_tears_the_stream_down(tmp_path: Path):
+    """Pause and stop keep their meaning: the device is genuinely released."""
+
+    engine, mic = make_live_engine(tmp_path)
+    await engine.listen("claude")
+    assert mic.opens == 1
+
+    await engine.session("http-control", "stop")
+    assert mic.closes == 1
+    assert engine.stream_open is False
+    assert engine.gate_open is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_pausing_releases_the_device_and_resuming_reopens_it(tmp_path: Path):
+    engine, mic = make_live_engine(tmp_path)
+    try:
+        await engine.listen("claude")
+        await engine.session("http-control", "pause")
+        assert mic.closes == 1
+        assert engine.stream_open is False
+
+        await engine.session("http-control", "resume")
+        await engine.listen("claude")
+        assert mic.opens == 2  # a new session, a new stream
+        assert engine.stream_open is True
+    finally:
+        await engine.session("http-control", "stop")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_the_turn_key_opens_a_turn_and_closing_it_submits(tmp_path: Path):
+    """Tap to talk, tap to send — the hotkey path, end to end."""
+
+    engine, mic = make_live_engine(tmp_path)
+    try:
+        opened = await engine.control("http-control", "gate_open")
+        assert opened["status"] == "gate_opened"
+        assert opened["gate_open"] is True
+        assert opened["listening"] is False
+
+        assert await wait_for(lambda: engine.microphone_open)
+        assert engine.gate_open is True
+
+        closed = await engine.control("http-control", "gate_close")
+        assert closed["status"] == "gate_closed"
+        assert closed["signalled"] is True
+
+        assert await wait_for(lambda: not engine.microphone_open)
+        assert engine.gate_open is False
+        # The turn was submitted, not discarded: it is waiting to be claimed.
+        assert await wait_for(lambda: bool(engine.notes.pending_targets()))
+        assert mic.opens == 1
+    finally:
+        await engine.session("http-control", "stop")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_the_turn_key_attaches_to_a_listen_that_is_already_waiting(tmp_path: Path):
+    """When converse already holds the mic, the key must not start a second turn."""
+
+    engine, mic = make_live_engine(tmp_path)
+    try:
+        listening = asyncio.create_task(engine.listen("claude"))
+        assert await wait_for(lambda: engine.microphone_open)
+
+        opened = await engine.control("http-control", "gate_open")
+        assert opened["listening"] is True
+        assert opened["opened"] is False  # _capture_once had already opened it
+
+        result = await listening
+        assert result["transcript"] == "hello world"
+        assert mic.opens == 1
+    finally:
+        await engine.session("http-control", "stop")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_a_gate_open_turn_does_not_hang_up_while_you_are_thinking(tmp_path: Path):
+    """The key said "I'm talking"; the runtime must not time out the onset."""
+
+    engine, _ = make_live_engine(tmp_path)
+    recorder = engine._open_ended_recorder()
+    assert recorder.config.onset_timeout_s is None
+    assert engine.recorder.config.onset_timeout_s == 5.0  # the default is untouched
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_persistent_capture_can_be_switched_off(tmp_path: Path):
+    """A kill switch, because this owns the microphone for the whole session."""
+
+    engine, mic = make_live_engine(tmp_path)
+    engine._persistent_capture = False
+    try:
+        await engine.listen("claude")
+        assert engine.stream_open is False
+        assert mic.opens == 1  # the old open-per-listen path still works
+        await engine.listen("claude")
+        assert mic.opens == 2
+    finally:
+        await engine.session("http-control", "stop")

@@ -453,6 +453,49 @@ async def test_http_health_and_control_are_loopback_and_token_protected(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_the_turn_key_reaches_the_engine_over_loopback(tmp_path: Path) -> None:
+    """The hotkey's two taps are ordinary control actions, token-authed."""
+
+    engine = FakeEngine(tmp_path / "latest.wav")
+    server = create_mcp(engine, control_token="correct-horse")
+    app = server.http_app(path="/mcp")
+
+    transport = ASGITransport(app=app, client=("127.0.0.1", 50123))
+    async with AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
+        opened = await client.post(
+            "/control",
+            json={"action": "gate_open"},
+            headers={"X-Vox-Token": "correct-horse"},
+        )
+        closed = await client.post(
+            "/control",
+            json={"action": "gate_close"},
+            headers={"X-Vox-Token": "correct-horse"},
+        )
+        unauthorised = await client.post("/control", json={"action": "gate_open"})
+
+    # Awaited, not the 202 fire-and-forget branch: the key needs to know
+    # whether the gate actually moved.
+    assert opened.status_code == 200
+    assert closed.status_code == 200
+    assert unauthorised.status_code == 401
+    control_calls = [arguments for name, arguments in engine.calls if name == "control"]
+    assert control_calls == [
+        {"action": "gate_open", "client_id": "http-control"},
+        {"action": "gate_close", "client_id": "http-control"},
+    ]
+
+    remote_transport = ASGITransport(app=app, client=("10.0.0.20", 50123))
+    async with AsyncClient(transport=remote_transport, base_url="http://10.0.0.20") as remote:
+        blocked = await remote.post(
+            "/control",
+            json={"action": "gate_open"},
+            headers={"X-Vox-Token": "correct-horse"},
+        )
+    assert blocked.status_code == 403
+
+
+@pytest.mark.asyncio
 async def test_control_route_stays_closed_without_configured_token(tmp_path: Path) -> None:
     engine = FakeEngine(tmp_path / "latest.wav")
     server = create_mcp(engine, control_token="")
