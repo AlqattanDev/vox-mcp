@@ -389,9 +389,16 @@ makes the 1.0 s guard read as deliberate rather than as a dead key press),
 **speaking** (blue). It is a `.nonactivatingPanel` ordered front with
 `orderFrontRegardless()` and never `makeKeyAndOrderFront` — taking key status
 would move the insertion point out of the field dictation is about to paste into.
-Speaking animates a synthetic pulse rather than a waveform, because playback is
-an opaque `afplay` subprocess with no readable level and a fake waveform reading
-as mic input would be the same dishonesty as the lit dot. `VOX_HUD=0` disables.
+**Speaking draws the true envelope of the clip being played.** `afplay` exposes
+no output level, but the file it plays is right there: `PlaybackLevels` measures
+it at the mic meter's 20 ms frames and dBFS mapping and publishes each frame
+only once wall clock has actually played it, so the bars carry syllables and
+sentence pauses and cannot sprint ahead of the voice. `/health` serves it as
+`tts_level` + `tts_levels`/`tts_levels_seq` (`?tts_levels_since=N`), the same
+non-destructive multi-reader contract as the mic waveform. Verified live:
+speech frames at 0.5–0.65 with zero-runs exactly at the sentence's commas. A
+file the envelope cannot be read from (the `say` fallback can emit non-PCM)
+yields flat bars, never a failed playback. `VOX_HUD=0` disables.
 
 **The waveform carries the microphone's real 50 Hz detail at a 12.5 Hz poll.**
 Frames are 20 ms, so levels are measured 50 times a second while the app polls
@@ -461,7 +468,8 @@ loopback — test capture by speaking.
 `VOX_CLIPBOARD_TRANSCRIPT` (1), `VOX_HUD` (1), `VOX_DICTATION_CLEANUP`
 (`rules`), `VOX_DICTATION_MAX_SECONDS` (120). `/health` carries `gate_open` and
 `stream_open`, which are not the same thing, plus `mic_levels` +
-`mic_levels_seq` for the waveform (`?levels_since=N`).
+`mic_levels_seq` for the mic waveform (`?levels_since=N`) and `tts_levels` +
+`tts_levels_seq` for the speaking waveform (`?tts_levels_since=N`).
 
 ## Next steps
 

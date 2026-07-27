@@ -295,8 +295,7 @@ class CaptureControl:
         flat baseline so the waveform only lifts when there is real signal.
         """
 
-        level = (dbfs + 60.0) / 60.0
-        level = 0.0 if level < 0.0 else 1.0 if level > 1.0 else level
+        level = _level_from_dbfs(dbfs)
         with self._level_lock:
             self._level = level
             self._levels.append(level)
@@ -526,6 +525,126 @@ def _dbfs(samples: FloatAudio) -> float:
     if rms <= 1e-8:
         return -96.0
     return max(-96.0, min(0.0, 20.0 * math.log10(rms)))
+
+
+def _level_from_dbfs(dbfs: float) -> float:
+    """Map dBFS to the 0..1 waveform scale shared by mic and playback bars."""
+
+    level = (dbfs + 60.0) / 60.0
+    return 0.0 if level < 0.0 else 1.0 if level > 1.0 else level
+
+
+def wav_envelope(path: Path | str, frame_ms: int = 20) -> list[float]:
+    """Per-frame 0..1 loudness of a PCM WAV, on the mic waveform's scale.
+
+    This is what makes the speaking waveform *true*: playback is an opaque
+    ``afplay`` subprocess with no readable output level, but the file it plays
+    is right here, and its envelope — measured from the actual samples at the
+    same frame size and dBFS mapping as the microphone meter — is the signal
+    leaving the speaker, not an animation of one.
+
+    Returns an empty list rather than raising: a file the envelope cannot be
+    read from (the macOS ``say`` fallback can emit non-PCM) must never take
+    playback down with it. Flat bars are honest about missing data; no audio
+    is not.
+    """
+
+    try:
+        with wave.open(str(Path(path).expanduser()), "rb") as reader:
+            sample_rate = reader.getframerate()
+            channels = reader.getnchannels()
+            width = reader.getsampwidth()
+            if sample_rate <= 0 or channels < 1 or width != 2:
+                return []
+            raw = reader.readframes(reader.getnframes())
+        samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        if channels > 1:
+            samples = samples.reshape(-1, channels).mean(axis=1)
+        per_frame = max(1, round(sample_rate * frame_ms / 1000))
+        return [
+            _level_from_dbfs(_dbfs(samples[start : start + per_frame]))
+            for start in range(0, len(samples), per_frame)
+        ]
+    except (OSError, wave.Error, EOFError, ValueError):
+        return []
+
+
+class PlaybackLevels:
+    """Publishes the envelope of what is playing, as wall clock plays it.
+
+    Mirrors ``CaptureControl``'s non-destructive reader contract — a rolling
+    sequence number, ``levels_since(seq)``, any number of readers each keeping
+    their own cursor — so the status app draws speech exactly the way it draws
+    the microphone. Frames become visible only once their moment has actually
+    left the speaker, which is what keeps the bars synchronized to the audio
+    rather than sprinting through the whole envelope at poll speed.
+    """
+
+    def __init__(self, *, frame_ms: int = 20, clock: Callable[[], float] = time.monotonic) -> None:
+        self._frame_s = frame_ms / 1000.0
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._envelope: list[float] = []
+        self._started_at: float | None = None
+        self._base_seq = 0
+
+    def _published_locked(self) -> int:
+        if self._started_at is None:
+            return self._base_seq
+        elapsed = self._clock() - self._started_at
+        played = int(elapsed / self._frame_s)
+        return self._base_seq + min(len(self._envelope), max(0, played))
+
+    def begin(self, path: Path | str) -> None:
+        """Start publishing ``path``'s envelope from now."""
+
+        envelope = wav_envelope(path, frame_ms=round(self._frame_s * 1000))
+        with self._lock:
+            self._base_seq = self._published_locked()
+            self._envelope = envelope
+            self._started_at = self._clock()
+
+    def end(self) -> None:
+        """Stop publishing — playback finished or was cancelled."""
+
+        with self._lock:
+            self._base_seq = self._published_locked()
+            self._envelope = []
+            self._started_at = None
+
+    @property
+    def active(self) -> bool:
+        with self._lock:
+            return self._started_at is not None
+
+    @property
+    def level(self) -> float:
+        """The 0..1 loudness of the frame playing right now."""
+
+        with self._lock:
+            if self._started_at is None:
+                return 0.0
+            index = self._published_locked() - self._base_seq
+            if not 0 < index <= len(self._envelope):
+                return 0.0
+            return self._envelope[index - 1]
+
+    def levels_since(self, seq: int) -> tuple[list[float], int]:
+        """Frames played after ``seq``, oldest first, with the new cursor.
+
+        Same semantics as ``CaptureControl.levels_since``: reading consumes
+        nothing, ``seq=0`` (or a cursor from a previous playback) yields what
+        is available, and only the current clip's already-played frames are
+        retrievable.
+        """
+
+        with self._lock:
+            total = self._published_locked()
+            available = total - self._base_seq
+            fresh = total - seq
+            count = max(0, min(available, fresh)) if fresh >= 0 else available
+            levels = self._envelope[available - count : available] if count else []
+            return [round(value, 3) for value in levels], total
 
 
 class WebRTCVADClassifier:

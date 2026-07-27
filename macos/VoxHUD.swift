@@ -15,10 +15,11 @@ import AppKit
 ///    `orderFrontRegardless()` and never `makeKeyAndOrderFront`. Stealing key
 ///    status would move the insertion point out of the field dictation is about
 ///    to paste into.
-///  * **It never invents a level.** `speaking` animates a synthetic pulse rather
-///    than a waveform, because there is no output level to read — playback is an
-///    opaque `afplay` subprocess. A fake waveform that reads as microphone input
-///    would be exactly the dishonesty this whole feature exists to remove.
+///  * **It never invents a level.** Every bar is measured: listening and
+///    dictating draw the microphone, and `speaking` draws the envelope of the
+///    clip actually playing, published by the runtime frame by frame as the
+///    clock plays it. `afplay` itself exposes no output level — the runtime
+///    reads the file it is playing instead, which is the same signal.
 enum HUDState: Equatable {
     /// The device is open but the gate is still shut: the stream-open guard is
     /// being waited out. Shown so that first second reads as deliberate warm-up
@@ -48,7 +49,6 @@ final class VoxHUD {
     private let panel: HUDPanel
     private let meter = LevelMeterView()
     private var state: HUDState?
-    private var pulse: CGFloat = 0
     private var onClick: () -> Void = {}
 
     init() {
@@ -147,21 +147,13 @@ final class VoxHUD {
             // and pretending otherwise would be the same lie as a fake meter.
             meter.active = false
             meter.settle()
-        case .listening, .dictating:
+        case .listening, .dictating, .speaking:
+            // Speaking bars are as measured as listening bars: the runtime
+            // publishes the envelope of the clip actually playing, frame by
+            // frame as the clock plays it, so this is the audio leaving the
+            // speaker — not an animation of one.
             meter.active = true
             meter.push(levels)
-        case .speaking:
-            // A synthetic breath, not a level. There is no output signal to read,
-            // so this is the one place the bars are generated rather than
-            // measured — and it is a slow sine precisely so it cannot be mistaken
-            // for a waveform of anything.
-            meter.active = true
-            meter.push(
-                (0..<4).map { _ in
-                    pulse += 0.12
-                    return 0.25 + 0.3 * (1 + CGFloat(sin(Double(pulse)))) / 2
-                }
-            )
         }
     }
 

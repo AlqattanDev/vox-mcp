@@ -781,7 +781,16 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
         except (TypeError, ValueError):
             levels_since = 0
         try:
-            payload = await _invoke(current_engine(), "health", levels_since=levels_since)
+            tts_levels_since = max(0, int(request.query_params.get("tts_levels_since", "0")))
+        except (TypeError, ValueError):
+            tts_levels_since = 0
+        try:
+            payload = await _invoke(
+                current_engine(),
+                "health",
+                levels_since=levels_since,
+                tts_levels_since=tts_levels_since,
+            )
         except Exception:
             return JSONResponse({"healthy": False, "error": "health_check_failed"}, status_code=503)
         healthy = not (isinstance(payload, dict) and payload.get("healthy") is False)

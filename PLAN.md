@@ -151,7 +151,10 @@ Select text, tap **⌘§**. Tap again to stop.
   frames again.
 - **Dictating** is teal, not red. Glance at it mid-hold and confirm you can tell
   at a glance that the words are going to the cursor rather than to an agent.
-- **Speaking** is blue and pulses. It is deliberately not a level meter.
+- **Speaking** is blue and draws the real envelope of the audio playing — the
+  bars should visibly pause when the voice pauses at a comma. If they tick
+  evenly through a pause, the burst is not arriving: check
+  `curl -s '127.0.0.1:8766/health?tts_levels_since=0'` mid-reply.
 - **It must never steal focus.** Dictate into a text field while the pill is up;
   if the insertion point moves or the frontmost app deactivates, the panel's
   `.nonactivatingPanel` contract is broken and dictation will paste into the

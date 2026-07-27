@@ -767,6 +767,114 @@ def test_resolving_input_refreshes_the_device_list_first() -> None:
     assert device.name == "MacBook Pro Microphone"
 
 
+def _write_tone_wav(path: Path, *, loud_seconds: float, quiet_seconds: float) -> None:
+    """A wav that is loud, then near-silent — an envelope a test can see."""
+
+    import wave as wave_module
+
+    sample_rate = 24_000
+    loud = 0.5 * np.sin(2 * np.pi * 440 * np.arange(int(sample_rate * loud_seconds)) / sample_rate)
+    quiet = np.zeros(int(sample_rate * quiet_seconds))
+    samples = (np.concatenate([loud, quiet]) * 32767).astype(np.int16)
+    with wave_module.open(str(path), "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(sample_rate)
+        writer.writeframes(samples.tobytes())
+
+
+def test_wav_envelope_tracks_the_actual_signal(tmp_path: Path) -> None:
+    from voxmcp.audio import wav_envelope
+
+    clip = tmp_path / "clip.wav"
+    _write_tone_wav(clip, loud_seconds=0.2, quiet_seconds=0.2)
+    envelope = wav_envelope(clip)
+
+    assert len(envelope) == 20  # 400 ms of 20 ms frames
+    assert all(level > 0.5 for level in envelope[:9])
+    assert all(level < 0.1 for level in envelope[11:])
+
+
+def test_wav_envelope_failure_is_empty_not_raised(tmp_path: Path) -> None:
+    from voxmcp.audio import wav_envelope
+
+    missing = tmp_path / "missing.wav"
+    garbage = tmp_path / "garbage.wav"
+    garbage.write_bytes(b"not a wav at all")
+    assert wav_envelope(missing) == []
+    assert wav_envelope(garbage) == []
+
+
+def test_playback_levels_release_frames_only_as_the_clock_plays_them(tmp_path: Path) -> None:
+    """The speaking waveform must stay synchronized to the audio.
+
+    Handing the whole envelope over at once would let the meter sprint through
+    the clip at poll speed and finish drawing before the voice finished
+    talking — which is a different animation, not the signal.
+    """
+
+    from voxmcp.audio import PlaybackLevels
+
+    clip = tmp_path / "clip.wav"
+    _write_tone_wav(clip, loud_seconds=0.2, quiet_seconds=0.2)
+    now = [0.0]
+    levels = PlaybackLevels(clock=lambda: now[0])
+
+    levels.begin(clip)
+    burst, seq = levels.levels_since(0)
+    assert burst == [] and seq == 0
+
+    now[0] += 0.1  # five 20 ms frames have played
+    burst, seq = levels.levels_since(0)
+    assert len(burst) == 5 and seq == 5
+    assert all(level > 0.5 for level in burst)
+
+    now[0] += 10.0  # long past the end: the envelope is bounded by the clip
+    burst, seq = levels.levels_since(seq)
+    assert len(burst) == 15 and seq == 20
+
+    levels.end()
+    assert levels.level == 0.0
+    burst, seq = levels.levels_since(seq)
+    assert burst == [] and seq == 20
+
+
+def test_playback_levels_readers_do_not_starve_each_other(tmp_path: Path) -> None:
+    from voxmcp.audio import PlaybackLevels
+
+    clip = tmp_path / "clip.wav"
+    _write_tone_wav(clip, loud_seconds=0.2, quiet_seconds=0.0)
+    now = [0.0]
+    levels = PlaybackLevels(clock=lambda: now[0])
+    levels.begin(clip)
+    now[0] += 0.1
+
+    first, first_seq = levels.levels_since(0)
+    second, second_seq = levels.levels_since(0)
+    assert first == second and first_seq == second_seq
+
+
+def test_playback_levels_sequence_survives_the_next_span(tmp_path: Path) -> None:
+    """Streamed TTS plays span after span; the cursor must never rewind."""
+
+    from voxmcp.audio import PlaybackLevels
+
+    clip = tmp_path / "clip.wav"
+    _write_tone_wav(clip, loud_seconds=0.1, quiet_seconds=0.0)
+    now = [0.0]
+    levels = PlaybackLevels(clock=lambda: now[0])
+
+    levels.begin(clip)
+    now[0] += 1.0
+    _, seq = levels.levels_since(0)
+    assert seq == 5
+
+    levels.begin(clip)  # the next span starts where the last one left off
+    now[0] += 1.0
+    burst, seq = levels.levels_since(seq)
+    assert len(burst) == 5 and seq == 10
+
+
 def test_resolution_leaves_the_snapshot_alone_under_a_live_stream() -> None:
     """Reinitializing PortAudio under an open InputStream would kill the turn."""
 

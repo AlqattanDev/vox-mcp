@@ -32,6 +32,7 @@ from .audio import (
     CaptureResult,
     CaptureStopReason,
     PlaybackHandle,
+    PlaybackLevels,
 )
 from .capture_source import PersistentCaptureSource
 from .dictation import Runner as ClipboardRunner
@@ -121,6 +122,9 @@ class VoxEngine:
         self.lease = lease or LeaseManager(ttl_seconds=max(30.0, config.idle_timeout_seconds))
         self.gate = gate or OperationGate()
         self.gate.on_event = self._log_queue_event
+        # The speaking waveform's source of truth: the envelope of the span
+        # being played, published as the clock plays it.
+        self.playback_levels = PlaybackLevels()
         self.last_heard = LastHeardStore(Path(config.state_dir) / "last_heard.json")
         self.notes = NotesStore(Path(config.state_dir) / "notes.json")
         self._io_mode_path = Path(config.state_dir) / "io_mode"
@@ -1100,6 +1104,9 @@ class VoxEngine:
         # echo gate has to work with for the price of a barely audible drop.
         volume = self.volume * self._barge_in_duck_volume if self.barge_in_armed else self.volume
         handle = self.player.play_file(replay_path, volume=volume, blocking=False)
+        # Published from the file's actual samples, aligned to the moment the
+        # player launched — the true waveform of this span, not an animation.
+        self.playback_levels.begin(replay_path)
         with self._active_lock:
             self._playback = handle
             self._playback_interruptible = interruptible
@@ -1109,7 +1116,10 @@ class VoxEngine:
             already_barged = self._barge_in_fired
         if already_barged:
             handle.cancel(grace_s=self._barge_in_cancel_grace_s)
-        return_code = await asyncio.to_thread(handle.wait)
+        try:
+            return_code = await asyncio.to_thread(handle.wait)
+        finally:
+            self.playback_levels.end()
         with self._active_lock:
             cancelled = self._cancel_requested
             self._playback = None
@@ -2746,13 +2756,16 @@ class VoxEngine:
         with self._active_lock:
             return self._microphone_active
 
-    async def health(self, *, levels_since: int = 0) -> dict[str, Any]:
+    async def health(
+        self, *, levels_since: int = 0, tts_levels_since: int = 0
+    ) -> dict[str, Any]:
         """Runtime state, plus the waveform samples newer than ``levels_since``.
 
         The caller passes back the ``mic_levels_seq`` it last saw so it receives
         only what has arrived since. Reading is non-destructive, so a second
         caller — `vox doctor`, another agent's health probe — cannot steal the
-        status app's waveform.
+        status app's waveform. ``tts_levels_since`` is the same contract for the
+        speaking waveform, published from the samples actually being played.
         """
 
         status = await self.status()
@@ -2779,6 +2792,7 @@ class VoxEngine:
             mic_levels, mic_levels_seq = control.levels_since(levels_since)
         else:
             mic_levels, mic_levels_seq = [], 0
+        tts_levels, tts_levels_seq = self.playback_levels.levels_since(tts_levels_since)
         return {
             "status": "ok",
             "state": status["state"],
@@ -2796,6 +2810,11 @@ class VoxEngine:
             "mic_level": round(mic_level, 3),
             "mic_levels": [round(value, 3) for value in mic_levels],
             "mic_levels_seq": mic_levels_seq,
+            # The speaking waveform, measured from the file being played and
+            # released frame by frame as wall clock plays it — never synthetic.
+            "tts_level": round(self.playback_levels.level, 3),
+            "tts_levels": tts_levels,
+            "tts_levels_seq": tts_levels_seq,
             # Kept deliberately compact and transcript-free for the native
             # status panel. This makes an automatic idle stop explainable
             # instead of looking like a crash.

@@ -264,6 +264,8 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var pendingLevels: [CGFloat] = []
     /// How far through the runtime's level stream we have drawn.
     private var levelsSeq = 0
+    private var ttsLevelsSeq = 0
+    private var pendingTtsLevels: [CGFloat] = []
     private var hotKeyRefs: [EventHotKeyRef] = []
     // ⌘§ is tap-or-hold, and which one it is cannot be known at key-down. The
     // pending work item is the undecided state; the flag remembers that the
@@ -751,7 +753,10 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // cannot steal them from us — and we cannot steal them from it.
         var url = baseURL.appendingPathComponent("health")
         if var parts = URLComponents(url: url, resolvingAgainstBaseURL: false) {
-            parts.queryItems = [URLQueryItem(name: "levels_since", value: String(levelsSeq))]
+            parts.queryItems = [
+                URLQueryItem(name: "levels_since", value: String(levelsSeq)),
+                URLQueryItem(name: "tts_levels_since", value: String(ttsLevelsSeq)),
+            ]
             url = parts.url ?? url
         }
         var request = URLRequest(url: url)
@@ -799,6 +804,13 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 self.levelsSeq = (payload["mic_levels_seq"] as? Int) ?? 0
                 if let burst = payload["mic_levels"] as? [Double], !burst.isEmpty {
                     self.pendingLevels = burst.map { CGFloat($0) }
+                }
+                // The speaking waveform: the envelope of the clip actually
+                // playing, measured runtime-side from its samples. Same burst
+                // contract as the mic levels, separate cursor.
+                self.ttsLevelsSeq = (payload["tts_levels_seq"] as? Int) ?? 0
+                if let burst = payload["tts_levels"] as? [Double], !burst.isEmpty {
+                    self.pendingTtsLevels = burst.map { CGFloat($0) }
                 }
                 self.detail = (payload["detail"] as? String) ?? "Local-only runtime connected"
                 self.lastStopReason = payload["last_stop_reason"] as? String
@@ -859,15 +871,21 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         stateBadgeLabel.stringValue = badge
         stateBadgeLabel.textColor = microphoneOpen ? .systemRed : .secondaryLabelColor
 
-        // Live waveform: reacts to the real mic level while listening; settles
-        // to a calm baseline the instant the mic closes. Drained here so a
-        // burst is consumed once even though updatePresentation runs for
-        // appearance changes and panel toggles too, not only for polls.
+        // Live waveform: the real mic level while listening, the real playback
+        // envelope while speaking; settles to a calm baseline otherwise.
+        // Drained here so a burst is consumed once even though
+        // updatePresentation runs for appearance changes and panel toggles
+        // too, not only for polls.
         let burst = pendingLevels
         pendingLevels = []
-        meterView.active = microphoneOpen
+        let ttsBurst = pendingTtsLevels
+        pendingTtsLevels = []
+        let speaking = normalized == "speaking" && !microphoneOpen
+        meterView.active = microphoneOpen || speaking
         if microphoneOpen {
             meterView.push(burst)
+        } else if speaking {
+            meterView.push(ttsBurst)
         } else {
             meterView.settle()
         }
@@ -876,7 +894,7 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // the panel — is on screen, and fall back to the light glyph-tracking
         // cadence the moment neither is.
         let hudShowing = hudEnabled ? hudState(normalized: normalized) : nil
-        if hudEnabled { hud.apply(hudShowing, levels: burst) }
+        if hudEnabled { hud.apply(hudShowing, levels: hudShowing == .speaking ? ttsBurst : burst) }
         setPollInterval(hudShowing != nil || popover.isShown ? 0.08 : 0.4)
 
         detailLabel.stringValue = meterCaption(normalized)
