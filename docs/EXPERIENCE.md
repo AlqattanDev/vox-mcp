@@ -95,6 +95,15 @@ called speech, because labelling first is circular: walk somewhere loud and
 every frame reads as speech, so the floor never rises to meet the room and
 never stops reading as speech.
 
+While an utterance is running the floor may only fall, so it cannot climb into
+the voice it is listening to — but that protects a floor that was *measured*.
+Until the first real reading lands, the starting guess is just a guess and gets
+replaced whichever way it has to move. Applied to the guess, the same rule
+pinned it: speech is confirmed in 60 ms and the window needs 240 ms to fill, so
+starting to talk immediately locked in a floor of -60 dBFS in a room actually at
+-47. Everything the room did then read as speech, trailing silence never
+accumulated, and the only ways out were the hard cap or the menu bar.
+
 `VOX_MINIMUM_SPEECH_DBFS` still exists as a hard backstop for pathological
 hardware, but it is not part of normal setup and you should not need it.
 

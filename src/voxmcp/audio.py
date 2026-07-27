@@ -139,7 +139,15 @@ class CaptureConfig:
     # room while the room's own fluctuation stays small. So the requirement is
     # sized to the measured fluctuation, which travels with you.
     vad_margin_db: float = 3.0
-    noise_spread_k: float = 4.0
+    # Multiplies the room's spread into that rise. Four was measured against
+    # rooms, not voices, and in an ordinary 3 dB room it demands 12 dB — more
+    # headroom than Ali's voice has over his own room (~8 dB), so his speech
+    # fell through the gate in holes long enough for the endpointer to close
+    # on. Three keeps every room in the cross-room contract rejecting its own
+    # noise at 0/200 while cutting his worst mid-sentence hole from 1.06 s to
+    # 0.46 s, under even the fastest close. Below 2.5 the restless rooms start
+    # leaking and this stops being a fix.
+    noise_spread_k: float = 3.0
     max_vad_margin_db: float = 15.0
     # The floor is read straight off a rolling window of recent loudness rather
     # than smoothed from frames a classifier already labelled. Labelling first
@@ -709,6 +717,18 @@ class AdaptiveCaptureState:
         self.speech_classifier = speech_classifier
         self.phase = CapturePhase.WAITING_FOR_SPEECH
         self.noise_floor_dbfs = self.config.initial_noise_floor_dbfs
+        # Whether the floor above is a reading of this room or still the
+        # starting guess. The "floor may only fall while capturing" rule exists
+        # to stop a measured floor climbing into the speaker's own voice; over
+        # the *guess* it does the reverse and pins it there for the whole turn.
+        # Measured in Ali's room: floor guessed at -60 dBFS, actually -47. His
+        # own room tone reads as speech against a gate set 13 dB too low, so
+        # trailing silence resets forever and the turn can only end at
+        # max_duration or by hand. Speech starts at 60 ms but a window takes
+        # 240 ms to fill, so a turn opened by talking straight away used to
+        # reach CAPTURING — and lock the guess in — before the first real
+        # reading ever landed.
+        self._floor_measured = False
         # How much this room's own noise wanders above its floor, in dB.
         # Learned from the room itself, so the speech gate re-sizes when you
         # move between a quiet bedroom and a loud office without being told.
@@ -780,7 +800,8 @@ class AdaptiveCaptureState:
 
         stationary = (median - floor) <= self.config.stationary_spread_db
         if (
-            self.phase is CapturePhase.CAPTURING
+            self._floor_measured
+            and self.phase is CapturePhase.CAPTURING
             and floor > self.noise_floor_dbfs
             and not stationary
         ):
@@ -791,9 +812,21 @@ class AdaptiveCaptureState:
             # clearing the gate, and the turn endpoints mid-word. The room does
             # not get louder because you are talking, so during an utterance the
             # floor may only fall.
+            #
+            # It guards a floor that was *measured*. Applied to the starting
+            # guess it does the opposite: see ``_floor_measured``.
             return
         self.noise_floor_dbfs = floor
-        self.noise_spread_db = max(0.0, median - floor)
+        if self.phase is not CapturePhase.CAPTURING or stationary:
+            # The spread is how restless *the room* is, and it sizes the rise a
+            # VAD-endorsed frame has to clear. A window full of speech measures
+            # the speaker's dynamic range instead — median sits on the voice,
+            # floor on the gaps between words — which inflates it toward the cap
+            # and quietly raises the gate above the very speech being measured.
+            # The floor is guarded from speech just above; the spread was not,
+            # and it is read from the same window.
+            self.noise_spread_db = max(0.0, median - floor)
+        self._floor_measured = True
 
     def _effective_trailing_silence_s(self) -> float:
         """How much silence ends *this* utterance, scaled to how much was said.

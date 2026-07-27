@@ -1147,3 +1147,150 @@ def test_during_an_utterance_the_floor_may_fall_but_never_climb() -> None:
     for _ in range(300):  # the room itself drops away underneath them
         state._observe_room(-58.0)
     assert state.noise_floor_dbfs < settled - 10.0
+
+
+# ---------------------------------------------------------------------------
+# The room the capture is actually in — not the one it guessed at startup.
+# ---------------------------------------------------------------------------
+
+
+def room_and_speech(room_dbfs: float, speech_dbfs: float, seed: int = 11):
+    """A room at a given level, and a voice a given distance above it.
+
+    ``talk`` leaves the 20 ms inter-word gaps real speech has: the floor is the
+    quietest tenth of the recent window, so a voice with no gaps in it is not a
+    signal any of this was designed to read.
+    """
+
+    rng = np.random.default_rng(seed)
+    counter = {"n": 0}
+
+    def room() -> np.ndarray:
+        return frame(10 ** ((room_dbfs + rng.uniform(-1.5, 1.5)) / 20.0))
+
+    def talk() -> np.ndarray:
+        counter["n"] += 1
+        if counter["n"] % 4 == 0:
+            return room()
+        return frame(10 ** ((speech_dbfs + rng.uniform(-2.0, 2.0)) / 20.0))
+
+    return room, talk
+
+
+# WebRTC votes speech on ordinary room tone; this is that vote at its worst,
+# the same model the cross-room contract above uses.
+def always_speech(_samples, _sample_rate):
+    return True
+
+
+def test_the_floor_is_measured_even_when_the_turn_opens_on_speech() -> None:
+    """The starting guess must never survive the turn.
+
+    ``initial_noise_floor_dbfs`` is a guess made before the microphone was
+    open. The "floor may only fall while capturing" rule exists to stop a
+    *measured* floor climbing into the speaker's voice — applied to the guess
+    it pinned it instead, for the whole turn. Speech starts at 60 ms and the
+    noise window needs 240 ms to fill, so anyone who answered immediately
+    locked the guess in: measured in Ali's room, a floor of -60 dBFS against a
+    room actually at -47.
+    """
+
+    _room, talk = room_and_speech(room_dbfs=-47.0, speech_dbfs=-38.0)
+    state = AdaptiveCaptureState(
+        1_000,
+        config(initial_noise_floor_dbfs=-60.0, trailing_silence_s=1.6, max_duration_s=60.0),
+        always_speech,
+    )
+    # Talking from the very first frame, which is what used to pin it.
+    for _ in range(200):
+        state.feed(talk())
+
+    assert state.phase is CapturePhase.CAPTURING
+    assert state.noise_floor_dbfs > -55.0, (
+        f"floor still pinned near the guess: {state.noise_floor_dbfs:.1f}"
+    )
+
+
+def test_a_long_answer_still_closes_in_a_room_louder_than_the_guess() -> None:
+    """The reported bug: talk long enough and the turn never ends.
+
+    With the floor pinned below the room, the room's own tone keeps clearing
+    the gate, so trailing silence resets forever and only ``max_duration`` or a
+    hand on the menu bar can end the turn. Measured live at 44.20 s of speech
+    inside a 60.00 s capture that ended on ``max_duration`` with trailing
+    silence still reading 0.
+    """
+
+    for speech_seconds in (5.0, 20.0, 45.0):
+        room, talk = room_and_speech(room_dbfs=-47.0, speech_dbfs=-38.0)
+        state = AdaptiveCaptureState(
+            1_000,
+            config(
+                initial_noise_floor_dbfs=-60.0,
+                trailing_silence_s=1.6,
+                short_trailing_silence_s=0.6,
+                max_duration_s=300.0,
+            ),
+            always_speech,
+        )
+        for _ in range(round(speech_seconds / 0.02)):
+            assert state.feed(talk()).stop_reason is None, speech_seconds
+
+        closed_after = None
+        for index in range(round(30.0 / 0.02)):
+            if state.feed(room()).stop_reason is not None:
+                closed_after = (index + 1) * 0.02
+                break
+
+        assert closed_after is not None, f"{speech_seconds}s of speech never closed"
+        assert state._stop_reason is CaptureStopReason.TRAILING_SILENCE
+        # Ends on its own window, not on the hard cap.
+        assert closed_after < 4.0, f"{speech_seconds}s took {closed_after}s to close"
+
+
+def test_the_room_spread_is_not_learned_from_the_speaker() -> None:
+    """Spread means how restless the *room* is, and it sizes the speech gate.
+
+    A window full of speech measures the speaker's dynamic range instead —
+    median on the voice, floor on the gaps between words — which inflates the
+    required rise and lifts the gate above the very speech being measured.
+    """
+
+    rng = np.random.default_rng(5)
+    counter = {"n": 0}
+
+    def room() -> np.ndarray:
+        return frame(10 ** ((-47.0 + rng.uniform(-1.0, 1.0)) / 20.0))
+
+    def talk() -> np.ndarray:
+        # Every fifth frame is a breath — quieter than the room itself, which is
+        # what lets the floor keep falling. The floor guard only blocks a
+        # *climb*, so on this shape it never fires and the window is read every
+        # time; unguarded, the spread it reads is the voice, not the room.
+        counter["n"] += 1
+        if counter["n"] % 5 == 0:
+            return frame(10 ** (-58.0 / 20.0))
+        return frame(10 ** ((-28.0 + rng.uniform(-2.0, 2.0)) / 20.0))
+
+    state = AdaptiveCaptureState(
+        1_000,
+        # Patience well past the run, so this measures the gate rather than
+        # racing an endpoint decision.
+        config(trailing_silence_s=10.0, max_duration_s=60.0),
+        always_speech,
+    )
+    for _ in range(100):  # read the room first
+        state.feed(room())
+    settled = state._vad_required_rise_db()
+    for _ in range(500):  # then a long stretch of talking
+        state.feed(talk())
+
+    # The rise a VAD-endorsed frame must clear is what the gate is made of, so
+    # assert on it rather than on the statistic behind it. Read from the room it
+    # stays a few dB; read from the speaker it pins to max_vad_margin_db and the
+    # gate closes over the voice.
+    assert state._vad_required_rise_db() < settled + 4.0, (
+        f"required rise climbed from {settled:.1f} dB to "
+        f"{state._vad_required_rise_db():.1f} dB on speech "
+        f"(spread {state.noise_spread_db:.1f})"
+    )

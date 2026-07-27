@@ -57,19 +57,33 @@ Package is `src/voxmcp/`.
   no stored level, nothing to re-run when you move. The floor is the 10th
   percentile of a rolling 3 s window of raw loudness (speech has gaps; the
   quietest tenth is the room), and the rise real speech must clear is scaled
-  from how far the room wanders above it — bounded 3–15 dB. Read from *raw*
-  levels, never from frames a classifier already labelled: labelling first is
-  circular, so in a loud room every frame reads as speech and the floor never
-  rises to meet it. **During an utterance the floor may only fall** — talk for
-  longer than the window without pausing and its quietest tenth stops being the
-  room and becomes you, so the floor climbs into your voice and the turn
-  endpoints mid-word (Ali hit exactly this live). A *stationary* window is
-  exempt, since a flat level is a drone and must still be learned; speech
-  varies syllable to syllable and a fan does not. Verified across four
-  simulated rooms nearly 40 dB apart (silent bedroom → café), plus live: one
+  from how far the room wanders above it (`k × spread`, k = 3, bounded 3–15 dB).
+  Read from *raw* levels, never from frames a classifier already labelled:
+  labelling first is circular, so in a loud room every frame reads as speech and
+  the floor never rises to meet it. **During an utterance the floor may only
+  fall** — talk for longer than the window without pausing and its quietest
+  tenth stops being the room and becomes you, so the floor climbs into your
+  voice and the turn endpoints mid-word (Ali hit exactly this live). A
+  *stationary* window is exempt, since a flat level is a drone and must still be
+  learned; speech varies syllable to syllable and a fan does not. Verified across
+  four simulated rooms nearly 40 dB apart (silent bedroom → café), plus live: one
   word **7.24 s → 1.6 s capture** with nothing configured, beating the
   hand-tuned value it replaced. `VOX_MINIMUM_SPEECH_DBFS` is a hard backstop,
   not part of setup.
+- **That rule guards a floor that was measured, never the starting guess.**
+  Speech is confirmed at 60 ms but the window needs 240 ms to fill, so answering
+  the instant the mic opened used to lock the -60 dBFS guess in for the whole
+  turn. In a room actually at -47 that puts the gate 13 dB too low, the room's
+  own tone keeps reading as speech, trailing silence never accumulates and the
+  turn can only end at `max_duration` or by hand — measured live at 44.20 s of
+  speech inside a 60.00 s capture. The spread is guarded the same way and for
+  the same reason: read off a window full of speech it measures the speaker's
+  dynamic range, not the room's, and pins the required rise to its ceiling.
+  The rise multiplier is **3**, not 4: four was measured against rooms, not
+  voices, and in an ordinary 3 dB room it demands 12 dB — more headroom than
+  Ali's voice has over his own room (~8 dB), so his speech fell through the gate
+  in holes long enough to endpoint on. Three holds every room in the cross-room
+  contract at 0/200 false speech.
 - **Endpointing scales with the utterance.** Trailing silence runs 0.6s for a
   short answer and 1.6s for a long one, interpolated over 1.5s–3.0s of measured
   *speech* (not wall time, so pausing to think keeps a long answer on the long
@@ -263,7 +277,7 @@ full 1.6 s — and is never cut off mid-thought.
 | `com.vox.runtime` | ~73 MB | ~73 MB |
 | **total** | **~2.7 GB** | **~3.2 GB** |
 
-Tests: `.venv/bin/python -m pytest tests/` — **413 passing**.
+Tests: `.venv/bin/python -m pytest tests/` — **416 passing**.
 
 **Slash commands** (in `~/.claude/commands/`, global): `/speak` reads the
 agent's last reply aloud (no mic); `/listen` opens the mic for one utterance
