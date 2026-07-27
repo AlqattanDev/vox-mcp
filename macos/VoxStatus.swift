@@ -3,20 +3,46 @@ import AVFoundation
 import Carbon.HIToolbox
 import Foundation
 
-/// The global hotkeys Vox owns. All are ⌃⌥⌘ combos: Carbon can register those
-/// with no permission grant at all, which a bare Fn key (Wispr's default)
-/// cannot do without an event tap and Input Monitoring.
+/// The global hotkeys Vox owns: two combos on one key.
+///
+/// Both live on **§**, the key left of 1 — `kVK_ISO_Section`, verified to map to
+/// "§" under this machine's layout. Carbon registers these with no permission
+/// grant at all, which a bare Fn key (Wispr's default) cannot do without an event
+/// tap and Input Monitoring. ⌘ alone is enough for that — extra modifiers buy
+/// nothing here, so a key reached dozens of times a day costs two fingers.
+///
+///   ⌘§ tapped  talk to the agent — tap again to send
+///   ⌘§ held    dictate at the cursor, release to inject
+///   ⇧⌘§        read the selection aloud
+///
+/// Tap and hold share one key because they are the same intent — "take my
+/// voice" — differing only in where the words end up. `holdThreshold` is what
+/// tells them apart.
 struct HotKeyBinding {
     let id: UInt32
     let keyCode: UInt32
+    let modifiers: UInt32
     let label: String
 
-    static let reply = HotKeyBinding(id: 1, keyCode: UInt32(kVK_ANSI_R), label: "⌃⌥⌘R")
-    static let turn = HotKeyBinding(id: 2, keyCode: UInt32(kVK_ANSI_L), label: "⌃⌥⌘L")
-    static let dictate = HotKeyBinding(id: 3, keyCode: UInt32(kVK_ANSI_D), label: "⌃⌥⌘D")
-    static let read = HotKeyBinding(id: 4, keyCode: UInt32(kVK_ANSI_S), label: "⌃⌥⌘S")
+    /// How long ⌘§ must stay down before it counts as dictation rather than a
+    /// tap. Long enough that a deliberate tap is never mistaken for a hold,
+    /// short enough to be imperceptible on a key you meant to hold.
+    static let holdThreshold: TimeInterval = 0.35
 
-    static let all: [HotKeyBinding] = [.reply, .turn, .dictate, .read]
+    static let voice = HotKeyBinding(
+        id: 1,
+        keyCode: UInt32(kVK_ISO_Section),
+        modifiers: UInt32(cmdKey),
+        label: "⌘§"
+    )
+    static let read = HotKeyBinding(
+        id: 2,
+        keyCode: UInt32(kVK_ISO_Section),
+        modifiers: UInt32(cmdKey | shiftKey),
+        label: "⇧⌘§"
+    )
+
+    static let all: [HotKeyBinding] = [.voice, .read]
 }
 
 /// Reads whatever text is selected in the frontmost app.
@@ -115,45 +141,18 @@ enum SelectionReader {
 /// posting one key event per character is slow for a minute of dictation and
 /// breaks outright on Arabic, and writing `AXSelectedText` is unimplemented or
 /// read-only in Chromium and Electron — which is most of where the text is
-/// wanted. Every app with a Paste command works, and the pasteboard is
-/// restored so nothing the user had copied is lost.
+/// wanted. Every app with a Paste command works.
+///
+/// The transcript is **left on the pasteboard afterwards**. Restoring what was
+/// there before looks tidier and is worse: a paste into a surface with no
+/// editable field silently goes nowhere, and the words are then simply gone.
+/// Leaving them there means the fallback is always ⌘V.
 enum TextInjector {
     static func paste(_ text: String) {
         let pasteboard = NSPasteboard.general
-        let saved = snapshot(pasteboard)
-
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
         postCommandV()
-
-        // The paste is asynchronous in the receiving app; restoring the
-        // pasteboard too eagerly makes it paste whatever was there before.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-            restore(saved, to: pasteboard)
-        }
-    }
-
-    private static func snapshot(_ pasteboard: NSPasteboard) -> [[String: Data]] {
-        (pasteboard.pasteboardItems ?? []).map { item in
-            var stored: [String: Data] = [:]
-            for type in item.types {
-                if let data = item.data(forType: type) { stored[type.rawValue] = data }
-            }
-            return stored
-        }
-    }
-
-    private static func restore(_ saved: [[String: Data]], to pasteboard: NSPasteboard) {
-        pasteboard.clearContents()
-        guard !saved.isEmpty else { return }
-        let items: [NSPasteboardItem] = saved.map { stored in
-            let item = NSPasteboardItem()
-            for (raw, data) in stored {
-                item.setData(data, forType: NSPasteboard.PasteboardType(raw))
-            }
-            return item
-        }
-        pasteboard.writeObjects(items)
     }
 
     private static func postCommandV() {
@@ -178,6 +177,10 @@ final class LevelMeterView: NSView {
     /// Whether the mic is live. Idle draws a calm baseline in a muted colour;
     /// active draws in the system accent so it reads as "hearing you."
     var active = false { didSet { needsDisplay = true } }
+    /// Overrides the active colour. The HUD uses it to say where the words are
+    /// going — an agent turn and a dictation look identical otherwise, and which
+    /// one is running decides whether the text lands in the frontmost app.
+    var tint: NSColor? { didSet { needsDisplay = true } }
 
     override var intrinsicContentSize: NSSize { NSSize(width: NSView.noIntrinsicMetric, height: 30) }
     override var isFlipped: Bool { false }
@@ -203,7 +206,7 @@ final class LevelMeterView: NSView {
         let barWidth = max(2, (bounds.width - gap * CGFloat(count - 1)) / CGFloat(count))
         let midY = bounds.midY
         let maxHalf = bounds.height / 2 - 1
-        let color = active ? NSColor.controlAccentColor : NSColor.tertiaryLabelColor
+        let color = active ? (tint ?? NSColor.controlAccentColor) : NSColor.tertiaryLabelColor
         color.setFill()
         for (index, sample) in history.enumerated() {
             // A small floor keeps a visible resting waveform instead of a blank
@@ -243,11 +246,22 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var lastSpokenAgent: String?
     private var micLevel: CGFloat = 0
     private var hotKeyRefs: [EventHotKeyRef] = []
+    // ⌘§ is tap-or-hold, and which one it is cannot be known at key-down. The
+    // pending work item is the undecided state; the flag remembers that the
+    // press already resolved into a dictation so the release ends it.
+    private var voiceKeyHoldTimer: DispatchWorkItem?
+    private var voiceKeyBecameHold = false
+    private let hud = VoxHUD()
+    private let hudEnabled =
+        (ProcessInfo.processInfo.environment["VOX_HUD"] ?? "1").lowercased()
+        != "0"
     private var gateOpen = false
+    private var streamOpen = false
     private var dictating = false
 
     private var runtime: Process?
     private var timer: Timer?
+    private var pollInterval: TimeInterval = 0
     private var runtimeFailures: [Date] = []
     private var restartWorkItem: DispatchWorkItem?
     private var runtimeProbePending = false
@@ -305,8 +319,12 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         )
         // Poll fast so the menu-bar glyph tracks the real mic state almost
         // instantly instead of lagging a second behind what the mic is doing.
-        timer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
-            self?.refreshStatus()
+        setPollInterval(0.4)
+        // Clicking the pill ends the turn, exactly as a left-click on the menu
+        // bar glyph does — the cue you are looking at should also be the control.
+        hud.onTap { [weak self] in
+            guard let self, self.microphoneOpen, !self.controlInFlight, !self.dictating else { return }
+            self.endTurn()
         }
         registerHotKeys()
         refreshStatus()
@@ -317,9 +335,6 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // grant), usable from any app. Carbon delivers both pressed and released,
     // so hold-to-talk works without a grant too. A bare Fn key is not
     // registrable this way; use combos, do not chase Fn.
-    //
-    //   ⌃⌥⌘R  reply to whoever last spoke   (press)
-    //   ⌃⌥⌘L  turn key: talk / send         (press, toggles)
     private func registerHotKeys() {
         var eventTypes = [
             EventTypeSpec(
@@ -361,12 +376,11 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             Unmanaged.passUnretained(self).toOpaque(),
             nil
         )
-        let modifiers = UInt32(controlKey | optionKey | cmdKey)
         for binding in HotKeyBinding.all {
             var reference: EventHotKeyRef?
             RegisterEventHotKey(
                 binding.keyCode,
-                modifiers,
+                binding.modifiers,
                 EventHotKeyID(signature: OSType(0x564F_5858), id: binding.id),  // 'VOXX'
                 GetApplicationEventTarget(),
                 0,
@@ -378,25 +392,46 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     func hotKeyFired(id: UInt32, pressed: Bool) {
         switch id {
-        case HotKeyBinding.reply.id:
-            guard pressed else { return }
-            // Ignore while the mic is already live or a control is mid-flight;
-            // the reply capture would just collide with the active turn.
-            guard !microphoneOpen, !controlInFlight else { return }
-            replyToLastSpeaker()
-        case HotKeyBinding.turn.id:
-            guard pressed else { return }
-            toggleTurnGate()
-        case HotKeyBinding.dictate.id:
-            // The one binding that is a hold, not a tap: the key IS the
-            // utterance boundary, so there is no endpointing to get wrong.
-            if pressed { beginDictation() } else { endDictation() }
+        case HotKeyBinding.voice.id:
+            if pressed { voiceKeyDown() } else { voiceKeyUp() }
         case HotKeyBinding.read.id:
             guard pressed else { return }
             readSelectionAloud()
         default:
             return
         }
+    }
+
+    // ⌘§ down: nothing happens yet, because what it means is not yet known.
+    // Dictation is committed to only once the key has been held past the
+    // threshold — before that it could still be a tap, and starting a dictation
+    // on every press would open the microphone for something the user is about
+    // to turn into an agent turn instead.
+    private func voiceKeyDown() {
+        guard voiceKeyHoldTimer == nil, !voiceKeyBecameHold else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.voiceKeyHoldTimer = nil
+            self.voiceKeyBecameHold = true
+            self.beginDictation()
+        }
+        voiceKeyHoldTimer = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + HotKeyBinding.holdThreshold, execute: work)
+    }
+
+    // ⌘§ up: whichever way the press resolved, end it that way.
+    private func voiceKeyUp() {
+        if let pending = voiceKeyHoldTimer {
+            // Released before the threshold — it was a tap.
+            pending.cancel()
+            voiceKeyHoldTimer = nil
+            voiceKeyBecameHold = false
+            toggleTurnGate()
+            return
+        }
+        guard voiceKeyBecameHold else { return }
+        voiceKeyBecameHold = false
+        endDictation()
     }
 
     // Press to hear the selection; press again to stop. Verbatim — the runtime
@@ -449,6 +484,11 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // While the panel is open, poll fast enough that the waveform reads as live;
     // when it closes, drop back to the lighter glyph-tracking cadence.
     private func setPollInterval(_ interval: TimeInterval) {
+        // Called from every status refresh, so it has to be a no-op when the
+        // cadence has not actually changed — otherwise the timer is torn down
+        // and rebuilt several times a second.
+        guard interval != pollInterval || timer == nil else { return }
+        pollInterval = interval
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             self?.refreshStatus()
@@ -543,10 +583,9 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     // Clicking outside dismisses a transient popover without routing through
-    // togglePanel; drop back to the light poll cadence here so the fast
-    // waveform polling never keeps running with the panel closed.
+    // togglePanel; refresh so the cadence is recomputed now the panel is gone.
     func popoverDidClose(_ notification: Notification) {
-        setPollInterval(0.4)
+        updatePresentation()
     }
 
     // A left-click while the mic is live ends the turn immediately — the fix for
@@ -568,11 +607,10 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard let button = statusItem.button else { return }
         if popover.isShown {
             popover.performClose(nil)
-            setPollInterval(0.4)
-        } else {
             updatePresentation()
+        } else {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            setPollInterval(0.08)
+            updatePresentation()
             refreshStatus()
         }
     }
@@ -700,6 +738,7 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     self.detail = error.localizedDescription
                     self.microphoneOpen = false
                     self.gateOpen = false
+                    self.streamOpen = false
                     self.updatePresentation()
                     if self.runtime == nil { self.startChildRuntime() }
                     return
@@ -720,6 +759,10 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 // tap from leaving the toggle inverted forever.
                 self.gateOpen = (payload["gate_open"] as? Bool) ?? self.microphoneOpen
                 self.micArmedForBargeIn = (payload["mic_armed_for_barge_in"] as? Bool) ?? false
+                // The device, as distinct from the gate. A stream open with the
+                // gate shut is the warm-up window: the macOS microphone
+                // indicator is lit but nothing can be heard yet.
+                self.streamOpen = (payload["stream_open"] as? Bool) ?? false
                 self.micLevel = CGFloat((payload["mic_level"] as? Double) ?? 0)
                 self.detail = (payload["detail"] as? String) ?? "Local-only runtime connected"
                 self.lastStopReason = payload["last_stop_reason"] as? String
@@ -789,6 +832,13 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             meterView.settle()
         }
 
+        // The pill's waveform has to read as live, so poll fast whenever it — or
+        // the panel — is on screen, and fall back to the light glyph-tracking
+        // cadence the moment neither is.
+        let hudShowing = hudEnabled ? hudState(normalized: normalized) : nil
+        if hudEnabled { hud.apply(hudShowing, level: micLevel) }
+        setPollInterval(hudShowing != nil || popover.isShown ? 0.08 : 0.4)
+
         detailLabel.stringValue = meterCaption(normalized)
 
         // Modes as one native segmented control; the active segment is selected.
@@ -798,6 +848,22 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         applyPrimaryButton(normalized: normalized)
         repeatButton.isEnabled = !controlInFlight && !["offline", "off"].contains(normalized)
         moreButton.isEnabled = !controlInFlight
+    }
+
+    /// What the floating pill should show, or nil to hide it.
+    ///
+    /// Only the states worth interrupting the screen for. Everything else —
+    /// idle, thinking, paused, offline — is the menu bar's job, and a pill that
+    /// hung around for those would stop meaning anything.
+    private func hudState(normalized: String) -> HUDState? {
+        if dictating { return .dictating }
+        if microphoneOpen { return .listening }
+        if normalized == "speaking" { return .speaking }
+        // The device is up but deaf: the stream-open guard is being waited out.
+        // Shown so that first second reads as warm-up rather than as a key press
+        // that did nothing at all.
+        if streamOpen && !gateOpen { return .warming }
+        return nil
     }
 
     // A short, human caption under the waveform — what Vox is doing right now,
@@ -1038,7 +1104,7 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // permission is missing.
         guard ensureAccessibility(for: "dictation") else { return }
         dictating = true
-        sendControl("dictate_start", notice: "Dictating — release ⌃⌥⌘D to type it.", serialized: false)
+        sendControl("dictate_start", notice: "Dictating — release ⌘§ to type it.", serialized: false)
     }
 
     private func endDictation() {
@@ -1054,7 +1120,9 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 return
             }
             TextInjector.paste(text)
-            self.actionNotice = "Typed \(text.count) characters."
+            // Says "and on your clipboard" because that is the recovery path when
+            // the paste had nowhere to land, and it is only useful if known.
+            self.actionNotice = "Typed \(text.count) characters — and on your clipboard."
             self.updatePresentation()
         }
     }
@@ -1083,10 +1151,10 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         case "cycle_mode": return "Mode cycled. Talk = both · Narrate = agent speaks · Dictate = you only."
         case "note": return "Listening for your note — speak now, then you can walk away."
         case "reply": return "Listening for your reply — speak now, then you can walk away."
-        case "gate_open": return "Listening. Take your time — press ⌃⌥⌘L again to send."
+        case "gate_open": return "Listening. Take your time — press ⌘§ again to send."
         case "gate_close": return "Got it. Recording closed; transcribing what you said."
-        case "dictate_start": return "Dictating — release ⌃⌥⌘D to type it."
-        case "read_aloud": return "Reading your selection. Press ⌃⌥⌘S again to stop."
+        case "dictate_start": return "Dictating — release ⌘§ to type it."
+        case "read_aloud": return "Reading your selection. Press ⇧⌘§ again to stop."
         case "repeat": return "Replaying the agent's last speech."
         default: return "Vox control applied."
         }

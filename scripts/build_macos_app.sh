@@ -17,6 +17,7 @@ mkdir -p "$MACOS"
   -framework AVFoundation \
   -framework Carbon \
   "$ROOT/macos/VoxStatus.swift" \
+  "$ROOT/macos/VoxHUD.swift" \
   -o "$MACOS/VoxStatus"
 /bin/cp "$ROOT/macos/Info.plist" "$CONTENTS/Info.plist"
 # macOS pins TCC grants to the code signature. Ad-hoc signing mints a new

@@ -35,7 +35,8 @@ from .audio import (
 )
 from .capture_source import PersistentCaptureSource
 from .compat import LegacyCompatibility
-from .dictation import clean_dictation
+from .dictation import Runner as ClipboardRunner
+from .dictation import clean_dictation, copy_to_clipboard
 from .companion import COMPANION_AGENT, ask_companion
 from .config import VoxConfig
 from .diagnostics import static_diagnostics
@@ -193,20 +194,40 @@ class VoxEngine:
             "VOX_BARGE_IN_REQUIRE_HEADPHONES", "1"
         ).strip().lower() not in {"0", "false", "no", "off"}
 
-        # One capture stream per session instead of one per listen. Opening a
-        # stream is what produces the Bluetooth HFP transient that used to open
-        # turns nobody started, so the fix is to stop doing it between turns and
-        # drop frames at the callback whenever no capture is attached.
+        # One capture stream per *turn*, shared by everything inside that turn,
+        # instead of one per listen. Opening a stream is what produces the
+        # Bluetooth HFP transient that used to open turns nobody started, so the
+        # fix is to stop doing it between the armed capture and the listen that
+        # follows it — and to drop frames at the callback whenever no capture is
+        # attached.
         self._persistent_capture = os.environ.get(
             "VOX_PERSISTENT_CAPTURE", "1"
         ).strip().lower() not in {"0", "false", "no", "off"}
         # The transient arrives ~240 ms after the stream engages and decays over
         # ~350 ms. Half a second was measured to be too short — onset still
-        # fired 513 ms after open on the FreeClip — and this is waited out once
-        # per session, before the cue that says the microphone is live.
+        # fired 513 ms after open on the FreeClip — and this is waited out
+        # before the cue that says the microphone is live.
         self._stream_open_guard_s = max(
             0.0, float(os.environ.get("VOX_STREAM_OPEN_GUARD_SECONDS", "1.0"))
         )
+        # How long the device stays open after the last capture lets go.
+        #
+        # This is not a grace period for idling: macOS lights its microphone
+        # indicator for as long as an input device is open and knows nothing
+        # about our software gate, so a stream that outlives the turn is a
+        # permanently lit dot with no honest meaning. The linger exists only so
+        # the hand-off from an armed barge-in capture to the listen that follows
+        # it inside one turn does not close and reopen the device in between.
+        self._stream_idle_release_s = max(
+            0.0, float(os.environ.get("VOX_STREAM_IDLE_RELEASE_SECONDS", "2.0"))
+        )
+        # Leave every spoken transcript on the clipboard, so a dictation that
+        # landed in no text field at all is still recoverable with ⌘V.
+        self._clipboard_transcript = os.environ.get(
+            "VOX_CLIPBOARD_TRANSCRIPT", "1"
+        ).strip().lower() not in {"0", "false", "no", "off"}
+        # Overridden by tests so the suite never writes to the real clipboard.
+        self._clipboard_runner: ClipboardRunner | None = None
         # Hold-to-talk dictation. The cap is a backstop for a key that never
         # came up, not a limit anyone should reach by talking.
         self._dictation_max_s = min(
@@ -239,6 +260,11 @@ class VoxEngine:
         self._last_spoken_agent: str | None = None
         self._audio_tempdir: tempfile.TemporaryDirectory[str] | None = None
         self._source: PersistentCaptureSource | None = None
+        # How many captures currently need the device. Zero means the device is
+        # released, which is the only state in which macOS stops showing the
+        # microphone indicator.
+        self._source_holds = 0
+        self._source_release_task: asyncio.Task[Any] | None = None
         self._dictation_control: CaptureControl | None = None
         self._dictation_future: asyncio.Future[Any] | None = None
         # Only set when dictation had to open a stream of its own, which it
@@ -730,7 +756,14 @@ class VoxEngine:
         self._log("barge_in.detected", client_id=self._active_client)
 
     async def _ensure_source(self) -> PersistentCaptureSource | None:
-        """Open the session's capture stream, or return None to capture per-turn.
+        """Open the capture stream and take a hold on it, or return None.
+
+        **Every non-None return is a hold the caller owns and must hand back
+        with `_release_source`**, exactly like a lock. That is what keeps the
+        device's lifetime tied to the turn instead of the session: while holds
+        are outstanding the stream stays up, so an armed barge-in capture and
+        the listen that follows it share one open; when the last one lets go the
+        device is released and macOS stops showing the microphone indicator.
 
         A stream that will not open must never take voice down with it: the
         caller falls back to the old open-per-listen path, which still works,
@@ -739,13 +772,16 @@ class VoxEngine:
 
         if not self._persistent_capture:
             return None
+        if not isinstance(self.recorder, AudioRecorder):
+            # An injected fake recorder owns its own frames; leave it alone.
+            return None
+        # Taken before the open so a release scheduled by the previous turn
+        # cannot close the device out from under this one mid-open.
+        self._hold_source()
         with self._active_lock:
             source = self._source
         if source is not None and source.stream_open:
             return source
-        if not isinstance(self.recorder, AudioRecorder):
-            # An injected fake recorder owns its own frames; leave it alone.
-            return None
         source = PersistentCaptureSource(
             self.recorder.config,
             device=self.input_device,
@@ -761,17 +797,71 @@ class VoxEngine:
             await asyncio.to_thread(source.open)
         except AudioError as exc:
             self._log("capture.stream_failed", error=str(exc))
+            self._release_source()
             return None
         with self._active_lock:
             self._source = source
         return source
 
+    def _hold_source(self) -> None:
+        """Claim the device for one capture, cancelling any pending release."""
+
+        with self._active_lock:
+            self._source_holds += 1
+            pending = self._source_release_task
+            self._source_release_task = None
+        if pending is not None:
+            pending.cancel()
+
+    def _release_source(self) -> None:
+        """Hand the device back. The last release schedules the close.
+
+        Safe to call from a future's done-callback, which is where every capture
+        actually finishes.
+        """
+
+        with self._active_lock:
+            if self._source_holds > 0:
+                self._source_holds -= 1
+            remaining = self._source_holds
+            if remaining > 0 or self._source is None:
+                return
+            if self._source_release_task is not None:
+                return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No loop to schedule on (a worker thread at shutdown). The stream
+            # is closed by pause/stop or by the next release that has one.
+            return
+        task = loop.create_task(self._release_source_after_linger())
+        with self._active_lock:
+            self._source_release_task = task
+
+    async def _release_source_after_linger(self) -> None:
+        try:
+            if self._stream_idle_release_s > 0:
+                await asyncio.sleep(self._stream_idle_release_s)
+        except asyncio.CancelledError:
+            return
+        with self._active_lock:
+            self._source_release_task = None
+            if self._source_holds > 0:
+                # Someone claimed the device while we were waiting.
+                return
+        await self._close_source()
+
     async def _close_source(self) -> None:
-        """Tear the session stream down — the privacy stop, not the gate."""
+        """Tear the capture stream down — the privacy stop, not the gate."""
 
         with self._active_lock:
             source = self._source
             self._source = None
+            self._source_holds = 0
+            pending = self._source_release_task
+            self._source_release_task = None
+        if pending is not None:
+            pending.cancel()
         if source is None:
             return
         await asyncio.to_thread(source.close)
@@ -837,6 +927,8 @@ class VoxEngine:
             self._barge_in_future = future
 
         def microphone_closed(_future: asyncio.Future[Any]) -> None:
+            if source is not None:
+                self._release_source()
             with self._active_lock:
                 self._microphone_active = False
                 self._microphone_closing = False
@@ -1278,39 +1370,49 @@ class VoxEngine:
         with self._active_lock:
             self._capture_control = control
         source = await self._ensure_source()
-        if source is not None:
-            # Hold the gate shut across the cue. The cue is played through the
-            # same headset the microphone is in, and on a fresh stream the
-            # Bluetooth open transient has not finished decaying yet — letting
-            # either into the endpointer is how a turn opens on a sound nobody
-            # made. Waiting the guard out here is also what makes the rising
-            # blip honest: it means "I can hear you now", not "soon".
-            source.close_gate()
-            remaining = source.guard_remaining_s
-            if remaining > 0:
-                await asyncio.sleep(remaining)
-        if not (control.cancelled or control.manual_end_requested or control.text_delivered):
-            # Never announce an open microphone to someone who already closed it.
-            await self._play_listen_start_cue()
-        loop = asyncio.get_running_loop()
-        selected_recorder = recorder or self.recorder
-        if source is not None:
-            # The gate is what "the microphone is open" now means: the stream
-            # outlives the turn, but frames only exist while a capture holds it.
-            source.open_gate()
-            future = loop.run_in_executor(
-                None,
-                lambda: selected_recorder.capture_from_frames(
-                    source.frames(control),
-                    source.sample_rate,
-                    control=control,
-                ),
-            )
-        else:
-            future = loop.run_in_executor(
-                None,
-                lambda: selected_recorder.capture(device=self.input_device, control=control),
-            )
+        # Everything between taking the hold and attaching the done-callback that
+        # gives it back can raise or be cancelled — the guard sleep and the cue
+        # both await. A hold leaked there would pin the device open for the rest
+        # of the session, which is the exact failure being fixed.
+        try:
+            if source is not None:
+                # Hold the gate shut across the cue. The cue is played through
+                # the same headset the microphone is in, and on a fresh stream
+                # the Bluetooth open transient has not finished decaying yet —
+                # letting either into the endpointer is how a turn opens on a
+                # sound nobody made. Waiting the guard out here is also what
+                # makes the rising blip honest: "I can hear you now", not "soon".
+                source.close_gate()
+                remaining = source.guard_remaining_s
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+            if not (control.cancelled or control.manual_end_requested or control.text_delivered):
+                # Never announce an open microphone to someone who already closed it.
+                await self._play_listen_start_cue()
+            loop = asyncio.get_running_loop()
+            selected_recorder = recorder or self.recorder
+            if source is not None:
+                # The gate is what "the microphone is open" now means: frames
+                # only exist while a capture holds it.
+                source.open_gate()
+                future = loop.run_in_executor(
+                    None,
+                    lambda: selected_recorder.capture_from_frames(
+                        source.frames(control),
+                        source.sample_rate,
+                        control=control,
+                    ),
+                )
+            else:
+                future = loop.run_in_executor(
+                    None,
+                    lambda: selected_recorder.capture(device=self.input_device, control=control),
+                )
+        except BaseException:
+            if source is not None:
+                source.close_gate()
+                self._release_source()
+            raise
         with self._active_lock:
             self._microphone_active = True
             self._microphone_closing = False
@@ -1318,6 +1420,9 @@ class VoxEngine:
         def microphone_closed(_future: asyncio.Future[Any]) -> None:
             if source is not None:
                 source.close_gate()
+                # Shutting the gate is not enough to put the macOS indicator
+                # out; the device has to go too.
+                self._release_source()
             with self._active_lock:
                 self._microphone_active = False
                 self._microphone_closing = False
@@ -1546,6 +1651,14 @@ class VoxEngine:
             turn_id=turn_id,
             delivered=False,
         )
+        if (
+            self._clipboard_transcript
+            and capture.reason is not CaptureStopReason.DELIVERED_TEXT
+        ):
+            # Everything spoken is left on the clipboard, so a turn the user
+            # meant to land somewhere can always be pasted by hand. Skipped for
+            # delivered text, which the user typed and already has.
+            copy_to_clipboard(transcript, runner=self._clipboard_runner)
         return transcript, turn_id, classify_spoken_intent(transcript)
 
     async def _heard_result(
@@ -1818,6 +1931,8 @@ class VoxEngine:
             listening = self._capture_control is not None
             target = self._last_spoken_agent
         if listening:
+            # The listen already holds the device; this tap only opened its gate.
+            self._release_source()
             self._log("gate.opened", client_id=client_id, started_turn=False)
             return {
                 "status": "gate_opened",
@@ -1840,6 +1955,10 @@ class VoxEngine:
         # Without a strong reference the loop may collect the task mid-capture.
         self._detached_turns.add(task)
         task.add_done_callback(self._detached_turns.discard)
+        # Held until the turn this tap started is actually under way. The turn's
+        # own _capture_once takes a hold of its own; the linger covers the gap
+        # between this release and that claim.
+        task.add_done_callback(lambda _task: self._release_source())
         self._log("gate.opened", client_id=client_id, started_turn=True)
         return {
             "status": "gate_opened",
@@ -1890,23 +2009,36 @@ class VoxEngine:
             await asyncio.to_thread(source.open)
             owned = True
 
-        source.close_gate()
-        remaining = source.guard_remaining_s
-        if remaining > 0:
-            await asyncio.sleep(remaining)
+        # Deliberately *not* waiting out the stream-open guard, unlike a spoken
+        # turn. The guard exists to stop the Bluetooth open transient from
+        # satisfying speech onset, and dictation runs capture_raw_from_frames,
+        # which has no onset detection to fool — the pop just reaches Whisper as
+        # a click, which it handles. Waiting here would instead cost a full
+        # second of dead air on a key the user is already talking into, and eat
+        # their first word every single time.
         source.open_gate()
-        destination = self.store.new_work_path("stt")
         held = source
-        future = loop.run_in_executor(
-            None,
-            lambda: recorder.capture_raw_from_frames(
-                held.frames(control),
-                held.sample_rate,
-                destination=destination,
-                control=control,
-                max_duration_s=self._dictation_max_s,
-            ),
-        )
+        try:
+            destination = self.store.new_work_path("stt")
+            future = loop.run_in_executor(
+                None,
+                lambda: recorder.capture_raw_from_frames(
+                    held.frames(control),
+                    held.sample_rate,
+                    destination=destination,
+                    control=control,
+                    max_duration_s=self._dictation_max_s,
+                ),
+            )
+        except BaseException:
+            # Nothing will ever call the done-callback that gives the device
+            # back, so hand it back here or the indicator stays lit.
+            held.close_gate()
+            if owned:
+                await asyncio.to_thread(held.close)
+            else:
+                self._release_source()
+            raise
         with self._active_lock:
             self._dictation_control = control
             self._dictation_future = future
@@ -1916,6 +2048,13 @@ class VoxEngine:
 
         def microphone_closed(_future: asyncio.Future[Any]) -> None:
             held.close_gate()
+            if not owned:
+                # Dictation used to hand a shared stream back still *open* and
+                # nothing ever closed it, so a single hold-to-talk press left the
+                # macOS microphone indicator lit until the next pause or stop —
+                # with no session running and the gate shut. Releasing here
+                # covers the key-released path and the max-duration path alike.
+                self._release_source()
             with self._active_lock:
                 self._microphone_active = False
                 self._microphone_closing = False
@@ -2723,7 +2862,7 @@ class VoxEngine:
             "version": "0.1.0",
             "local_only": True,
             "microphone_open": session["microphone_open"],
-            # With a session-lived stream these two stop being the same thing:
+            # The gate and the device are not the same thing:
             # gate_open is whether audio can reach Whisper, stream_open is
             # merely whether the device is held. The glyph tracks the gate.
             "gate_open": self.gate_open,

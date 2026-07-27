@@ -85,8 +85,8 @@ Read `io_mode` from status. Panel or `voice_session(set_mode|cycle_mode)` sets i
 ## User-initiated reply (they grab the turn)
 
 Even when you did not open the mic, the user can answer on their own terms — a
-**Reply** button in the panel or the global hotkey **⌃⌥⌘R** opens the mic and
-captures one utterance, auto-addressed to whoever last spoke. It surfaces as
+**Reply** button in the panel or a tap of the global hotkey **⌘§** opens the mic
+and captures one utterance, auto-addressed to whoever last spoke. It surfaces as
 `undelivered_heard` (`kind == "note"`) in that agent's status, so treat it like
 any addressed note: whenever you see `undelivered_heard.present`, claim it and
 act on it. This is how the user replies after you have already hung up.

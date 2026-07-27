@@ -55,12 +55,18 @@ def speech_vote(samples: np.ndarray, _sample_rate: int) -> bool:
 
 def test_capture_config_enforces_safety_bounds() -> None:
     defaults = CaptureConfig(save_latest=False, latest_wav_path=None)
-    assert defaults.onset_timeout_s == 15.0
+    # Five, not fifteen: this is how long the microphone stays open after the
+    # agent stops speaking, and a fifteen-second window is fifteen seconds in
+    # which the room can interrupt an agent that has gone back to work.
+    assert defaults.onset_timeout_s == 5.0
     assert defaults.trailing_silence_s == 1.6
     assert defaults.min_duration_s == 0.5
     assert defaults.max_duration_s == 75.0
     assert defaults.pre_roll_s == 0.3
 
+    # Fifteen stays reachable deliberately; above it does not.
+    assert CaptureConfig(onset_timeout_s=15.0).onset_timeout_s == 15.0
+    assert CaptureConfig(onset_timeout_s=None).onset_timeout_s is None
     with pytest.raises(ValueError, match="onset_timeout"):
         CaptureConfig(onset_timeout_s=15.01)
     with pytest.raises(ValueError, match="max_duration"):

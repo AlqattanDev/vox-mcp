@@ -5,11 +5,16 @@ reconstruction: strip the annotations it writes about the audio, drop the
 filler words nobody means to type, and make sure the result reads as a
 sentence.  Everything here is a local regex — no model, no network, and no
 rewriting of what was actually said.
+
+Also home to the clipboard hand-off, because getting text out of Vox and into
+whatever the user is actually looking at is the same job.
 """
 
 from __future__ import annotations
 
 import re
+import subprocess
+from typing import Callable, Sequence
 
 from .intents import is_non_speech_transcript
 
@@ -82,3 +87,32 @@ def clean_dictation(text: str | None, *, mode: str = "rules") -> str:
     if cleaned[-1] not in _TERMINAL:
         cleaned += "."
     return cleaned
+
+
+Runner = Callable[[Sequence[str], bytes], object]
+
+
+def _pbcopy(argv: Sequence[str], payload: bytes) -> object:
+    return subprocess.run(list(argv), input=payload, check=True, timeout=5.0)
+
+
+def copy_to_clipboard(text: str, *, runner: Runner | None = None) -> bool:
+    """Put ``text`` on the system clipboard.  False if it could not be done.
+
+    So that anything Vox heard is recoverable with ⌘V — a dictation that landed
+    in a surface with no editable field pastes nothing and used to be simply
+    gone, and a spoken turn was only ever readable inside the agent's reply.
+
+    ``pbcopy`` rather than an AppKit call because the runtime is a plain Python
+    process with no NSApplication, and rather than a PyObjC dependency for one
+    write.  A failure is never worth taking a turn down for: the transcript has
+    already been delivered by the time this runs.
+    """
+
+    if not text.strip():
+        return False
+    try:
+        (runner or _pbcopy)(("pbcopy",), text.encode("utf-8"))
+    except Exception:
+        return False
+    return True

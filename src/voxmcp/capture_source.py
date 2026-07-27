@@ -10,11 +10,17 @@ on a pop nobody made.  Whisper then returns non-speech and the window closes
 around 0.9 s — while the user's actual words land in the dead air between two
 phantom windows.
 
-The fix is to stop opening streams.  This source opens one stream per session
-and puts a gate in front of it: while the gate is closed the realtime callback
-drops frames on the floor, so nothing is queued, buffered, or classified, and
-"deaf" genuinely means deaf.  Frames only exist while the user has said they
-are talking.
+The fix is to open one stream per *turn* and share it with everything inside
+that turn, with a gate in front of it: while the gate is closed the realtime
+callback drops frames on the floor, so nothing is queued, buffered, or
+classified, and "deaf" genuinely means deaf.  Frames only exist while the user
+has said they are talking.
+
+The stream's lifetime is owned by the engine, which holds it for as long as some
+capture needs it and closes it once none does.  That matters because macOS lights
+its microphone indicator for an open input *device* and knows nothing about this
+gate, so a stream kept open across a whole session is an indicator burning with
+no honest meaning.
 
 The gate is *not* the same thing as ``pause``/``mute``, which tear the stream
 down entirely and block until the device confirms closure.  That remains the
@@ -52,7 +58,7 @@ EventSink = Callable[..., Any]
 
 
 class PersistentCaptureSource:
-    """A session-lived microphone stream that only passes audio when gated open."""
+    """A microphone stream that only passes audio while a capture holds the gate."""
 
     def __init__(
         self,

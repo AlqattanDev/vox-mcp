@@ -21,37 +21,55 @@ So there are two questions, and `/health` answers them separately:
 
 ## When Vox can hear you
 
-| Situation | Gate | Stream |
+Two separate things, and the difference is the whole design. The **gate** is
+whether audio reaches the endpointer and Whisper. The **device** is whether an
+input stream is open — which is what macOS puts its orange microphone indicator
+up for, and macOS knows nothing about our gate. So the device's lifetime is the
+*turn's*, not the session's: a stream that outlived the turn was an indicator
+burning with no honest meaning.
+
+| Situation | Gate | Device |
 |---|---|---|
 | Vox runtime starts | Shut | Closed |
-| A voice session starts | Shut; state becomes `IDLE` | Open |
-| Between turns, however long | Shut | Open |
-| `speak` or `converse(..., wait_for_response=false)` | Shut | Open |
-| `converse(..., wait_for_response=true)` | Opens only after playback has fully drained | Open |
-| `converse(...)` with barge-in enabled | Armed *during* playback, gated against Vox's own voice, so talking interrupts | Open |
-| `listen` | Opens for one bounded turn | Open |
-| **⌃⌥⌘L** (first tap) | Opens, with no onset timeout — the key said you are talking | Open |
-| **⌃⌥⌘L** (second tap) | Shuts; the turn is transcribed and submitted | Open |
-| **⌃⌥⌘D** held | Open for exactly as long as the key is down | Open |
-| **⌃⌥⌘S** | Shut — read-aloud never listens | Unchanged |
+| A voice session starts | Shut; state becomes `IDLE` | Closed |
+| Between turns, and while the agent works | Shut | Closed |
+| `speak` or `converse(..., wait_for_response=false)` | Shut | Closed |
+| `converse(..., wait_for_response=true)` | Opens only after playback has fully drained | Open for the turn |
+| `converse(...)` with barge-in enabled | Armed *during* playback, gated against Vox's own voice, so talking interrupts | Open, shared with the listen that follows |
+| `listen` | Opens for one bounded turn | Open for the turn |
+| **⌘§** (first tap) | Opens, with no onset timeout — the key said you are talking | Open |
+| **⌘§** (second tap) | Shuts; the turn is transcribed and submitted | Released |
+| **⌘§** held | Open for exactly as long as the key is down | Open for the hold |
+| **⇧⌘§** | Shut — read-aloud never listens | **Closed** |
 | The user says a short standalone “wait” phrase | Shut during the wait, then reopened for a fresh bounded turn | Open |
-| No speech arrives within the onset timeout | Shut; session remains `IDLE` | Open |
-| Speech ends | Shut after adaptive trailing silence | Open |
+| No speech arrives within the 5 s onset timeout | Shut; session remains `IDLE` | Released |
+| Speech ends | Shut after adaptive trailing silence | Released |
 | Pause, mute, stop, Escape/cancel, sleep, screen lock, route loss, or request cancellation | Shut immediately | **Closed** |
 
 There is no ambient listening. Starting the runtime, connecting an MCP client,
 or leaving a voice session active never opens the gate — and with the gate shut,
 an open stream delivers nothing to anything.
 
-The first turn after a stream opens waits out a **1.0 s guard** before the gate
-opens, because a Bluetooth headset emits a decaying transient for roughly the
-first 600 ms of any capture. The rising cue plays *after* that wait, so the blip
-means “I can hear you now,” not “soon.”
+“Released” means the device closes once nothing needs it, after a **2 s linger**
+(`VOX_STREAM_IDLE_RELEASE_SECONDS`). The linger is not a grace period for
+idling: it exists so the hand-off from an armed barge-in capture to the listen
+that follows it inside one turn does not close and reopen the device in between.
+Consecutive turns inside it share one open; anything longer and the indicator
+goes out.
+
+Each turn waits out a **1.0 s guard** before the gate opens, because a Bluetooth
+headset emits a decaying transient for roughly the first 600 ms of any capture.
+The rising cue plays *after* that wait, so the blip means “I can hear you now,”
+not “soon.” Dictation is the exception and skips it: the raw path has no onset
+detection for a transient to fool, so waiting would only eat the first word of a
+key you are already talking into.
 
 Default turn bounds are deliberately generous for this user’s speaking style:
 
 - 300 ms pre-roll so first syllables survive detection.
-- 15 seconds to begin speaking.
+- 5 seconds to begin speaking — this is the window that stays open after the
+  agent stops, and fifteen was fifteen seconds in which the room could interrupt
+  an agent that had gone back to work.
 - 0.6 to 1.6 seconds of trailing silence to end an utterance, scaled to how much
   was actually said (see below).
 - Up to 75 seconds for a long dictated turn.
@@ -138,7 +156,7 @@ recognisably headphones, reporting `shared_output` instead of interrupting
 itself. Plug in AirPods and it arms; unplug them and it stops. Nothing to
 configure, and `VOX_BARGE_IN_REQUIRE_HEADPHONES=0` overrides it deliberately.
 
-On speakers the **Reply button and ⌃⌥⌘R** are the interruption path: same
+On speakers the **Reply button, or a ⌘§ tap**, is the interruption path: same
 outcome, no acoustics involved.
 
 Off by default. `VOX_BARGE_IN_ENABLED=1` opens the microphone alongside

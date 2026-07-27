@@ -17,15 +17,20 @@ loopback address; Vox refuses to start if they do not.
   second agent — or one agent's own next `converse` — waits its turn rather
   than losing the reply. Waiting is bounded at 30s, and `cancel`/`stop` drain
   the queue instead of orphaning it.
-- One capture stream per session with a software gate in front of it, rather
-  than a stream opened and closed around every turn. Audio reaches the
-  endpointer and Whisper only while the gate is open — which is only while a
-  turn is actually running. With the gate shut, frames are dropped in the
-  realtime callback: nothing is queued, buffered, or classified. `pause`,
-  `mute`, and `stop` still tear the stream down entirely.
+- One capture stream per turn with a software gate in front of it, shared by
+  everything inside that turn rather than opened and closed twice within it.
+  Audio reaches the endpointer and Whisper only while the gate is open — which
+  is only while a turn is actually running. With the gate shut, frames are
+  dropped in the realtime callback: nothing is queued, buffered, or classified.
+  The device itself is released once nothing needs it, so macOS's own
+  microphone indicator is lit only when Vox can genuinely hear you.
 - Global hotkeys that work in any app and need no permission grant, because
-  Carbon hotkeys need none: **⌃⌥⌘L** to open a turn and again to send it,
-  **⌃⌥⌘R** to reply to whoever last spoke.
+  Carbon hotkeys need none — all on one key: **⌘§** tapped opens a turn and
+  again sends it; tapped when nothing is listening it replies to whoever last
+  spoke.
+- A floating pill at the bottom of the screen that appears only while Vox is
+  warming up, listening, dictating, or speaking, with a live waveform of your
+  actual microphone level.
 - `pause`, `resume`, `stop`, replay, manual end-of-turn, and cancellation are
   daemon controls and remain available even when an MCP adapter reconnects.
 - Native microphone sample-rate capture with a single high-quality resample;
@@ -115,21 +120,27 @@ Whisper. `pause`, `mute`, and `stop` release the device outright.
 Two of the hotkeys have nothing to do with MCP and keep working with every
 agent host closed:
 
-- **⌃⌥⌘D held** dictates into whatever app is focused. Everything between
-  press and release goes to Whisper — no endpointing, no voice activity
-  detection, because the key already says where the utterance starts and
-  stops. The text is pasted at the cursor and your clipboard is restored.
-  Local rules strip Whisper's ambient annotations and spoken hesitation
+- **⌘§ held** dictates into whatever app is focused. Everything between press
+  and release goes to Whisper — no endpointing, no voice activity detection,
+  because the key already says where the utterance starts and stops. Local rules
+  strip Whisper's ambient annotations and spoken hesitation
   (`VOX_DICTATION_CLEANUP=rules|off`); no model rewrites what you said.
-- **⌃⌥⌘S** reads the current selection aloud, word for word. The text goes
+- **⇧⌘§** reads the current selection aloud, word for word. The text goes
   straight to Kokoro, so there is nothing on the path that could paraphrase a
   number, a name, or a line of code. Press again to stop. It queues behind an
-  agent that is already speaking rather than talking over it.
+  agent that is already speaking rather than talking over it. It never opens the
+  microphone.
+
+Anything Vox hears is **left on your clipboard** — the dictated text after it is
+pasted at the cursor, and the transcript of a spoken turn
+(`VOX_CLIPBOARD_TRANSCRIPT=0` to opt out). A paste into a surface with no
+editable field silently goes nowhere; leaving the words on the clipboard means
+the fallback is always ⌘V.
 
 ## Permissions
 
 - **Microphone** — required for everything. Requested on first launch.
-- **Accessibility** — required only for ⌃⌥⌘D and ⌃⌥⌘S, which post ⌘V/⌘C and
+- **Accessibility** — required only for ⌘§ held and ⇧⌘§, which post ⌘V/⌘C and
   read the focused element. Vox prompts the first time you use either, and
   says so in the panel rather than failing silently. Grant it to
   `Vox` under System Settings › Privacy & Security › Accessibility.

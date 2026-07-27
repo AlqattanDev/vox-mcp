@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 import json
 from pathlib import Path
 import threading
@@ -1349,7 +1350,7 @@ async def test_speakers_can_be_overridden_deliberately(tmp_path: Path, monkeypat
 
 
 # ---------------------------------------------------------------------------
-# Persistent capture: one stream per session, a gate in front of it.
+# Persistent capture: one stream per turn, a gate in front of it.
 # ---------------------------------------------------------------------------
 
 
@@ -1469,8 +1470,12 @@ async def wait_for(predicate, timeout: float = 15.0) -> bool:
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(30)
-async def test_a_session_opens_one_stream_and_reuses_it_across_turns(tmp_path: Path):
-    """The churn is the bug: two opens per turn is what fires the HFP pop."""
+async def test_back_to_back_turns_share_one_stream(tmp_path: Path):
+    """The churn is the bug: two opens per turn is what fires the HFP pop.
+
+    Consecutive turns inside the idle-release linger reuse the device rather
+    than reopening it, which is the whole point of the linger.
+    """
 
     engine, mic = make_live_engine(tmp_path)
     try:
@@ -1480,27 +1485,65 @@ async def test_a_session_opens_one_stream_and_reuses_it_across_turns(tmp_path: P
         assert second["transcript"] == "hello world"
         assert mic.opens == 1
         assert mic.closes == 0
-        assert engine.stream_open is True
     finally:
         await engine.session("http-control", "stop")
 
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(30)
-async def test_between_turns_the_stream_stays_open_but_the_gate_is_shut(tmp_path: Path):
-    """Stream open is not the same as being able to hear you."""
+async def test_the_device_is_released_when_the_turn_ends(tmp_path: Path):
+    """macOS lights its microphone indicator for an open *device*.
+
+    It knows nothing about our software gate, so a stream that outlives the turn
+    is an indicator burning with no honest meaning — which is exactly what Ali
+    saw and called uncomfortable. Shutting the gate is not enough; the device
+    has to go.
+    """
 
     engine, mic = make_live_engine(tmp_path)
+    engine._stream_idle_release_s = 0.05
     try:
         await engine.listen("claude")
-        assert engine.stream_open is True
+        assert await wait_for(lambda: not engine.stream_open)
+        assert mic.closes == 1
         assert engine.gate_open is False
         assert engine.microphone_open is False
 
         health = await engine.health()
-        assert health["stream_open"] is True
+        assert health["stream_open"] is False
         assert health["gate_open"] is False
         assert health["microphone_open"] is False
+    finally:
+        await engine.session("http-control", "stop")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_the_device_stays_up_while_a_capture_still_needs_it(tmp_path: Path):
+    """The linger must never close the device out from under a live turn.
+
+    Asserted as the invariant rather than by sleeping past the linger, because
+    when the turn ends is up to the endpointer: an open microphone with no device
+    behind it is the failure, whenever it happens.
+    """
+
+    engine, _ = make_live_engine(tmp_path, silent_frames=0)
+    # Shorter than any turn, so a linger that ignored the outstanding hold would
+    # fire in the middle of one.
+    engine._stream_idle_release_s = 0.01
+    try:
+        await engine.control("http-control", "gate_open")
+        assert await wait_for(lambda: engine.microphone_open)
+
+        deaf_while_open = 0
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            if engine.microphone_open and not engine.stream_open:
+                deaf_while_open += 1
+            await asyncio.sleep(0.01)
+        assert deaf_while_open == 0
+        # And once nothing needs it, it does go.
+        assert await wait_for(lambda: not engine.stream_open)
     finally:
         await engine.session("http-control", "stop")
 
@@ -1563,7 +1606,6 @@ async def test_the_turn_key_opens_a_turn_and_closing_it_submits(tmp_path: Path):
 
         assert await wait_for(lambda: not engine.microphone_open)
         assert engine.gate_open is False
-        assert engine.stream_open is True  # the turn ended, the session did not
         assert mic.opens == 1
     finally:
         await engine.session("http-control", "stop")
@@ -1736,6 +1778,143 @@ async def test_dictation_never_speaks_and_never_takes_an_agent_turn(tmp_path: Pa
     assert "dictation.completed" in events
     # Nothing was addressed to an agent: dictation goes to the cursor, not Vox.
     assert engine.notes.pending_targets() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_dictation_gives_the_device_back_when_the_key_comes_up(tmp_path: Path):
+    """The regression test for a microphone indicator that never went out.
+
+    Dictation used to hand a *shared* stream back still open — it closed only
+    the one it had opened itself — so a single hold-to-talk press left the
+    device live until the next pause or stop. Observed on Ali's machine as an
+    orange dot burning with no session running and the gate shut, straight after
+    the one dictation press the setup instructions asked for.
+    """
+
+    engine, mic = make_live_engine(tmp_path)
+    engine._stream_idle_release_s = 0.05
+    try:
+        await engine.dictate("http-control", "dictate_start")
+        assert await wait_for(lambda: engine.microphone_open)
+        assert engine.stream_open is True
+        await asyncio.sleep(0.2)
+        await engine.dictate("http-control", "dictate_end")
+
+        assert await wait_for(lambda: not engine.stream_open)
+        assert mic.closes == 1
+    finally:
+        await engine.session("http-control", "stop")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_dictation_does_not_wait_out_the_stream_open_guard(tmp_path: Path):
+    """A hold-to-talk key is already being spoken into.
+
+    The guard stops the Bluetooth open transient from satisfying speech onset,
+    and the raw dictation path has no onset detection to fool — the pop just
+    reaches Whisper as a click. Waiting it out here would instead eat the first
+    second of every single dictation.
+    """
+
+    engine, _ = make_live_engine(tmp_path)
+    engine._stream_open_guard_s = 5.0
+    try:
+        started = time.monotonic()
+        await engine.dictate("http-control", "dictate_start")
+        # The gate is open immediately, not five seconds from now.
+        assert engine.gate_open is True
+        assert time.monotonic() - started < 1.0
+        await engine.dictate("http-control", "dictate_end")
+    finally:
+        await engine.session("http-control", "stop")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_reading_aloud_never_opens_the_microphone(tmp_path: Path):
+    """Text-to-speech is not a reason to listen to the room.
+
+    Structural, not a promise: read_aloud does not pass barge_in, so nothing on
+    the path can arm a capture. Asserted because it is a privacy contract and
+    nothing should be free to break it silently.
+    """
+
+    engine, mic = make_live_engine(tmp_path)
+    log = Path(engine.config.event_log_path)
+    # With barge-in *enabled*, so the assertion is about read_aloud not arming
+    # rather than about barge-in being off.
+    engine.config = replace(engine.config, barge_in_enabled=True)
+    armed: list[str] = []
+
+    async def record_arm(client_id: str) -> None:
+        armed.append(client_id)
+
+    engine._arm_barge_in = record_arm  # type: ignore[method-assign]
+    try:
+        result = await engine.read_aloud("http-control", text="Version 3.11.4, exactly.")
+        assert result["status"] != "skipped"
+        assert armed == []
+        assert engine.stream_open is False
+        assert engine.microphone_open is False
+        assert mic.opens == 0
+    finally:
+        await engine.session("http-control", "stop")
+
+    events = [json.loads(line)["event"] for line in log.read_text().splitlines() if line.strip()]
+    assert "capture.stream_opened" not in events
+    assert "listening.started" not in events
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_what_was_said_is_left_on_the_clipboard(tmp_path: Path):
+    """So a turn that landed nowhere is still recoverable with ⌘V."""
+
+    engine, _ = make_live_engine(tmp_path)
+    copied: list[bytes] = []
+    engine._clipboard_runner = lambda argv, payload: copied.append(payload)
+    try:
+        result = await engine.listen("claude")
+        assert result["transcript"] == "hello world"
+        assert copied == [b"hello world"]
+    finally:
+        await engine.session("http-control", "stop")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_typed_text_does_not_clobber_the_clipboard(tmp_path: Path):
+    """Text the user typed is already theirs; taking their clipboard for it is rude."""
+
+    engine, _ = make_live_engine(tmp_path)
+    copied: list[bytes] = []
+    engine._clipboard_runner = lambda argv, payload: copied.append(payload)
+    try:
+        listening = asyncio.create_task(engine.listen("claude"))
+        assert await wait_for(lambda: engine.microphone_open)
+        await engine.control("http-control", "deliver_text", text="typed instead")
+        result = await listening
+        assert result["transcript"] == "typed instead"
+        assert result["backend"] == "delivered_text"
+        assert copied == []
+    finally:
+        await engine.session("http-control", "stop")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_the_clipboard_hand_off_can_be_switched_off(tmp_path: Path):
+    engine, _ = make_live_engine(tmp_path)
+    engine._clipboard_transcript = False
+    copied: list[bytes] = []
+    engine._clipboard_runner = lambda argv, payload: copied.append(payload)
+    try:
+        await engine.listen("claude")
+        assert copied == []
+    finally:
+        await engine.session("http-control", "stop")
 
 
 @pytest.mark.asyncio

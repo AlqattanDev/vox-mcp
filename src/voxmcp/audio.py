@@ -95,11 +95,22 @@ def default_latest_recording_path() -> Path:
 class CaptureConfig:
     """Endpointing and persistence settings for one recording."""
 
-    # None means "wait indefinitely for onset". Only the barge-in capture uses
-    # it: what ends that capture is the reply finishing, not a clock, and a
-    # 15 s timeout silently made the back half of every long reply
-    # uninterruptible (measured: armed died at 15.1 s of a 72 s reply).
-    onset_timeout_s: float | None = 15.0
+    # How long a turn waits for the user to start talking before giving up.
+    #
+    # Five seconds, not fifteen: this is the window that stays open after the
+    # agent stops speaking, and an open microphone hanging around for fifteen
+    # seconds after every reply is fifteen seconds in which the room can
+    # interrupt an agent that has gone back to work. Five is long enough to draw
+    # breath and answer, short enough that the device is released almost
+    # immediately when you do not.
+    #
+    # None means "wait indefinitely for onset", and is for the two paths where a
+    # clock would be wrong: the barge-in capture, which ends when the reply
+    # finishes (a 15 s timeout silently made the back half of every long reply
+    # uninterruptible — measured dying at 15.1 s of a 72 s reply), and a turn the
+    # user opened with the turn key, where pressing the key already said they are
+    # talking.
+    onset_timeout_s: float | None = 5.0
     trailing_silence_s: float = 1.6
     short_trailing_silence_s: float = 0.6
     short_utterance_speech_s: float = 1.5
