@@ -290,8 +290,25 @@ after launch. One of them had an existing test that asserted the microphone
 closed but never that the state machine recovered — it passed throughout. Verify
 aloud before believing green, and assert the state, not just the device.
 
+## Voice suite — verified spec ready to build
+
+`VOICE-SUITE-VERIFIED.md` (2026-07-27) is the implementation-ready spec for
+the persistent mic + keyboard gate, system-wide hold-to-talk dictation, and
+verbatim read-aloud. Every diagnosis in `VOICE-GATE-BRIEF.md` was verified
+against code, the event log, and live hardware. Key findings: the mic
+flicker is a **Bluetooth HFP stream-open transient** (−27 dBFS burst ~240 ms
+after every stream open on the FreeClip 2 — reproduced on demand, echo
+refuted); `mute` is a privacy teardown, not a gate; Vox holds **no
+Accessibility permission** (needed for dictation/read-aloud injection, and
+the build's ad-hoc signing fallback would kill the grant every deploy);
+`capture_from_frames` is the ready-made sink for the persistent stream.
+Build order F1 → F2 → F3, acceptance tests in the spec.
+
 ## Next steps
 
+- **Build the voice suite from `VOICE-SUITE-VERIFIED.md`** (supersedes the
+  "dictation out of scope" line that used to sit here — it is now in scope,
+  spec'd, at the runtime level).
 - **Confirm the `UserPromptSubmit` hook fires during a running tool call.** The
   hook is installed (`.claude/settings.json` →
   `scripts/claude_code_deliver_text.sh`) and the script is verified end to end:
@@ -310,4 +327,3 @@ aloud before believing green, and assert the state, not just the device.
 - If `small` is too lossy on accents: revert model path to
   `ggml-large-v3-turbo.bin` (~1.6 GB).
 - Kokoro memory is the only large remaining cost lever.
-- System-wide dictation (Wispr replacement) is out of scope for this runtime.
