@@ -24,10 +24,10 @@ loopback address; Vox refuses to start if they do not.
   dropped in the realtime callback: nothing is queued, buffered, or classified.
   The device itself is released once nothing needs it, so macOS's own
   microphone indicator is lit only when Vox can genuinely hear you.
-- Global hotkeys that work in any app and need no permission grant, because
-  Carbon hotkeys need none — all on one key: **⌘§** tapped opens a turn and
-  again sends it; tapped when nothing is listening it replies to whoever last
-  spoke.
+- One global hotkey that works in any app and needs no permission grant,
+  because Carbon hotkeys need none: **⌘§** held dictates at the cursor, and
+  **⌘§** tapped reads the selection aloud. A tap never opens the microphone —
+  listening happens only while the key is held.
 - A floating pill at the bottom of the screen that appears only while Vox is
   warming up, listening, dictating, or speaking, with a live waveform of your
   actual microphone level.
@@ -125,9 +125,9 @@ agent host closed:
   because the key already says where the utterance starts and stops. Local rules
   strip Whisper's ambient annotations and spoken hesitation
   (`VOX_DICTATION_CLEANUP=rules|off`); no model rewrites what you said.
-- **⇧⌘§** reads the current selection aloud, word for word. The text goes
+- **⌘§ tapped** reads the current selection aloud, word for word. The text goes
   straight to Kokoro, so there is nothing on the path that could paraphrase a
-  number, a name, or a line of code. Press again to stop. It queues behind an
+  number, a name, or a line of code. Tap again to stop. It queues behind an
   agent that is already speaking rather than talking over it. It never opens the
   microphone.
 

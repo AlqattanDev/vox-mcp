@@ -37,10 +37,8 @@ burning with no honest meaning.
 | `converse(..., wait_for_response=true)` | Opens only after playback has fully drained | Open for the turn |
 | `converse(...)` with barge-in enabled | Armed *during* playback, gated against Vox's own voice, so talking interrupts | Open, shared with the listen that follows |
 | `listen` | Opens for one bounded turn | Open for the turn |
-| **⌘§** (first tap) | Opens, with no onset timeout — the key said you are talking | Open |
-| **⌘§** (second tap) | Shuts; the turn is transcribed and submitted | Released |
 | **⌘§** held | Open for exactly as long as the key is down | Open for the hold |
-| **⇧⌘§** | Shut — read-aloud never listens | **Closed** |
+| **⌘§** tapped | Shut — read-aloud never listens; with an agent's mic already open the tap shuts it and submits the turn | **Closed** |
 | The user says a short standalone “wait” phrase | Shut during the wait, then reopened for a fresh bounded turn | Open |
 | No speech arrives within the 5 s onset timeout | Shut; session remains `IDLE` | Released |
 | Speech ends | Shut after adaptive trailing silence | Released |
@@ -156,7 +154,7 @@ recognisably headphones, reporting `shared_output` instead of interrupting
 itself. Plug in AirPods and it arms; unplug them and it stops. Nothing to
 configure, and `VOX_BARGE_IN_REQUIRE_HEADPHONES=0` overrides it deliberately.
 
-On speakers the **Reply button, or a ⌘§ tap**, is the interruption path: same
+On speakers a **⌘§ tap** (or the panel) is the interruption path: same
 outcome, no acoustics involved.
 
 Off by default. `VOX_BARGE_IN_ENABLED=1` opens the microphone alongside

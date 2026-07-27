@@ -75,21 +75,22 @@ turns you took.
 
 ## 2. The ⌘§ key on real hardware
 
-1. **Tap, talk, tap.** A long turn: tap ⌘§, talk for ~60 s with several
-   multi-second thinking pauses, tap ⌘§. Acceptance: **exactly one** turn, the
-   transcript is complete, and nothing endpointed mid-thought. This is why a
-   gate-open turn runs with `onset_timeout_s=None`.
-2. **The cue is honest.** The rising blip must land *before* you start talking
-   and after the mic is genuinely live. If the first word of a turn is ever
-   clipped, the 1.0 s guard is being waited out in the wrong place.
-3. **Tap and hold do not get confused.** A quick tap must never start a
-   dictation, and a deliberate hold must never open an agent turn. The threshold
+The key's contract: **a tap never opens the microphone** — it reads the
+selection aloud (or stops speech, or ends an agent's already-open turn).
+Listening happens only while the key is held.
+
+1. **Tap and hold do not get confused.** A quick tap must never start a
+   dictation, and a deliberate hold must never read the selection. The threshold
    is 350 ms (`HotKeyBinding.holdThreshold`). If a tap you meant as a tap starts
-   dictating, raise it; if a hold you meant as a hold sends a turn, lower it.
-4. **The reply window is 5 s.** After an agent finishes speaking the mic opens
-   for about five seconds and then gives up. Long enough to draw breath and
-   answer; if it is not, `onset_timeout` is per-call and the skill can pass more.
-5. **Barge-in still works.** With `VOX_BARGE_IN_ENABLED=1` and the earbuds, talk
+   dictating, raise it; if a hold you meant as a hold reads aloud, lower it.
+2. **A tap with the room silent and nothing selected must not listen.** The
+   acceptance is the absence: no earcon, no red pill, no orange dot — just the
+   "Nothing is selected to read" notice.
+3. **The reply window is 5 s.** After an agent finishes speaking (via
+   `converse`) the mic opens for about five seconds and then gives up. Long
+   enough to draw breath and answer; if it is not, `onset_timeout` is per-call
+   and the skill can pass more. A ⌘§ tap during that window ends the turn.
+4. **Barge-in still works.** With `VOX_BARGE_IN_ENABLED=1` and the earbuds, talk
    over a long reply. Acceptance: playback dies within ~0.2 s,
    `spoken.status == "barge_in"`, and the transcript contains **the first word
    you spoke** — that proves the pre-roll survived. Confirm the armed capture and
@@ -118,7 +119,7 @@ If the text lands but the filler-stripping is wrong for how you talk, tune the
 
 ## 4. Read-aloud, verbatim and deaf
 
-Select text, press **⇧⌘§**. Press again to stop.
+Select text, tap **⌘§**. Tap again to stop.
 
 - Chrome, Notes, a PDF in Preview, and a terminal. AX read is tried first and
   returns nothing in some Chromium/Electron surfaces; the ⌘C fallback covers
@@ -128,7 +129,8 @@ Select text, press **⇧⌘§**. Press again to stop.
 - **Spot-check verbatim on paraphrase-prone material**: numbers, version
   strings, names, a line of code. Nothing on this path can rewrite them, so any
   drift is Kokoro's pronunciation, not a model — different bug, different fix.
-- With an agent already speaking, ⇧⌘§ must **queue**, not cut in.
+- With an agent already speaking, a ⌘§ tap **stops the speech** — reading a new
+  selection needs a second tap once the room is quiet.
 - Nothing selected → the error earcon, not silence.
 
 ## 5. The pill

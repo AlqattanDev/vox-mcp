@@ -3,21 +3,20 @@ import AVFoundation
 import Carbon.HIToolbox
 import Foundation
 
-/// The global hotkeys Vox owns: two combos on one key.
+/// The one global hotkey Vox owns, with meaning carried by the gesture.
 ///
-/// Both live on **§**, the key left of 1 — `kVK_ISO_Section`, verified to map to
-/// "§" under this machine's layout. Carbon registers these with no permission
+/// It lives on **§**, the key left of 1 — `kVK_ISO_Section`, verified to map to
+/// "§" under this machine's layout. Carbon registers it with no permission
 /// grant at all, which a bare Fn key (Wispr's default) cannot do without an event
 /// tap and Input Monitoring. ⌘ alone is enough for that — extra modifiers buy
 /// nothing here, so a key reached dozens of times a day costs two fingers.
 ///
-///   ⌘§ tapped  talk to the agent — tap again to send
+///   ⌘§ tapped  read the selection aloud — tap again to stop
 ///   ⌘§ held    dictate at the cursor, release to inject
-///   ⇧⌘§        read the selection aloud
 ///
-/// Tap and hold share one key because they are the same intent — "take my
-/// voice" — differing only in where the words end up. `holdThreshold` is what
-/// tells them apart.
+/// A tap never opens the microphone. Listening happens only while the key is
+/// held — the user's rule, stated exactly: "speech to text only on hold."
+/// `holdThreshold` is what tells the two gestures apart.
 struct HotKeyBinding {
     let id: UInt32
     let keyCode: UInt32
@@ -35,14 +34,8 @@ struct HotKeyBinding {
         modifiers: UInt32(cmdKey),
         label: "⌘§"
     )
-    static let read = HotKeyBinding(
-        id: 2,
-        keyCode: UInt32(kVK_ISO_Section),
-        modifiers: UInt32(cmdKey | shiftKey),
-        label: "⇧⌘§"
-    )
 
-    static let all: [HotKeyBinding] = [.voice, .read]
+    static let all: [HotKeyBinding] = [.voice]
 }
 
 /// Reads whatever text is selected in the frontmost app.
@@ -420,9 +413,6 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         switch id {
         case HotKeyBinding.voice.id:
             if pressed { voiceKeyDown() } else { voiceKeyUp() }
-        case HotKeyBinding.read.id:
-            guard pressed else { return }
-            readSelectionAloud()
         default:
             return
         }
@@ -452,7 +442,7 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             pending.cancel()
             voiceKeyHoldTimer = nil
             voiceKeyBecameHold = false
-            toggleTurnGate()
+            voiceKeyTapped()
             return
         }
         guard voiceKeyBecameHold else { return }
@@ -460,13 +450,27 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         endDictation()
     }
 
-    // Press to hear the selection; press again to stop. Verbatim — the runtime
-    // hands the text straight to Kokoro with no model anywhere on the path.
-    private func readSelectionAloud() {
+    // A tap never opens the microphone — listening is only ever the hold.
+    // Speaking → stop it. An agent's mic already open → end that turn (which
+    // closes a gate, never opens one). Otherwise → read the selection aloud.
+    private func voiceKeyTapped() {
         if state.lowercased() == "speaking" {
             sendControl("cancel", notice: "Stopped reading.", serialized: false)
             return
         }
+        if gateOpen {
+            // Deliberately not serialised: this must never be swallowed by a
+            // poll-triggered control still in flight, or the turn would stay
+            // open with no way to close it.
+            sendControl("gate_close", notice: "Sending…", serialized: false)
+            return
+        }
+        readSelectionAloud()
+    }
+
+    // Verbatim — the runtime hands the text straight to Kokoro with no model
+    // anywhere on the path.
+    private func readSelectionAloud() {
         guard ensureAccessibility(for: "reading the selection") else { return }
         guard let selection = SelectionReader.read() else {
             actionNotice = "Nothing is selected to read."
@@ -479,18 +483,6 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             extra: ["text": selection],
             serialized: false
         )
-    }
-
-    // Tap to talk, tap again to send. Not hold: a spoken turn runs 40-60
-    // seconds and nobody holds a key that long. The runtime answers with the
-    // gate state, so the two taps cannot drift out of step with it.
-    private func toggleTurnGate() {
-        let action = gateOpen ? "gate_close" : "gate_open"
-        let notice = gateOpen ? "Sending…" : "Listening…"
-        // Deliberately not serialised: the second tap must never be swallowed
-        // by a poll-triggered control that is still in flight, or the turn
-        // would stay open with no way to close it.
-        sendControl(action, notice: notice, serialized: false)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -1199,10 +1191,9 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         case "cycle_mode": return "Mode cycled. Talk = both · Narrate = agent speaks · Dictate = you only."
         case "note": return "Listening for your note — speak now, then you can walk away."
         case "reply": return "Listening for your reply — speak now, then you can walk away."
-        case "gate_open": return "Listening. Take your time — press ⌘§ again to send."
         case "gate_close": return "Got it. Recording closed; transcribing what you said."
         case "dictate_start": return "Dictating — release ⌘§ to type it."
-        case "read_aloud": return "Reading your selection. Press ⇧⌘§ again to stop."
+        case "read_aloud": return "Reading your selection. Tap ⌘§ again to stop."
         case "repeat": return "Replaying the agent's last speech."
         default: return "Vox control applied."
         }

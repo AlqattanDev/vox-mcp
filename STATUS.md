@@ -186,12 +186,12 @@ Package is `src/voxmcp/`.
   short value (~4s) opens the mic for a beat after the agent speaks and returns
   `no_speech` fast on silence, so a conversational turn offers a reply without a
   hanging mic. The skill tells agents to end back-and-forth turns this way and
-  reserve bare `speak` for a true sign-off. **(2) Reply on demand:** a panel
-  **Reply** button (idle primary) and a tap of the permission-free global hotkey
-  **⌘§** (Carbon `RegisterEventHotKey`) grab the mic and answer whoever last spoke —
+  reserve bare `speak` for a true sign-off. **(2) Reply on demand:** the panel
+  **Reply** button (idle primary) grabs the mic and answers whoever last spoke —
   `reply` control → `engine.reply` auto-targets `last_spoken_agent` (tracked in
   `_speak_locked`, exposed on `/health`) and delivers via the note path, so it
-  surfaces as that agent's `undelivered_heard` on its next turn. The agent-picker
+  surfaces as that agent's `undelivered_heard` on its next turn. The ⌘§ tap
+  deliberately does not do this: a tap never opens the mic. The agent-picker
   note moved into **More…**. Inherent limit: a reply after a full sign-off waits
   for the agent's next action (host-injection is the `deliver_text` PLAN item).
 - **Type instead of talking, without waiting the mic out.** `deliver_text` ends
@@ -359,25 +359,26 @@ which the room could interrupt an agent that had gone back to work. Still `None`
 on the two paths where a clock would be wrong: an armed barge-in mic, and a turn
 the user opened with the key.
 
-**Hotkeys: two combos on one key**, both permission-free Carbon registrations on
-`kVK_ISO_Section` (verified to map to "§" under this machine's ABC layout, and
-both combos register `noErr`).
+**One hotkey, meaning carried by the gesture** — a permission-free Carbon
+registration on `kVK_ISO_Section` (verified to map to "§" under this machine's
+ABC layout).
 
 | | |
 |---|---|
-| **⌘§** tapped | Talk to the agent — tap again to send. Tapped when nothing is listening it starts a turn addressed to whoever last spoke |
+| **⌘§** tapped | Read the selection aloud — tap again to stop. With an agent's mic already open, the tap ends that turn instead |
 | **⌘§** held | Dictate at the cursor; release injects |
-| **⇧⌘§** | Read the selection aloud |
 
-⌘ alone registers as freely as any three-modifier combo, so two keys is all a
-permission-free hotkey costs. Tap and hold
-are told apart by a **350 ms** threshold: nothing happens on key-down, because
-what the press means is not yet known. A separate reply hotkey no longer exists —
-`_gate_open` already starts a turn addressed to `last_spoken_agent` when nothing
-is listening, so it was the same action twice. The Carbon handler had to be
-rewritten before any of this: it installed one `EventTypeSpec` and ignored all
-three of its arguments, so it could tell neither which hotkey fired nor whether
-the key went down or up.
+**A tap never opens the microphone; listening happens only while the key is
+held.** That is Ali's rule, verbatim: "speech to text only on hold." The
+tap-to-talk turn key and the separate ⇧⌘§ read combo are gone — live use showed
+a shifted combo landing on the tap path and opening the mic on a key pressed to
+*hear* text, which is the exact wrong direction to fail in. Tap and hold are
+told apart by a **350 ms** threshold: nothing happens on key-down, because what
+the press means is not yet known. Agent turns are started by agents (or the
+panel's Reply button); the key's only mic is the hold. The Carbon handler had
+to be rewritten before any of this: it installed one `EventTypeSpec` and
+ignored all three of its arguments, so it could tell neither which hotkey fired
+nor whether the key went down or up.
 
 **The floating pill** (`macos/VoxHUD.swift`) is a capsule at bottom-centre that
 exists *only* while something is happening, so its presence is the signal and its
