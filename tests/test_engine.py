@@ -52,7 +52,9 @@ class FakeRecorder:
 class FakeHandle:
     running = False
     def wait(self): return 0
-    def cancel(self): return None
+    # grace_s because the real handle takes it: barge-in cancels hard, and a
+    # fake that rejects the argument turns a policy failure into a TypeError.
+    def cancel(self, grace_s: float = 0.2): return None
 
 
 class FakePlayer:
@@ -1342,6 +1344,37 @@ async def test_speakers_can_be_overridden_deliberately(tmp_path: Path, monkeypat
     engine._barge_in_require_headphones = False
 
     assert engine.barge_in_availability()["available"] is True
+
+
+@pytest.mark.asyncio
+async def test_converse_on_speakers_never_arms_the_microphone(tmp_path: Path, monkeypatch):
+    """The whole turn, not just the advisory: on speakers nothing arms.
+
+    ``barge_in_availability`` being right is not the same as the arming path
+    asking it. This drives the real ``converse`` with a recorder that would
+    interrupt the moment it is handed an onset callback — so if anything on the
+    path arms, the reply comes back cut off instead of spoken.
+    """
+
+    from voxmcp import engine as engine_module
+
+    monkeypatch.setattr(engine_module, "default_output_name", lambda: "MacBook Pro Speakers")
+    store = AudioStore(tmp_path / "audio")
+    recorder = BargingRecorder(store.latest_stt)
+    engine = make_engine(tmp_path, recorder=recorder, barge_in=True)
+    engine._barge_in_require_headphones = True  # the shipped default
+
+    result = await engine.converse("claude", "Here is a long explanation.")
+
+    assert result["spoken"]["status"] == "completed"
+    assert result.get("barge_in") is None
+    assert recorder.fired.is_set() is False
+    assert engine.barge_in_armed is False
+    events = [
+        json.loads(line)["event"]
+        for line in Path(engine.config.event_log_path).read_text().splitlines()
+    ]
+    assert "barge_in.armed" not in events
 
 
 # ---------------------------------------------------------------------------

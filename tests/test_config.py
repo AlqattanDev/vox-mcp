@@ -147,6 +147,31 @@ def test_a_real_environment_variable_still_wins(tmp_path: Path, monkeypatch) -> 
     assert os.environ["VOX_COMPANION_ENABLED"] == "1"
 
 
+def test_the_headphone_gate_cannot_be_switched_off_permanently(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Left in settings.json after one calibration session, this armed barge-in
+    # on the built-in speakers for a day: Kokoro came back louder than Ali did
+    # and every reply was interrupted by its own echo. A gate a file can
+    # disable forever is not a gate — the override has to be a run, not a state.
+    from voxmcp.config import load_user_settings
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({
+        "VOX_BARGE_IN_REQUIRE_HEADPHONES": "0",
+        "VOX_COMPANION_ENABLED": "1",
+    }))
+    monkeypatch.delenv("VOX_BARGE_IN_REQUIRE_HEADPHONES", raising=False)
+    monkeypatch.delenv("VOX_COMPANION_ENABLED", raising=False)
+
+    applied = load_user_settings(settings)
+
+    assert "VOX_BARGE_IN_REQUIRE_HEADPHONES" not in applied
+    assert "VOX_BARGE_IN_REQUIRE_HEADPHONES" not in os.environ
+    # The rest of the file still loads; only the one key is refused.
+    assert applied["VOX_COMPANION_ENABLED"] == "1"
+
+
 def test_a_missing_settings_file_is_not_an_error(tmp_path: Path) -> None:
     from voxmcp.config import load_user_settings
 

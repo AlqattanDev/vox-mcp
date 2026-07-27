@@ -171,6 +171,17 @@ def user_settings_path() -> Path:
     return Path(os.environ.get("VOX_HOME", "~/.vox")).expanduser() / "settings.json"
 
 
+#: Knobs that may be set for a single run but never written into the machine's
+#: permanent state. ``VOX_BARGE_IN_REQUIRE_HEADPHONES=0`` tells barge-in to arm
+#: on the built-in speakers, where the measurement says it cannot work: Kokoro
+#: comes back at −22 dBFS p90 while Ali's voice peaks at −29.8, so the agent
+#: hears itself and interrupts itself. It stayed in ``settings.json`` after one
+#: calibration session and every reply for a day was cut off by its own echo.
+#: A one-off ``VOX_BARGE_IN_REQUIRE_HEADPHONES=0 voxd`` still works — an
+#: experiment you are watching, not a setting that outlives you noticing.
+EPHEMERAL_ONLY_SETTINGS = frozenset({"VOX_BARGE_IN_REQUIRE_HEADPHONES"})
+
+
 def load_user_settings(path: Path | None = None) -> dict[str, str]:
     """Fold ``~/.vox/settings.json`` into the environment, without overriding it.
 
@@ -182,6 +193,7 @@ def load_user_settings(path: Path | None = None) -> dict[str, str]:
 
     A real environment variable still wins, so a one-off
     ``VOX_BARGE_IN_ENABLED=1 voxd`` overrides the file for that run.
+    ``EPHEMERAL_ONLY_SETTINGS`` are ignored here whatever the file says.
     """
 
     settings = path or user_settings_path()
@@ -199,6 +211,9 @@ def load_user_settings(path: Path | None = None) -> dict[str, str]:
         name = str(key).strip()
         if not name.startswith("VOX_"):
             # Refuse to inject arbitrary names into the process environment.
+            continue
+        if name in EPHEMERAL_ONLY_SETTINGS:
+            # A safety gate that a file can switch off permanently is not a gate.
             continue
         if name in os.environ:
             continue

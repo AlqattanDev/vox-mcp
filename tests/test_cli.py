@@ -312,3 +312,18 @@ def test_mcp_caller_is_fixed_to_loopback_and_has_a_generous_timeout() -> None:
 
     with pytest.raises(ValueError):
         MCPToolCaller(url="https://example.com/mcp")
+
+
+def test_set_refuses_to_persist_the_headphone_gate(tmp_path: Path, monkeypatch) -> None:
+    # The runtime ignores this key in settings.json, so writing it would leave
+    # the file claiming one thing and the daemon doing another. Refuse loudly
+    # and point at the form that actually works: one run, not forever.
+    monkeypatch.setenv("VOX_HOME", str(tmp_path))
+
+    result, _caller, _installer = invoke(
+        ["set", "VOX_BARGE_IN_REQUIRE_HEADPHONES=0", "--no-restart"]
+    )
+
+    assert result.exit_code != 0
+    assert "cannot be persisted" in result.output
+    assert not (tmp_path / "settings.json").exists()

@@ -152,7 +152,10 @@ through many times over. No amount of tuning fixes a negative gap.
 So barge-in checks the default output device and refuses to arm unless it is
 recognisably headphones, reporting `shared_output` instead of interrupting
 itself. Plug in AirPods and it arms; unplug them and it stops. Nothing to
-configure, and `VOX_BARGE_IN_REQUIRE_HEADPHONES=0` overrides it deliberately.
+configure. One run of `VOX_BARGE_IN_REQUIRE_HEADPHONES=0 voxd` overrides it for
+that session; `vox set` refuses to write the key, because an override that
+outlives the experiment turns every reply into an echo the agent interrupts
+itself on.
 
 On speakers a **⌘§ tap** (or the panel) is the interruption path: same
 outcome, no acoustics involved.

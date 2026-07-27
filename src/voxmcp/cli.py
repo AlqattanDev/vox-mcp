@@ -436,7 +436,7 @@ def create_cli(
         prints the current file.
         """
 
-        from .config import user_settings_path
+        from .config import EPHEMERAL_ONLY_SETTINGS, user_settings_path
 
         path = user_settings_path()
         try:
@@ -454,6 +454,13 @@ def create_cli(
             if not _ or not key.startswith("VOX_"):
                 raise click.ClickException(
                     f"expected VOX_NAME=value, got {item!r}"
+                )
+            if key in EPHEMERAL_ONLY_SETTINGS:
+                # Writing it would be worse than refusing: the file would say
+                # one thing and the runtime, which ignores it, would do another.
+                raise click.ClickException(
+                    f"{key} cannot be persisted — it switches off a safety gate. "
+                    f"Run one session with it instead: {key}=0 voxd"
                 )
             current[key] = value.strip()
         for key in unset:

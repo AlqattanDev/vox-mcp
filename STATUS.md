@@ -15,7 +15,11 @@ This exists because launchd hands the runtime **none** of the shell environment
 and does not reliably pass `launchctl setenv` — every `VOX_*` knob was
 unreachable in the installed deployment, and nothing set that way survived a
 reboot. The file is the configuration that actually arrives. Non-`VOX_`-prefixed
-keys are ignored rather than injected into the process environment.
+keys are ignored rather than injected into the process environment, and
+`VOX_BARGE_IN_REQUIRE_HEADPHONES` is refused outright — `vox set` errors and the
+runtime skips it even if the file is edited by hand. It disables the gate that
+keeps barge-in off the built-in speakers, so it is a run you watch, never a
+state you forget.
 
 ## Where it lives
 
@@ -83,7 +87,9 @@ Package is `src/voxmcp/`.
   default output device and **declines to arm** unless it is recognisably
   headphones, reporting `barge_in.reason = "shared_output"` in
   `diagnostics(privacy)` rather than interrupting itself.
-  `VOX_BARGE_IN_REQUIRE_HEADPHONES=0` overrides deliberately. On speakers, the
+  A single run of `VOX_BARGE_IN_REQUIRE_HEADPHONES=0 voxd` overrides it; the
+  key is refused in `settings.json`, because a gate a file can switch off
+  forever is not a gate. On speakers, the
   **Reply button / a ⌘§ tap** is the interruption path and needs no acoustics.
   The device list is **re-read on every availability check and every input
   resolution** — PortAudio snapshots devices at process start, so headphones
@@ -252,7 +258,7 @@ full 1.6 s — and is never cut off mid-thought.
 | `com.vox.runtime` | ~73 MB | ~73 MB |
 | **total** | **~2.7 GB** | **~3.2 GB** |
 
-Tests: `.venv/bin/python -m pytest tests/` — **400 passing**.
+Tests: `.venv/bin/python -m pytest tests/` — **408 passing**.
 
 **Slash commands** (in `~/.claude/commands/`, global): `/speak` reads the
 agent's last reply aloud (no mic); `/listen` opens the mic for one utterance

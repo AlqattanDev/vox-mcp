@@ -713,8 +713,9 @@ class VoxEngine:
                 "output_device": name or "unknown",
                 "detail": (
                     "Playback goes to a device the microphone can hear, so talking over "
-                    "Vox cannot be told apart from Vox. Use headphones, or set "
-                    "VOX_BARGE_IN_REQUIRE_HEADPHONES=0 to try anyway."
+                    "Vox cannot be told apart from Vox. Use headphones, or run one "
+                    "session with VOX_BARGE_IN_REQUIRE_HEADPHONES=0 voxd to try anyway "
+                    "— it cannot be persisted in settings.json."
                 ),
             }
         return {"available": True, "reason": "ok", "output_device": name or "unknown"}
