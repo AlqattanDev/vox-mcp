@@ -1604,3 +1604,57 @@ async def test_persistent_capture_can_be_switched_off(tmp_path: Path):
         assert mic.opens == 2
     finally:
         await engine.session("http-control", "stop")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_closing_the_turn_during_warm_up_is_not_swallowed(tmp_path: Path):
+    """Tap, tap — fast. The second tap must not land on nothing.
+
+    A turn spends its first second warming up: waiting out the stream-open
+    guard, then playing the cue. Found live: the capture control used to be
+    published only after that, so an impatient second tap signalled nothing
+    and the microphone stayed open with no way to close it.
+    """
+
+    engine, _ = make_live_engine(tmp_path)
+    engine._stream_open_guard_s = 1.0
+    try:
+        await engine.control("http-control", "gate_open")
+        # Well inside the warm-up window, before any capture exists.
+        await asyncio.sleep(0.1)
+        assert engine.microphone_open is False
+        closed = await engine.control("http-control", "gate_close")
+        assert closed["signalled"] is True
+
+        assert await wait_for(lambda: engine.state.state.value == "idle")
+        assert engine.microphone_open is False
+        assert engine.gate_open is False
+        # Nothing was said, so nothing was submitted.
+        assert engine.notes.pending_targets() == []
+    finally:
+        await engine.session("http-control", "stop")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_the_start_cue_is_never_played_into_an_open_gate(tmp_path: Path):
+    """The cue goes to the same headset the microphone is in.
+
+    It has to finish before the endpointer is listening, or Vox opens turns on
+    the sound of its own blip.
+    """
+
+    engine, _ = make_live_engine(tmp_path)
+    engine._stream_open_guard_s = 0.0
+    gate_states: list[bool] = []
+
+    async def watched_cue() -> None:
+        gate_states.append(engine.gate_open)
+
+    engine._play_listen_start_cue = watched_cue  # type: ignore[method-assign]
+    try:
+        await engine.listen("claude")
+        assert gate_states == [False]
+    finally:
+        await engine.session("http-control", "stop")

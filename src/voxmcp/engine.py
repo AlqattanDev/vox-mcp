@@ -200,9 +200,11 @@ class VoxEngine:
             "VOX_PERSISTENT_CAPTURE", "1"
         ).strip().lower() not in {"0", "false", "no", "off"}
         # The transient arrives ~240 ms after the stream engages and decays over
-        # ~350 ms; a guard shorter than half a second does not cover it.
+        # ~350 ms. Half a second was measured to be too short — onset still
+        # fired 513 ms after open on the FreeClip — and this is waited out once
+        # per session, before the cue that says the microphone is live.
         self._stream_open_guard_s = max(
-            0.0, float(os.environ.get("VOX_STREAM_OPEN_GUARD_SECONDS", "0.5"))
+            0.0, float(os.environ.get("VOX_STREAM_OPEN_GUARD_SECONDS", "1.0"))
         )
 
         self._active_lock = threading.RLock()
@@ -1222,13 +1224,31 @@ class VoxEngine:
     ) -> tuple[CaptureResult, SpeechResult | None]:
         self.state.begin_listening(client_id=client_id)
         self._log("listening.started", client_id=client_id)
-        await self._play_listen_start_cue()
+        # Published before anything that can block. A turn spends its first
+        # second warming up — waiting out the stream-open guard, playing the
+        # cue — and a user who taps the key twice quickly must not have the
+        # second tap land on nothing. With the control already live, an early
+        # end is remembered and the capture closes the instant it opens.
         control = CaptureControl()
         with self._active_lock:
             self._capture_control = control
+        source = await self._ensure_source()
+        if source is not None:
+            # Hold the gate shut across the cue. The cue is played through the
+            # same headset the microphone is in, and on a fresh stream the
+            # Bluetooth open transient has not finished decaying yet — letting
+            # either into the endpointer is how a turn opens on a sound nobody
+            # made. Waiting the guard out here is also what makes the rising
+            # blip honest: it means "I can hear you now", not "soon".
+            source.close_gate()
+            remaining = source.guard_remaining_s
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+        if not (control.cancelled or control.manual_end_requested or control.text_delivered):
+            # Never announce an open microphone to someone who already closed it.
+            await self._play_listen_start_cue()
         loop = asyncio.get_running_loop()
         selected_recorder = recorder or self.recorder
-        source = await self._ensure_source()
         if source is not None:
             # The gate is what "the microphone is open" now means: the stream
             # outlives the turn, but frames only exist while a capture holds it.

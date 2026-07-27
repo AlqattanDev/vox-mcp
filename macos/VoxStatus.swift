@@ -3,6 +3,20 @@ import AVFoundation
 import Carbon.HIToolbox
 import Foundation
 
+/// The global hotkeys Vox owns. All are ⌃⌥⌘ combos: Carbon can register those
+/// with no permission grant at all, which a bare Fn key (Wispr's default)
+/// cannot do without an event tap and Input Monitoring.
+struct HotKeyBinding {
+    let id: UInt32
+    let keyCode: UInt32
+    let label: String
+
+    static let reply = HotKeyBinding(id: 1, keyCode: UInt32(kVK_ANSI_R), label: "⌃⌥⌘R")
+    static let turn = HotKeyBinding(id: 2, keyCode: UInt32(kVK_ANSI_L), label: "⌃⌥⌘L")
+
+    static let all: [HotKeyBinding] = [.reply, .turn]
+}
+
 /// A live scrolling waveform of the microphone level. Fed one 0..1 sample per
 /// status poll; it keeps a short rolling history and draws it as centred bars,
 /// so the panel visibly reacts to your voice instead of showing dead text.
@@ -75,7 +89,8 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var notesWaiting: [String] = []
     private var lastSpokenAgent: String?
     private var micLevel: CGFloat = 0
-    private var replyHotKeyRef: EventHotKeyRef?
+    private var hotKeyRefs: [EventHotKeyRef] = []
+    private var gateOpen = false
 
     private var runtime: Process?
     private var timer: Timer?
@@ -139,54 +154,107 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         timer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
             self?.refreshStatus()
         }
-        registerReplyHotKey()
+        registerHotKeys()
         refreshStatus()
     }
 
-    // A permission-free global hotkey (Carbon RegisterEventHotKey — unlike an
-    // NSEvent global monitor, it needs no Input Monitoring grant) that grabs the
-    // mic to reply to whoever last spoke, from any app. Default: ⌃⌥⌘R.
-    private func registerReplyHotKey() {
-        var eventType = EventTypeSpec(
-            eventClass: OSType(kEventClassKeyboard),
-            eventKind: OSType(kEventHotKeyPressed)
-        )
+    // Permission-free global hotkeys (Carbon RegisterEventHotKey — unlike an
+    // NSEvent global monitor, it needs no Input Monitoring or Accessibility
+    // grant), usable from any app. Carbon delivers both pressed and released,
+    // so hold-to-talk works without a grant too. A bare Fn key is not
+    // registrable this way; use combos, do not chase Fn.
+    //
+    //   ⌃⌥⌘R  reply to whoever last spoke   (press)
+    //   ⌃⌥⌘L  turn key: talk / send         (press, toggles)
+    private func registerHotKeys() {
+        var eventTypes = [
+            EventTypeSpec(
+                eventClass: OSType(kEventClassKeyboard),
+                eventKind: OSType(kEventHotKeyPressed)
+            ),
+            EventTypeSpec(
+                eventClass: OSType(kEventClassKeyboard),
+                eventKind: OSType(kEventHotKeyReleased)
+            ),
+        ]
         InstallEventHandler(
             GetApplicationEventTarget(),
-            { _, _, userData in
-                guard let userData else { return noErr }
+            { _, event, userData in
+                guard let userData, let event else { return noErr }
+                // The handler used to ignore its arguments entirely, so a
+                // second hotkey would have been indistinguishable from the
+                // first. Read which key, and whether it went down or up.
+                var identifier = EventHotKeyID()
+                let status = GetEventParameter(
+                    event,
+                    EventParamName(kEventParamDirectObject),
+                    EventParamType(typeEventHotKeyID),
+                    nil,
+                    MemoryLayout<EventHotKeyID>.size,
+                    nil,
+                    &identifier
+                )
+                guard status == noErr else { return noErr }
+                let pressed = GetEventKind(event) == UInt32(kEventHotKeyPressed)
                 let delegate = Unmanaged<VoxAppDelegate>.fromOpaque(userData).takeUnretainedValue()
-                DispatchQueue.main.async { delegate.replyHotKeyFired() }
+                DispatchQueue.main.async {
+                    delegate.hotKeyFired(id: identifier.id, pressed: pressed)
+                }
                 return noErr
             },
-            1,
-            &eventType,
+            2,
+            &eventTypes,
             Unmanaged.passUnretained(self).toOpaque(),
             nil
         )
-        let hotKeyID = EventHotKeyID(signature: OSType(0x564F_5852), id: 1)  // 'VOXR'
         let modifiers = UInt32(controlKey | optionKey | cmdKey)
-        RegisterEventHotKey(
-            UInt32(kVK_ANSI_R),
-            modifiers,
-            hotKeyID,
-            GetApplicationEventTarget(),
-            0,
-            &replyHotKeyRef
-        )
+        for binding in HotKeyBinding.all {
+            var reference: EventHotKeyRef?
+            RegisterEventHotKey(
+                binding.keyCode,
+                modifiers,
+                EventHotKeyID(signature: OSType(0x564F_5858), id: binding.id),  // 'VOXX'
+                GetApplicationEventTarget(),
+                0,
+                &reference
+            )
+            if let reference { hotKeyRefs.append(reference) }
+        }
     }
 
-    func replyHotKeyFired() {
-        // Ignore while the mic is already live or a control is mid-flight; the
-        // reply capture would just collide with the active turn.
-        guard !microphoneOpen, !controlInFlight else { return }
-        replyToLastSpeaker()
+    func hotKeyFired(id: UInt32, pressed: Bool) {
+        switch id {
+        case HotKeyBinding.reply.id:
+            guard pressed else { return }
+            // Ignore while the mic is already live or a control is mid-flight;
+            // the reply capture would just collide with the active turn.
+            guard !microphoneOpen, !controlInFlight else { return }
+            replyToLastSpeaker()
+        case HotKeyBinding.turn.id:
+            guard pressed else { return }
+            toggleTurnGate()
+        default:
+            return
+        }
+    }
+
+    // Tap to talk, tap again to send. Not hold: a spoken turn runs 40-60
+    // seconds and nobody holds a key that long. The runtime answers with the
+    // gate state, so the two taps cannot drift out of step with it.
+    private func toggleTurnGate() {
+        let action = gateOpen ? "gate_close" : "gate_open"
+        let notice = gateOpen ? "Sending…" : "Listening…"
+        // Deliberately not serialised: the second tap must never be swallowed
+        // by a poll-triggered control that is still in flight, or the turn
+        // would stay open with no way to close it.
+        sendControl(action, notice: notice, serialized: false)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         quitting = true
         timer?.invalidate()
-        if let replyHotKeyRef { UnregisterEventHotKey(replyHotKeyRef) }
+        for reference in hotKeyRefs { UnregisterEventHotKey(reference) }
+        hotKeyRefs.removeAll()
         DistributedNotificationCenter.default().removeObserver(self)
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         stopChildRuntime()
@@ -449,6 +517,7 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     self.state = "offline"
                     self.detail = error.localizedDescription
                     self.microphoneOpen = false
+                    self.gateOpen = false
                     self.updatePresentation()
                     if self.runtime == nil { self.startChildRuntime() }
                     return
@@ -464,6 +533,10 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 }
                 self.state = (payload["state"] as? String) ?? (payload["status"] as? String) ?? "online"
                 self.microphoneOpen = (payload["microphone_open"] as? Bool) ?? false
+                // The runtime owns the gate; the key only ever asks for the
+                // flip. Reading it back is what keeps a missed or duplicated
+                // tap from leaving the toggle inverted forever.
+                self.gateOpen = (payload["gate_open"] as? Bool) ?? self.microphoneOpen
                 self.micArmedForBargeIn = (payload["mic_armed_for_barge_in"] as? Bool) ?? false
                 self.micLevel = CGFloat((payload["mic_level"] as? Double) ?? 0)
                 self.detail = (payload["detail"] as? String) ?? "Local-only runtime connected"
@@ -685,9 +758,20 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         return detail
     }
 
-    private func sendControl(_ action: String, notice: String, extra: [String: Any] = [:]) {
-        guard !controlInFlight else { return }
-        controlInFlight = true
+    /// - Parameter serialized: pass `false` for hotkey-driven controls. The
+    ///   in-flight guard exists so panel buttons cannot be double-fired, but a
+    ///   turn key whose second tap gets swallowed leaves the microphone open
+    ///   with no way to close it — a far worse failure than a duplicate.
+    private func sendControl(
+        _ action: String,
+        notice: String,
+        extra: [String: Any] = [:],
+        serialized: Bool = true
+    ) {
+        if serialized {
+            guard !controlInFlight else { return }
+            controlInFlight = true
+        }
         actionNotice = notice
         updatePresentation()
         var request = URLRequest(url: baseURL.appendingPathComponent("control"))
@@ -707,7 +791,7 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.controlInFlight = false
+                if serialized { self.controlInFlight = false }
                 if let error {
                     self.actionNotice = "Could not \(action): \(error.localizedDescription)"
                 } else if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
@@ -738,6 +822,8 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         case "cycle_mode": return "Mode cycled. Talk = both · Narrate = agent speaks · Dictate = you only."
         case "note": return "Listening for your note — speak now, then you can walk away."
         case "reply": return "Listening for your reply — speak now, then you can walk away."
+        case "gate_open": return "Listening. Take your time — press ⌃⌥⌘L again to send."
+        case "gate_close": return "Got it. Recording closed; transcribing what you said."
         case "repeat": return "Replaying the agent's last speech."
         default: return "Vox control applied."
         }

@@ -43,8 +43,10 @@ from .audio import (
 
 
 # The transient arrives ~240 ms *after* the stream opens and decays over
-# ~350 ms, so a guard shorter than half a second does not actually cover it.
-DEFAULT_OPEN_GUARD_SECONDS = 0.5
+# ~350 ms. Half a second looked like enough and was not: measured on a
+# FreeClip 2, onset still fired 513 ms after open. The cost of being generous
+# is paid once per session, before the cue that says the mic is live.
+DEFAULT_OPEN_GUARD_SECONDS = 1.0
 
 EventSink = Callable[..., Any]
 
@@ -98,6 +100,12 @@ class PersistentCaptureSource:
     @property
     def gate_open(self) -> bool:
         return self._gate.is_set()
+
+    @property
+    def guard_remaining_s(self) -> float:
+        """How long the newly opened stream still has to be ignored."""
+
+        return max(0.0, self._guard_until - self._clock())
 
     @property
     def dropped_frames(self) -> int:
