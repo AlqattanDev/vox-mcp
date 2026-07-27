@@ -13,8 +13,161 @@ struct HotKeyBinding {
 
     static let reply = HotKeyBinding(id: 1, keyCode: UInt32(kVK_ANSI_R), label: "⌃⌥⌘R")
     static let turn = HotKeyBinding(id: 2, keyCode: UInt32(kVK_ANSI_L), label: "⌃⌥⌘L")
+    static let dictate = HotKeyBinding(id: 3, keyCode: UInt32(kVK_ANSI_D), label: "⌃⌥⌘D")
+    static let read = HotKeyBinding(id: 4, keyCode: UInt32(kVK_ANSI_S), label: "⌃⌥⌘S")
 
-    static let all: [HotKeyBinding] = [.reply, .turn]
+    static let all: [HotKeyBinding] = [.reply, .turn, .dictate, .read]
+}
+
+/// Reads whatever text is selected in the frontmost app.
+///
+/// `AXSelectedText` first, because it is instant and leaves the pasteboard
+/// alone. It returns nothing in plenty of Chromium and Electron surfaces
+/// though, so a synthesized ⌘C is the fallback — with the pasteboard restored
+/// afterwards, and a `changeCount` check so "nothing was selected" is
+/// distinguishable from "the copy landed".
+enum SelectionReader {
+    static func read() -> String? {
+        if let viaAX = accessibilitySelection(), !viaAX.isEmpty { return viaAX }
+        return clipboardSelection()
+    }
+
+    private static func accessibilitySelection() -> String? {
+        let system = AXUIElementCreateSystemWide()
+        var focused: CFTypeRef?
+        guard
+            AXUIElementCopyAttributeValue(
+                system, kAXFocusedUIElementAttribute as CFString, &focused
+            ) == .success,
+            let element = focused
+        else { return nil }
+
+        var selected: CFTypeRef?
+        guard
+            AXUIElementCopyAttributeValue(
+                element as! AXUIElement, kAXSelectedTextAttribute as CFString, &selected
+            ) == .success,
+            let text = selected as? String
+        else { return nil }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func clipboardSelection() -> String? {
+        let pasteboard = NSPasteboard.general
+        let before = pasteboard.changeCount
+        let saved = (pasteboard.pasteboardItems ?? []).map { item -> [String: Data] in
+            var stored: [String: Data] = [:]
+            for type in item.types {
+                if let data = item.data(forType: type) { stored[type.rawValue] = data }
+            }
+            return stored
+        }
+
+        postCommandC()
+
+        // Give the frontmost app a moment to service the copy. If changeCount
+        // never moves, nothing was selected — say so rather than reading back
+        // whatever happened to be on the clipboard already.
+        var text: String?
+        let deadline = Date().addingTimeInterval(0.25)
+        while Date() < deadline {
+            if pasteboard.changeCount != before {
+                text = pasteboard.string(forType: .string)
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+
+        pasteboard.clearContents()
+        if !saved.isEmpty {
+            pasteboard.writeObjects(
+                saved.map { stored in
+                    let item = NSPasteboardItem()
+                    for (raw, data) in stored {
+                        item.setData(data, forType: NSPasteboard.PasteboardType(raw))
+                    }
+                    return item
+                }
+            )
+        }
+        guard let text else { return nil }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func postCommandC() {
+        guard let source = CGEventSource(stateID: .combinedSessionState) else { return }
+        let c = CGKeyCode(kVK_ANSI_C)
+        guard
+            let down = CGEvent(keyboardEventSource: source, virtualKey: c, keyDown: true),
+            let up = CGEvent(keyboardEventSource: source, virtualKey: c, keyDown: false)
+        else { return }
+        down.flags = .maskCommand
+        up.flags = .maskCommand
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+    }
+}
+
+/// Puts dictated text at the cursor of whatever app is focused.
+///
+/// Clipboard plus a synthesized ⌘V, deliberately, over the alternatives:
+/// posting one key event per character is slow for a minute of dictation and
+/// breaks outright on Arabic, and writing `AXSelectedText` is unimplemented or
+/// read-only in Chromium and Electron — which is most of where the text is
+/// wanted. Every app with a Paste command works, and the pasteboard is
+/// restored so nothing the user had copied is lost.
+enum TextInjector {
+    static func paste(_ text: String) {
+        let pasteboard = NSPasteboard.general
+        let saved = snapshot(pasteboard)
+
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        postCommandV()
+
+        // The paste is asynchronous in the receiving app; restoring the
+        // pasteboard too eagerly makes it paste whatever was there before.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            restore(saved, to: pasteboard)
+        }
+    }
+
+    private static func snapshot(_ pasteboard: NSPasteboard) -> [[String: Data]] {
+        (pasteboard.pasteboardItems ?? []).map { item in
+            var stored: [String: Data] = [:]
+            for type in item.types {
+                if let data = item.data(forType: type) { stored[type.rawValue] = data }
+            }
+            return stored
+        }
+    }
+
+    private static func restore(_ saved: [[String: Data]], to pasteboard: NSPasteboard) {
+        pasteboard.clearContents()
+        guard !saved.isEmpty else { return }
+        let items: [NSPasteboardItem] = saved.map { stored in
+            let item = NSPasteboardItem()
+            for (raw, data) in stored {
+                item.setData(data, forType: NSPasteboard.PasteboardType(raw))
+            }
+            return item
+        }
+        pasteboard.writeObjects(items)
+    }
+
+    private static func postCommandV() {
+        guard let source = CGEventSource(stateID: .combinedSessionState) else { return }
+        let v = CGKeyCode(kVK_ANSI_V)
+        guard
+            let down = CGEvent(keyboardEventSource: source, virtualKey: v, keyDown: true),
+            let up = CGEvent(keyboardEventSource: source, virtualKey: v, keyDown: false)
+        else { return }
+        down.flags = .maskCommand
+        up.flags = .maskCommand
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+    }
 }
 
 /// A live scrolling waveform of the microphone level. Fed one 0..1 sample per
@@ -91,6 +244,7 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var micLevel: CGFloat = 0
     private var hotKeyRefs: [EventHotKeyRef] = []
     private var gateOpen = false
+    private var dictating = false
 
     private var runtime: Process?
     private var timer: Timer?
@@ -233,9 +387,37 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         case HotKeyBinding.turn.id:
             guard pressed else { return }
             toggleTurnGate()
+        case HotKeyBinding.dictate.id:
+            // The one binding that is a hold, not a tap: the key IS the
+            // utterance boundary, so there is no endpointing to get wrong.
+            if pressed { beginDictation() } else { endDictation() }
+        case HotKeyBinding.read.id:
+            guard pressed else { return }
+            readSelectionAloud()
         default:
             return
         }
+    }
+
+    // Press to hear the selection; press again to stop. Verbatim — the runtime
+    // hands the text straight to Kokoro with no model anywhere on the path.
+    private func readSelectionAloud() {
+        if state.lowercased() == "speaking" {
+            sendControl("cancel", notice: "Stopped reading.", serialized: false)
+            return
+        }
+        guard ensureAccessibility(for: "reading the selection") else { return }
+        guard let selection = SelectionReader.read() else {
+            actionNotice = "Nothing is selected to read."
+            updatePresentation()
+            return
+        }
+        sendControl(
+            "read_aloud",
+            notice: "Reading \(selection.count) characters…",
+            extra: ["text": selection],
+            serialized: false
+        )
     }
 
     // Tap to talk, tap again to send. Not hold: a spoken turn runs 40-60
@@ -811,6 +993,85 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }.resume()
     }
 
+    /// The one control whose *body* matters. Every other sender discards the
+    /// response — dictation has to get the transcript back so it can be typed
+    /// where the user is looking.
+    private func sendDictationEnd(completion: @escaping (String?) -> Void) {
+        var request = URLRequest(url: baseURL.appendingPathComponent("control"))
+        request.httpMethod = "POST"
+        // Whisper small on a two-minute hold is the worst case this has to
+        // survive; the shared 6s ceiling would abandon the transcript.
+        request.timeoutInterval = 30.0
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("status-bar", forHTTPHeaderField: "X-Vox-Control-Source")
+        if let token = controlToken() {
+            request.setValue(token, forHTTPHeaderField: "X-Vox-Token")
+        }
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["action": "dictate_end"])
+        URLSession.shared.dataTask(with: request) { data, _, _ in
+            guard
+                let data,
+                let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                let result = payload["result"] as? [String: Any],
+                let text = result["text"] as? String,
+                !text.isEmpty
+            else {
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+            DispatchQueue.main.async { completion(text) }
+        }.resume()
+    }
+
+    private func controlToken() -> String? {
+        let path = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".vox/control.token")
+        guard let token = try? String(contentsOf: path, encoding: .utf8) else { return nil }
+        return token.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // MARK: - Dictation
+
+    private func beginDictation() {
+        // Ask before capturing, not after: a hold that records fine and then
+        // silently fails to type is the worst possible way to learn that the
+        // permission is missing.
+        guard ensureAccessibility(for: "dictation") else { return }
+        dictating = true
+        sendControl("dictate_start", notice: "Dictating — release ⌃⌥⌘D to type it.", serialized: false)
+    }
+
+    private func endDictation() {
+        guard dictating else { return }
+        dictating = false
+        actionNotice = "Transcribing…"
+        updatePresentation()
+        sendDictationEnd { [weak self] text in
+            guard let self else { return }
+            guard let text else {
+                self.actionNotice = "Nothing was said."
+                self.updatePresentation()
+                return
+            }
+            TextInjector.paste(text)
+            self.actionNotice = "Typed \(text.count) characters."
+            self.updatePresentation()
+        }
+    }
+
+    /// Prompts once, then reports honestly. TCC grants are pinned to the code
+    /// signature, so this can start failing after a rebuild — never let that
+    /// look like the feature simply doing nothing.
+    @discardableResult
+    private func ensureAccessibility(for feature: String) -> Bool {
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
+        if AXIsProcessTrustedWithOptions(options) { return true }
+        actionNotice = "Vox needs Accessibility to use \(feature). "
+            + "Enable Vox in System Settings › Privacy & Security › Accessibility."
+        updatePresentation()
+        return false
+    }
+
     private func successNotice(for action: String) -> String {
         switch action {
         case "start": return "Voice session ready. Shared — any agent may use it. Mic closed until a turn listens."
@@ -824,6 +1085,8 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         case "reply": return "Listening for your reply — speak now, then you can walk away."
         case "gate_open": return "Listening. Take your time — press ⌃⌥⌘L again to send."
         case "gate_close": return "Got it. Recording closed; transcribing what you said."
+        case "dictate_start": return "Dictating — release ⌃⌥⌘D to type it."
+        case "read_aloud": return "Reading your selection. Press ⌃⌥⌘S again to stop."
         case "repeat": return "Replaying the agent's last speech."
         default: return "Vox control applied."
         }

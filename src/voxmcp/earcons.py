@@ -5,8 +5,11 @@ user could not tell a live mic from a dead one — the loudest complaint about t
 runtime. These two synthesized tones close that gap. They are generated once,
 cached under the Vox home, and played through the normal cancellable player.
 
-The start tone plays *blocking, before* the capture stream opens, so it can never
-leak into the recording; the stop tone plays fire-and-forget once the mic closes.
+The start tone plays *blocking, before* the gate opens, so it can never leak
+into the recording; the stop tone plays fire-and-forget once the mic closes. A
+third, lower tone marks a request that could not be carried out — there was
+nothing selected to read, or a permission is missing — because a key that
+silently does nothing is indistinguishable from a key that is broken.
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ import numpy as np
 from .audio import write_wav_atomic
 
 # Bump when the tones change so cached wavs regenerate on the next run.
-_VERSION = "v1"
+_VERSION = "v2"
 _SAMPLE_RATE = 24_000
 _AMPLITUDE = 0.28
 
@@ -49,18 +52,24 @@ def _tone(sequence: list[tuple[float, float]]) -> np.ndarray:
 
 
 # Rising two-note blip = "mic open, talk now"; falling = "mic closed, I stopped".
+# The error tone sits below both and repeats one note, so it is unmistakably
+# not either of them even heard out of the corner of your ear.
 _START_SEQUENCE = [(660.0, 0.075), (990.0, 0.085)]
 _STOP_SEQUENCE = [(880.0, 0.075), (560.0, 0.100)]
+_ERROR_SEQUENCE = [(392.0, 0.090), (0.0, 0.040), (392.0, 0.120)]
 
 
-def ensure_earcons(assets_dir: Path) -> tuple[Path, Path]:
-    """Return ``(start_wav, stop_wav)``, synthesizing them if not already cached."""
+def ensure_earcons(assets_dir: Path) -> tuple[Path, Path, Path]:
+    """Return ``(start_wav, stop_wav, error_wav)``, synthesizing what is missing."""
 
     assets_dir = Path(assets_dir).expanduser()
     start = assets_dir / f"listen_start.{_VERSION}.wav"
     stop = assets_dir / f"listen_stop.{_VERSION}.wav"
+    error = assets_dir / f"cue_error.{_VERSION}.wav"
     if not start.is_file():
         write_wav_atomic(start, _tone(_START_SEQUENCE), _SAMPLE_RATE)
     if not stop.is_file():
         write_wav_atomic(stop, _tone(_STOP_SEQUENCE), _SAMPLE_RATE)
-    return start, stop
+    if not error.is_file():
+        write_wav_atomic(error, _tone(_ERROR_SEQUENCE), _SAMPLE_RATE)
+    return start, stop, error

@@ -45,6 +45,8 @@ class FakeEngine:
         "listen",
         "session",
         "control",
+        "dictate",
+        "read_aloud",
         "service",
         "diagnostics",
         "transcribe",
@@ -493,6 +495,46 @@ async def test_the_turn_key_reaches_the_engine_over_loopback(tmp_path: Path) -> 
             headers={"X-Vox-Token": "correct-horse"},
         )
     assert blocked.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_dictation_and_read_aloud_reach_the_engine_over_loopback(tmp_path: Path) -> None:
+    """Both work with no MCP client connected — that is the point of them."""
+
+    engine = FakeEngine(tmp_path / "latest.wav")
+    server = create_mcp(engine, control_token="correct-horse")
+    app = server.http_app(path="/mcp")
+
+    transport = ASGITransport(app=app, client=("127.0.0.1", 50123))
+    async with AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
+        started = await client.post(
+            "/control",
+            json={"action": "dictate_start"},
+            headers={"X-Vox-Token": "correct-horse"},
+        )
+        ended = await client.post(
+            "/control",
+            json={"action": "dictate_end"},
+            headers={"X-Vox-Token": "correct-horse"},
+        )
+        read = await client.post(
+            "/control",
+            json={"action": "read_aloud", "text": "exactly these words"},
+            headers={"X-Vox-Token": "correct-horse"},
+        )
+        unauthorised = await client.post("/control", json={"action": "dictate_end"})
+
+    assert [started.status_code, ended.status_code, read.status_code] == [200, 200, 200]
+    assert unauthorised.status_code == 401
+
+    dictate_calls = [arguments for name, arguments in engine.calls if name == "dictate"]
+    assert dictate_calls == [
+        {"action": "dictate_start", "client_id": "http-control"},
+        {"action": "dictate_end", "client_id": "http-control"},
+    ]
+    # The selection reaches the engine unaltered; nothing on this path rewrites it.
+    read_calls = [arguments for name, arguments in engine.calls if name == "read_aloud"]
+    assert read_calls == [{"client_id": "http-control", "text": "exactly these words"}]
 
 
 @pytest.mark.asyncio

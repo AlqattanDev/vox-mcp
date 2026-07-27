@@ -1759,10 +1759,12 @@ async def test_dictation_wins_over_a_turn_that_is_already_listening(tmp_path: Pa
         assert await wait_for(lambda: engine.microphone_open)
 
         await engine.dictate("http-control", "dictate_start")
-        # The interrupted turn ended the honest way: what was already said is
-        # still transcribed rather than thrown away.
+        # The interrupted turn ended the honest way — manual end, not cancel —
+        # so whatever had already been said is kept rather than discarded. How
+        # much that is depends on when the key landed, so the assertion is on
+        # the reason, not on the words.
         heard = await listening
-        assert heard["transcript"] == "hello world"
+        assert heard["capture"]["reason"] == "manual_end"
 
         await asyncio.sleep(0.3)
         result = await engine.dictate("http-control", "dictate_end")
@@ -1802,3 +1804,87 @@ async def test_an_unknown_dictation_action_is_refused(tmp_path: Path):
     engine, _ = make_live_engine(tmp_path)
     with pytest.raises(VoxError):
         await engine.dictate("http-control", "dictate_sideways")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_pausing_closes_the_microphone_even_mid_dictation(tmp_path: Path):
+    """Pause is a privacy stop and must be able to stop everything.
+
+    A dictation holds the microphone through its own control, so leaving it
+    out of the cancel path made pause and stop wait three seconds for a
+    capture nothing had signalled, then report the runtime wedged — with the
+    microphone still open the whole time.
+    """
+
+    engine, mic = make_live_engine(tmp_path)
+    await engine.dictate("http-control", "dictate_start")
+    assert await wait_for(lambda: engine.microphone_open)
+
+    await engine.session("http-control", "pause")
+
+    assert engine.microphone_open is False
+    assert engine.stream_open is False
+    assert mic.closes == 1
+
+    # The audio is discarded, not typed somewhere the user stopped looking.
+    result = await engine.dictate("http-control", "dictate_end")
+    assert result["text"] == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_read_aloud_speaks_the_selection_exactly_as_given(tmp_path: Path):
+    """No model on this path: what is selected is what is spoken."""
+
+    speech = CountingSpeech()
+    engine = make_engine(tmp_path, speech_client=speech)
+    selection = "Deploy 3 replicas to eu-west-1 at 07:45, not 0745."
+
+    result = await engine.read_aloud("http-control", text=selection)
+
+    assert result["status"] == "completed"
+    assert "".join(speech.spans) == selection
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_read_aloud_refuses_an_empty_selection_without_speaking(tmp_path: Path):
+    speech = CountingSpeech()
+    engine = make_engine(tmp_path, speech_client=speech)
+
+    for empty in (None, "", "   \n\t "):
+        result = await engine.read_aloud("http-control", text=empty)
+        assert result == {"status": "skipped", "reason": "empty_selection"}
+    assert speech.spans == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_read_aloud_queues_behind_an_agent_instead_of_talking_over_it(tmp_path: Path):
+    """Ali's call: the agent finishes its sentence, then the selection is read."""
+
+    speech = CountingSpeech()
+    engine = make_engine(tmp_path, speech_client=speech)
+
+    agent_turn = asyncio.create_task(engine.speak("claude", "The agent was already talking."))
+    reading = asyncio.create_task(engine.read_aloud("http-control", text="And then the selection."))
+    await asyncio.gather(agent_turn, reading)
+
+    assert speech.spans == ["The agent was already talking.", "And then the selection."]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_read_aloud_speaks_even_in_dictate_mode(tmp_path: Path):
+    """io_mode governs what agents may do with the speaker, not the user."""
+
+    speech = CountingSpeech()
+    engine = make_engine(tmp_path, speech_client=speech)
+    engine._save_io_mode("dictate")
+
+    assert (await engine.speak("claude", "agents stay quiet"))["status"] == "skipped"
+    assert (await engine.read_aloud("http-control", text="but this is read"))["status"] == (
+        "completed"
+    )
+    assert speech.spans == ["but this is read"]

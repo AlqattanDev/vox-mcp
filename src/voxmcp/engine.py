@@ -136,7 +136,7 @@ class VoxEngine:
         self.input_device: int | str | None = os.environ.get("VOX_INPUT_DEVICE")
         self.volume = min(1.0, max(0.0, float(os.environ.get("VOX_VOLUME", "1"))))
         self._earcons_enabled = earcons_enabled()
-        self._earcon_paths: tuple[Path, Path] | None = None
+        self._earcon_paths: tuple[Path, Path, Path] | None = None
         self._stream_tts = os.environ.get("VOX_STREAM_TTS", "1").strip().lower() not in {
             "0",
             "false",
@@ -605,6 +605,7 @@ class VoxEngine:
             task = self._active_task
             control = self._capture_control
             barge_control = self._barge_in_control
+            dictation = self._dictation_control
             playback = self._playback
             interruptible = self._playback_interruptible
             client = self._active_client
@@ -628,10 +629,27 @@ class VoxEngine:
             and task is not None
             and task is not asyncio.current_task()
         )
-        signalled = cancel_control or cancel_barge_in or cancel_playback or cancel_async_task
+        # A dictation holds the microphone through its own control, not
+        # _capture_control. Leaving it out made pause and stop unable to close
+        # the mic at all — they waited three seconds for a capture nothing had
+        # signalled and then reported the runtime wedged. Pause and stop are
+        # privacy stops, so a dictation is *cancelled*: the audio is discarded
+        # rather than typed somewhere the user is no longer looking.
+        cancel_dictation = dictation is not None
+        signalled = (
+            cancel_control
+            or cancel_barge_in
+            or cancel_dictation
+            or cancel_playback
+            or cancel_async_task
+        )
         if signalled and not manual_end:
             with self._active_lock:
                 self._cancel_requested = True
+        if dictation is not None:
+            with self._active_lock:
+                self._microphone_closing = True
+            dictation.cancel()
         if control is not None:
             with self._active_lock:
                 self._microphone_closing = True
@@ -1155,7 +1173,7 @@ class VoxEngine:
             "audio_path": str(first_replay) if first_replay is not None else None,
         }
 
-    def _earcon_files(self) -> tuple[Path, Path] | None:
+    def _earcon_files(self) -> tuple[Path, Path, Path] | None:
         if not self._earcons_enabled:
             return None
         if self._earcon_paths is None:
@@ -1187,6 +1205,21 @@ class VoxEngine:
             return
         try:
             self.player.play_file(cues[1], volume=self.volume, blocking=False)
+        except Exception:
+            pass
+
+    def _play_error_cue(self) -> None:
+        """Say "that did not happen" out loud.
+
+        A hotkey that quietly does nothing reads as a broken hotkey, and the
+        user presses it again harder rather than looking for the reason.
+        """
+
+        cues = self._earcon_files()
+        if cues is None:
+            return
+        try:
+            self.player.play_file(cues[2], volume=self.volume, blocking=False)
         except Exception:
             pass
 
@@ -1662,6 +1695,38 @@ class VoxEngine:
             return {**result, "io_mode": self._io_mode, "session": self.state.snapshot().to_dict()}
 
         return await self._run_operation(client_id, "speak", operation, agent=agent)
+
+    async def read_aloud(self, client_id: str, *, text: str | None = None, **_: Any) -> dict[str, Any]:
+        """Read the user's selection back to them, exactly as written.
+
+        The verbatim guarantee is structural rather than a promise: this goes
+        straight to Kokoro, so there is no model, prompt, or rewrite anywhere
+        on the path that could paraphrase a number, a name, or a line of code.
+        Deliberately not routed through converse for that reason.
+
+        It queues behind an agent that is already speaking instead of cutting
+        it off — which is simply what the operation gate already does.
+        """
+
+        message = (text or "").strip()
+        if not message:
+            return {"status": "skipped", "reason": "empty_selection"}
+
+        async def operation() -> dict[str, Any]:
+            # io_mode is about what agents may do with the speaker; this is the
+            # user asking out loud, so it applies regardless of mode.
+            result = await self._speak_locked(
+                client_id,
+                message,
+                voice=await self._agent_voice(None),
+                speed=1.0,
+                instructions=None,
+                interruptible=True,
+            )
+            self._log("read_aloud.completed", client_id=client_id, chars=len(message))
+            return {**result, "session": self.state.snapshot().to_dict()}
+
+        return await self._run_operation(client_id, "read_aloud", operation)
 
     async def listen(
         self,
