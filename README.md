@@ -17,8 +17,15 @@ loopback address; Vox refuses to start if they do not.
   second agent — or one agent's own next `converse` — waits its turn rather
   than losing the reply. Waiting is bounded at 30s, and `cancel`/`stop` drain
   the queue instead of orphaning it.
-- The microphone opens only for one bounded `listen` turn or a
-  response-waiting `converse`; manual end provides push-to-talk behavior.
+- One capture stream per session with a software gate in front of it, rather
+  than a stream opened and closed around every turn. Audio reaches the
+  endpointer and Whisper only while the gate is open — which is only while a
+  turn is actually running. With the gate shut, frames are dropped in the
+  realtime callback: nothing is queued, buffered, or classified. `pause`,
+  `mute`, and `stop` still tear the stream down entirely.
+- Global hotkeys that work in any app and need no permission grant, because
+  Carbon hotkeys need none: **⌃⌥⌘L** to open a turn and again to send it,
+  **⌃⌥⌘R** to reply to whoever last spoke.
 - `pause`, `resume`, `stop`, replay, manual end-of-turn, and cancellation are
   daemon controls and remain available even when an MCP adapter reconnects.
 - Native microphone sample-rate capture with a single high-quality resample;
@@ -98,5 +105,37 @@ reload. The Vox daemon persists across later host restarts and updates.
 
 The `Vox` item in the macOS menu bar is a local control panel, not an
 always-listening toggle. Click it to start/pause/stop a session or cancel the
-current turn; starting or resuming only makes Vox ready. The microphone stays
-closed until a host calls `listen` or response-waiting `converse`.
+current turn; starting or resuming only makes Vox ready. A session holds one
+capture stream open, but the gate in front of it stays shut until a turn
+actually runs, so nothing you say between turns reaches the endpointer or
+Whisper. `pause`, `mute`, and `stop` release the device outright.
+
+## Working without an agent
+
+Two of the hotkeys have nothing to do with MCP and keep working with every
+agent host closed:
+
+- **⌃⌥⌘D held** dictates into whatever app is focused. Everything between
+  press and release goes to Whisper — no endpointing, no voice activity
+  detection, because the key already says where the utterance starts and
+  stops. The text is pasted at the cursor and your clipboard is restored.
+  Local rules strip Whisper's ambient annotations and spoken hesitation
+  (`VOX_DICTATION_CLEANUP=rules|off`); no model rewrites what you said.
+- **⌃⌥⌘S** reads the current selection aloud, word for word. The text goes
+  straight to Kokoro, so there is nothing on the path that could paraphrase a
+  number, a name, or a line of code. Press again to stop. It queues behind an
+  agent that is already speaking rather than talking over it.
+
+## Permissions
+
+- **Microphone** — required for everything. Requested on first launch.
+- **Accessibility** — required only for ⌃⌥⌘D and ⌃⌥⌘S, which post ⌘V/⌘C and
+  read the focused element. Vox prompts the first time you use either, and
+  says so in the panel rather than failing silently. Grant it to
+  `Vox` under System Settings › Privacy & Security › Accessibility.
+
+macOS pins these grants to the app's code signature, so the build refuses to
+fall back to ad-hoc signing: an ad-hoc signature changes on every build and
+would revoke Accessibility on every install with no error to explain why
+dictation stopped working. Set `VOX_CODESIGN_IDENTITY` if the identity is not
+found automatically.

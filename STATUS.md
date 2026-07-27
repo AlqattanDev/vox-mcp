@@ -157,6 +157,9 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
   `set_mode` / `cycle_mode`; persisted in `~/.vox/state/io_mode`.
 - **Menu bar glyph (baked colour).** A glanceable SF Symbol: a **red mic only
   when `microphone_open` is truly set**, so idle/speaking never read as "hot."
+  With a session-lived stream that flag tracks the **gate**, not the device:
+  red means audio can reach Whisper, which is what the user actually cares
+  about. `/health.stream_open` reports the device separately.
   **Left-click while the mic is live ends the turn**; right-click / mic-closed
   click opens the panel. The glyph colour is **painted into the image pixels**
   (non-template, palette-tinted from `AppleInterfaceStyle`), not left to the
@@ -244,7 +247,7 @@ full 1.6 s — and is never cut off mid-thought.
 | `com.vox.runtime` | ~73 MB | ~73 MB |
 | **total** | **~2.7 GB** | **~3.2 GB** |
 
-Tests: `.venv/bin/python -m pytest tests/` — **276 passing**.
+Tests: `.venv/bin/python -m pytest tests/` — **387 passing**.
 
 **Slash commands** (in `~/.claude/commands/`, global): `/speak` reads the
 agent's last reply aloud (no mic); `/listen` opens the mic for one utterance
@@ -255,6 +258,13 @@ installs to `~/Applications/Vox.app` **cleanly** (removes the old app first —
 `cp -R` into an existing dir nests the app and leaves launchd running the stale
 binary), guards against nesting, and restarts `com.vox.runtime`. The editable
 Python runtime picks up code changes on that restart.
+
+The build **fails without a persistent codesigning identity** (currently Apple
+Development, team `YN9839UZF5`). That is deliberate: macOS pins Accessibility
+to the code signature, and the old ad-hoc fallback minted a new cdhash every
+build — silently revoking dictation and read-aloud on every deploy with nothing
+to explain why. Set `VOX_CODESIGN_IDENTITY`, or `VOX_ALLOW_ADHOC_SIGN=1` to
+build anyway and re-grant by hand.
 
 ## Wired agents
 
@@ -290,25 +300,74 @@ after launch. One of them had an existing test that asserted the microphone
 closed but never that the state machine recovered — it passed throughout. Verify
 aloud before believing green, and assert the state, not just the device.
 
-## Voice suite — verified spec ready to build
+## The voice suite (shipped 2026-07-27)
 
-`VOICE-SUITE-VERIFIED.md` (2026-07-27) is the implementation-ready spec for
-the persistent mic + keyboard gate, system-wide hold-to-talk dictation, and
-verbatim read-aloud. Every diagnosis in `VOICE-GATE-BRIEF.md` was verified
-against code, the event log, and live hardware. Key findings: the mic
-flicker is a **Bluetooth HFP stream-open transient** (−27 dBFS burst ~240 ms
-after every stream open on the FreeClip 2 — reproduced on demand, echo
-refuted); `mute` is a privacy teardown, not a gate; Vox holds **no
-Accessibility permission** (needed for dictation/read-aloud injection, and
-the build's ad-hoc signing fallback would kill the grant every deploy);
-`capture_from_frames` is the ready-made sink for the persistent stream.
-Build order F1 → F2 → F3, acceptance tests in the spec.
+**One capture stream per session, with a gate in front of it.** Vox used to
+open and close an `InputStream` twice per turn — the armed barge-in capture,
+then a fresh one ~130 ms later. On the FreeClip 2 every open emits a broadband
+transient about **240 ms after the stream engages**, ~24 dB above the initial
+threshold, decaying over ~350 ms. WebRTC endorses broadband noise and 60 ms of
+it satisfies `speech_start_s`, so turns opened on a pop nobody made, endpointed
+at ~0.9 s, and came back `stt.non_speech` — while the words actually spoken
+landed in the dead air between two phantom windows. Reproduced on demand from a
+cold start with no TTS playing; echo was refuted as the cause.
+
+`PersistentCaptureSource` (`src/voxmcp/capture_source.py`) opens one stream per
+session and drops frames **in the realtime callback** whenever no capture holds
+the gate — nothing queued, buffered, or classified between turns. Turns run
+through the existing endpointing path via `capture_from_frames`; the frame
+generator ends itself on the control flags, so the exhaustion branch resolves
+the right stop reason with no new state-machine code. `pause`/`mute`/`stop`
+keep their meaning and tear the stream down.
+
+The open guard is **1.0 s, not 0.5 s**: half a second was measured to be too
+short — onset still fired 513 ms after open and reproduced the flicker exactly.
+`_capture_once` waits the remainder out *before* the start cue, so the rising
+blip means "I can hear you now" rather than "soon", and so the cue itself —
+played into the same headset the mic is in — cannot bleed into the recording.
+
+**Hotkeys, all permission-free Carbon combos.** ⌃⌥⌘R reply · **⌃⌥⌘L** turn key
+(tap to talk, tap to send) · **⌃⌥⌘D** held dictates at the cursor · **⌃⌥⌘S**
+reads the selection aloud. The Carbon handler had to be rewritten first: it
+installed one `EventTypeSpec` and ignored all three of its arguments, so it
+could tell neither which hotkey fired nor whether the key went down or up.
+
+**Dictation and read-aloud need no MCP client and no voice session.** Dictation
+uses `capture_raw_from_frames` — a genuinely raw path, not the endpointer in a
+costume. The first attempt reused `AdaptiveCaptureState` with a classifier that
+voted speech on every frame; that is wrong because `_classify` still gates a
+positive vote on the adaptive energy threshold, so a quiet start is dropped.
+Live, it captured 5.2 s and returned nothing. Injection is clipboard + ⌘V in
+Swift (per-character events break on Arabic; `AXSelectedText` writes are
+read-only in Chromium/Electron). Read-aloud goes straight to Kokoro — no model
+on the path — and queues behind an agent that is already speaking.
+
+**Accessibility is now required** for ⌃⌥⌘D and ⌃⌥⌘S. macOS pins TCC grants to
+the code signature, so `build_macos_app.sh` **fails** rather than falling back
+to ad-hoc signing, which would revoke the grant on every install with no error
+anywhere. `VOX_ALLOW_ADHOC_SIGN=1` opts out.
+
+**Device note:** the FreeClip cancels its own speaker out of the mic feed, so
+playing audio through it to test capture measures −61 dBFS. It is not a usable
+loopback — test capture by speaking.
+
+New `/control` actions: `gate_open`, `gate_close`, `dictate_start`,
+`dictate_end`, `read_aloud`. New knobs: `VOX_PERSISTENT_CAPTURE` (1),
+`VOX_STREAM_OPEN_GUARD_SECONDS` (1.0), `VOX_DICTATION_CLEANUP` (`rules`),
+`VOX_DICTATION_MAX_SECONDS` (120). `/health` gains `gate_open` and
+`stream_open`, which stop being the same thing.
 
 ## Next steps
 
-- **Build the voice suite from `VOICE-SUITE-VERIFIED.md`** (supersedes the
-  "dictation out of scope" line that used to sit here — it is now in scope,
-  spec'd, at the runtime level).
+- **Verify the voice suite aloud.** Machine-checkable acceptance passed: one
+  stream open across three turns (was two per turn), zero `listening.started`
+  through 30 s of speech with the gate shut, zero phantom windows on a cold
+  open, and pause/stop/deliver_text unchanged. Still needs a human voice: a
+  60 s turn with long pauses landing as one clean transcript, barge-in still
+  firing on earbuds, dictation into Chrome/Notes/Slack/a terminal (verify the
+  clipboard is restored using an *image*, not text), Arabic round-tripping, and
+  read-aloud spot-checked against numbers, names, and code. Grant Accessibility
+  on first ⌃⌥⌘D press.
 - **Confirm the `UserPromptSubmit` hook fires during a running tool call.** The
   hook is installed (`.claude/settings.json` →
   `scripts/claude_code_deliver_text.sh`) and the script is verified end to end:

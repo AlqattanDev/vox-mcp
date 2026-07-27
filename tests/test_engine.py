@@ -1366,7 +1366,12 @@ class ScriptedMic:
     SPEECH_FRAMES = 10
     SILENT_FRAMES = 10
 
-    def __init__(self) -> None:
+    def __init__(self, *, silent_frames: int | None = None) -> None:
+        # silent_frames=0 is "someone who has not stopped talking" — the only
+        # way to test a control that ends a turn, since otherwise trailing
+        # silence ends it first and there is nothing left to signal.
+        if silent_frames is not None:
+            self.SILENT_FRAMES = silent_frames
         self.opens = 0
         self.closes = 0
         self._running = threading.Event()
@@ -1400,7 +1405,11 @@ class ScriptedMic:
                         amplitude = 0.4 if index % period < owner.SPEECH_FRAMES else 0.0
                         frame = np.full(block, amplitude, dtype=np.float32)
                         callback(frame.reshape(-1, 1), block, None, None)
-                        time.sleep(0.002)
+                        # Still four times faster than the 20 ms frames it is
+                        # pretending to deliver. Any tighter and several of
+                        # these threads running at once starve the executor
+                        # the captures they feed are running on.
+                        time.sleep(0.005)
 
                 threading.Thread(target=pump, daemon=True).start()
 
@@ -1424,10 +1433,10 @@ class ScriptedMic:
         return Stream()
 
 
-def make_live_engine(tmp_path: Path):
+def make_live_engine(tmp_path: Path, *, silent_frames: int | None = None):
     """An engine whose recorder is the real one, over a scripted device."""
 
-    mic = ScriptedMic()
+    mic = ScriptedMic(silent_frames=silent_frames)
     store = AudioStore(tmp_path / "audio")
     recorder = AudioRecorder(
         CaptureConfig(
@@ -1449,7 +1458,7 @@ def make_live_engine(tmp_path: Path):
     return engine, mic
 
 
-async def wait_for(predicate, timeout: float = 5.0) -> bool:
+async def wait_for(predicate, timeout: float = 15.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
@@ -1532,7 +1541,7 @@ async def test_pausing_releases_the_device_and_resuming_reopens_it(tmp_path: Pat
 @pytest.mark.asyncio
 @pytest.mark.timeout(30)
 async def test_the_turn_key_opens_a_turn_and_closing_it_submits(tmp_path: Path):
-    """Tap to talk, tap to send — the hotkey path, end to end."""
+    """Tap to talk, tap to send — the second tap must reach a live capture."""
 
     engine, mic = make_live_engine(tmp_path)
     try:
@@ -1544,15 +1553,36 @@ async def test_the_turn_key_opens_a_turn_and_closing_it_submits(tmp_path: Path):
         assert await wait_for(lambda: engine.microphone_open)
         assert engine.gate_open is True
 
+        # Promptly, while the capture is certainly still running. The mic
+        # cannot be made to talk forever: the adaptive floor learns any
+        # unvarying sound as the room, which is exactly what it is for.
         closed = await engine.control("http-control", "gate_close")
         assert closed["status"] == "gate_closed"
         assert closed["signalled"] is True
+        assert closed["manual_end"] is True
 
         assert await wait_for(lambda: not engine.microphone_open)
         assert engine.gate_open is False
-        # The turn was submitted, not discarded: it is waiting to be claimed.
-        assert await wait_for(lambda: bool(engine.notes.pending_targets()))
+        assert engine.stream_open is True  # the turn ended, the session did not
         assert mic.opens == 1
+    finally:
+        await engine.session("http-control", "stop")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_a_turn_opened_by_the_key_is_submitted_not_discarded(tmp_path: Path):
+    """What was said reaches an agent, addressed to whoever last spoke."""
+
+    engine, _ = make_live_engine(tmp_path)
+    try:
+        await engine.control("http-control", "gate_open")
+        # Trailing silence stays on as the fallback end — the key is the
+        # primary signal, not the only one.
+        assert await wait_for(lambda: bool(engine.notes.pending_targets()))
+        note = engine.notes.claim("*")
+        assert note is not None
+        assert note["transcript"] == "hello world"
     finally:
         await engine.session("http-control", "stop")
 

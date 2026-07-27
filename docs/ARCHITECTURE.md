@@ -6,8 +6,11 @@ Claude Code ── Streamable HTTP ─┐
 Codex ──────── Streamable HTTP ─┼── 127.0.0.1:8766/mcp
                                │          Vox runtime (launchd)
 CLI / menu bar ─ local control ┘             │
-                                             ├── audio state machine
-                                             ├── native-rate CoreAudio capture
+       (owns the global hotkeys)             ├── audio state machine
+                                             ├── one native-rate CoreAudio
+                                             │   stream per session, behind a
+                                             │   gate that drops frames in the
+                                             │   realtime callback when shut
                                              ├── bounded recovery/replay store
                                              ├── service watchdog
                                              └── one hardware owner/lease
@@ -30,6 +33,21 @@ dead stdio child.
 Vox is a launchd-supervised Streamable HTTP server. Host processes are only
 clients. Claude Code and Codex can reconnect independently; audio cancellation
 and cleanup happen inside the process that owns the device.
+
+## Why the hotkeys live in the Swift app
+
+VoxStatus already owns the control token, the `/control` plumbing, and the
+runtime's lifecycle, so it owns the keys too. Carbon's `RegisterEventHotKey`
+needs no Input Monitoring or Accessibility grant and delivers both press and
+release, which is what makes hold-to-talk possible for free. A bare Fn key is
+not registrable that way and would require a CGEventTap — so Vox uses combos
+and does not chase Fn.
+
+Text injection and selection capture stay in Swift for a different reason: they
+post CGEvents and read AX attributes, which need Accessibility, and macOS pins
+that grant to the responsible app bundle. Granting it to the Python child
+separately would be fragile and pointless. The runtime stays permission-free
+apart from the microphone.
 
 ## State and concurrency
 

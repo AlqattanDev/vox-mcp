@@ -1,27 +1,52 @@
 # The Vox listening contract
 
-Vox treats microphone access as a short-lived capability, not as a side effect
-of “voice mode.” A session can remain active for convenience while the
-microphone is physically closed.
+Vox treats *hearing* as a short-lived capability, not as a side effect of
+“voice mode.” A session can remain active for convenience while Vox is deaf.
 
-## When Vox listens
+## Two different things
 
-| Situation | Microphone |
-|---|---|
-| Vox runtime starts | Closed |
-| A voice session starts | Closed; state becomes `IDLE` |
-| `speak` or `converse(..., wait_for_response=false)` | Closed |
-| `converse(..., wait_for_response=true)` | Opens only after playback has fully drained |
-| `converse(...)` with barge-in enabled | Opens *during* playback, gated against Vox's own voice, so talking interrupts |
-| `listen` | Opens immediately for one bounded turn |
-| A `listen` turn is used as push-to-talk | Open until manual end, then closed |
-| The user says a short standalone “wait” phrase | Closed during the wait, then reopened for a fresh bounded turn |
-| No speech arrives within the onset timeout | Closed; session remains `IDLE` |
-| Speech ends | Closed after adaptive trailing silence |
-| Pause, mute, stop, Escape/cancel, sleep, screen lock, route loss, or request cancellation | Closed immediately |
+A session holds **one capture stream** open rather than opening and closing the
+device around every turn — repeated opens are what produced the Bluetooth
+transient that used to start turns nobody spoke. In front of that stream sits a
+**gate**. While the gate is shut, frames are discarded in the realtime callback:
+never queued, never buffered, never endpointed, never sent to Whisper. Vox is
+deaf, and the only thing an open stream costs is the device indicator.
 
-There is no ambient listening by default. Starting the runtime, connecting an
-MCP client, or leaving a voice session active does not open the microphone.
+So there are two questions, and `/health` answers them separately:
+
+- `gate_open` — **can Vox hear you?** This is the one that matters, and the one
+  the red menu-bar mic tracks.
+- `stream_open` — is the audio device held? Released by `pause`, `mute`, and
+  `stop`.
+
+## When Vox can hear you
+
+| Situation | Gate | Stream |
+|---|---|---|
+| Vox runtime starts | Shut | Closed |
+| A voice session starts | Shut; state becomes `IDLE` | Open |
+| Between turns, however long | Shut | Open |
+| `speak` or `converse(..., wait_for_response=false)` | Shut | Open |
+| `converse(..., wait_for_response=true)` | Opens only after playback has fully drained | Open |
+| `converse(...)` with barge-in enabled | Armed *during* playback, gated against Vox's own voice, so talking interrupts | Open |
+| `listen` | Opens for one bounded turn | Open |
+| **⌃⌥⌘L** (first tap) | Opens, with no onset timeout — the key said you are talking | Open |
+| **⌃⌥⌘L** (second tap) | Shuts; the turn is transcribed and submitted | Open |
+| **⌃⌥⌘D** held | Open for exactly as long as the key is down | Open |
+| **⌃⌥⌘S** | Shut — read-aloud never listens | Unchanged |
+| The user says a short standalone “wait” phrase | Shut during the wait, then reopened for a fresh bounded turn | Open |
+| No speech arrives within the onset timeout | Shut; session remains `IDLE` | Open |
+| Speech ends | Shut after adaptive trailing silence | Open |
+| Pause, mute, stop, Escape/cancel, sleep, screen lock, route loss, or request cancellation | Shut immediately | **Closed** |
+
+There is no ambient listening. Starting the runtime, connecting an MCP client,
+or leaving a voice session active never opens the gate — and with the gate shut,
+an open stream delivers nothing to anything.
+
+The first turn after a stream opens waits out a **1.0 s guard** before the gate
+opens, because a Bluetooth headset emits a decaying transient for roughly the
+first 600 ms of any capture. The rising cue plays *after* that wait, so the blip
+means “I can hear you now,” not “soon.”
 
 Default turn bounds are deliberately generous for this user’s speaking style:
 

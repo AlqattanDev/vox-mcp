@@ -30,10 +30,20 @@
 Vox also adds capabilities the installed version does not provide reliably:
 
 - A real persistent session with deterministic close/pause semantics.
-- A 15-second speech-onset timeout instead of leaving the mic open for 90s.
+- One capture stream per session behind a software gate, so a Bluetooth
+  headset is not re-opened twice per turn — which is what made turns start on
+  the stream-open transient rather than on anyone speaking. Frames are dropped
+  in the realtime callback whenever the gate is shut.
+- A 15-second speech-onset timeout instead of leaving the mic open for 90s —
+  waived for a turn the user opened with the key, which has said outright that
+  they intend to speak.
 - Thread-safe cancellation that waits for confirmed microphone closure.
 - A direct MCP `listen` tool, push-to-talk/manual end, and host-independent
   replay/control.
+- Permission-free global hotkeys: a turn key (⌃⌥⌘L), reply (⌃⌥⌘R), and two
+  that need no agent at all — system-wide hold-to-talk dictation (⌃⌥⌘D) and
+  verbatim read-aloud of the selection (⌃⌥⌘S), both of which keep working with
+  every MCP host closed.
 - A visible native macOS status/permission launcher.
 - Frozen, side-by-side, health-checked installs with rollback.
 - Loopback-only backend bindings and bounded private storage.

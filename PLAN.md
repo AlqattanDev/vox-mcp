@@ -1,14 +1,15 @@
-# PLAN — verify what is built, then finish proactive input
+# PLAN — verify the voice suite aloud, then finish proactive input
 
 Read `STATUS.md` first for what the runtime does today. This file is the
 next-step plan and stands alone.
 
-Two of the three items below are **verification, not construction**. Everything
-in steps 1 and 2 is already written, committed, and passing tests — it has
-simply never been used by a human. In the session that built it, three bugs
-(an echo gate that did nothing, a noise floor that cut sentences off mid-word,
-a scope check that answered code questions) were all already marked done, and
-all three were found by *talking to the thing*. Do not trust green.
+**Everything below is verification, not construction.** The voice suite (gate,
+turn key, dictation, read-aloud) is written, committed, pushed, and green — and
+most of it has never been used by a human. This repo has shipped three
+green-test bugs that only speaking aloud found, and this suite has already
+added two more that no test caught: a 0.5 s open guard that was measured to be
+too short, and a second key tap that got swallowed during warm-up. Do not trust
+green.
 
 Ground rules for this repo: commit straight to `main`, never branch. Deploy with
 `zsh scripts/install_macos_app.sh` (Swift rebuild + app install + runtime
@@ -16,118 +17,112 @@ restart); a Python-only change needs just
 `launchctl kickstart -k gui/$(id -u)/com.vox.runtime`. Settings go in
 `~/.vox/settings.json` via `vox set NAME=value` — **not** `launchctl setenv`,
 which never reaches the runtime. Tests: `.venv/bin/python -m pytest tests/`
-(276 passing at handoff).
+(387 passing at handoff).
+
+**The build now fails without a persistent codesigning identity.** That is
+deliberate — see `STATUS.md` → Deploy. If it stops you, fix the identity rather
+than reaching for `VOX_ALLOW_ADHOC_SIGN=1`, or Accessibility dies every install.
 
 ---
 
-## 1. Verify barge-in on headphones
+## 0. Grant Accessibility (one click, blocks §3 and §4)
 
-**Why it is blocked today:** measured on this MacBook, Kokoro through the
-built-in speakers returns into the mic at −22 dBFS p90 while Ali's own voice
-peaks at −29.8. He is ~24 dB *quieter than his own echo*, so no threshold
-separates them. Barge-in therefore reads the default output device and refuses
-to arm unless it is recognisably headphones — `VoxEngine.barge_in_availability()`
-in `src/voxmcp/engine.py`.
+Press **⌃⌥⌘D** once. macOS opens System Settings › Privacy & Security ›
+Accessibility with Vox listed. Enable it. Until then dictation and read-aloud
+report themselves unavailable in the panel — they do not fail silently.
 
-With AirPods or wired headphones set as system output:
+Confirm it stuck across a deploy:
 
 ```bash
-vox set VOX_BARGE_IN_ENABLED=1          # writes settings.json, restarts runtime
-curl -s http://127.0.0.1:8766/health | python3 -m json.tool | grep -i barge
+zsh scripts/install_macos_app.sh
+codesign -dv --verbose=2 ~/Applications/Vox.app 2>&1 | grep TeamIdentifier
 ```
 
-`diagnostics(section="privacy").barge_in.available` must be `true` with the
-headphone device named. If it says `shared_output`, macOS has not actually
-switched output — fix that first.
+`TeamIdentifier` must stay `YN9839UZF5`. If it ever reads `adhoc`, the grant is
+gone and the build guard failed to stop it.
 
-Then by voice, in order:
+## 1. The turn key on real hardware
 
-1. **No false interrupts.** Have the agent speak three long replies while you
-   stay silent. Barge-in must not fire once. If it does, run
-   `vox barge-in calibrate` (needs a real terminal — `click.pause` will not work
-   when driven by an agent) and apply the printed
-   `VOX_BARGE_IN_MAX_VAD_MARGIN_DB` with `vox set`.
-2. **Interrupt mid-sentence.** Talk over a long reply. Acceptance: playback dies
-   within ~0.2 s, `spoken.status == "barge_in"`, and **the transcript contains
-   the first word you spoke** — that proves the pre-roll splice and is the whole
-   point of the design.
-3. **The panel is honest.** While the agent speaks, the menu-bar glyph should be
-   red on the `waveform.badge.mic` symbol and the panel should read
-   **"Speaking · cut in"**. If not, the Swift half was not rebuilt — run
-   `zsh scripts/install_macos_app.sh`.
-4. **Cancel while armed.** `vox control cancel` mid-speech, then confirm
-   `/health` shows `microphone_open: false` and no stuck mic.
+Already verified without a voice: one `capture.stream_opened` across three
+turns, zero `listening.started` through 30 s of speech with the gate shut, zero
+phantom windows on a cold open, and pause/stop/`deliver_text` unchanged.
 
-**If step 1 fails even after calibration**, the honest outcome is that barge-in
-stays off and the Reply button / ⌃⌥⌘R remains the interruption path. Record that
-in `STATUS.md` rather than leaving it looking shippable.
+What needs your voice, with the FreeClip connected:
 
-## 2. Verify the companion past two turns
-
-Live-proven so far: one small-talk answer (3.1 s) and one correct escalation.
-Untested: the loop, the spoken controls inside it, and the interview path.
+1. **A long turn with pauses.** ⌃⌥⌘L, talk for ~60 s with several multi-second
+   thinking pauses, ⌃⌥⌘L. Acceptance: **exactly one** turn, the transcript is
+   complete, and nothing endpointed mid-thought. This is the whole reason the
+   gate-open turn runs with `onset_timeout_s=None`.
+2. **The cue is honest.** The rising blip must land *before* you start talking
+   and after the mic is genuinely live. If the first word of a session is ever
+   clipped, the 1.0 s guard is being waited out in the wrong place.
+3. **Barge-in still works.** With `VOX_BARGE_IN_ENABLED=1` and headphones, talk
+   over a long reply. Acceptance: playback dies within ~0.2 s,
+   `spoken.status == "barge_in"`, and the transcript contains **the first word
+   you spoke** — that proves the pre-roll survived the move to the shared
+   stream, and it now attaches to the live stream instead of opening a second
+   one. Confirm no `capture.stream_opened` appears when arming.
+4. **Read the log, not the vibe.**
 
 ```bash
-vox set VOX_COMPANION_ENABLED=1
+python3 - <<'EOF'
+import json
+rows = [json.loads(l) for l in open('/Users/ali/.vox/state/events.jsonl')][-200:]
+opens = [r for r in rows if r['event'] == 'capture.stream_opened']
+phantom = [r for r in rows if r['event'] == 'listening.stopped'
+           and (r.get('data') or {}).get('speech')
+           and ((r.get('data') or {}).get('duration_s') or 0) < 1.5]
+print('stream opens:', len(opens), '| phantom windows:', len(phantom))
+EOF
 ```
 
-Call the `companion` MCP tool with `budget_turns: 6` and:
+One open per session, zero phantom windows.
 
-- Hold **four or five** small-talk turns. Acceptance: each answers in ~2–4 s in
-  a voice different from the agent's, and `turns[].said` is populated.
-- Say **"stop"** mid-loop. Acceptance: `reason: "user_stopped"`, stops
-  listening.
-- Ask something about the code. Acceptance: `status: "escalated"`,
-  `reason: "out_of_scope"`, `turns[].said` is `null` (the backend must not be
-  called at all), and `transcript` carries everything heard.
-- Kill the backend (`mv ~/grokctl ~/grokctl.off`) and hand over again.
-  Acceptance: escalates with the grokctl failure reason and does **not** hang.
-  Restore afterwards.
+## 2. Dictation, in the apps you actually use
 
-Scope lives in `companion_may_answer` (`src/voxmcp/intents.py`). It requires a
-positive small-talk *signal*. If it wrongly refuses something harmless, add the
-phrase to `_SMALL_TALK_SIGNAL` **and** to `ANSWERABLE` in
-`tests/test_companion.py`. If it wrongly *answers* something about the work,
-that is the serious direction — add to `_WORK_TOPIC` and to `MUST_ESCALATE`.
+Hold **⌃⌥⌘D**, speak, release. The text should land at the cursor.
 
-Then run the interview path once:
-`voice_survey(agent="companion", turns=[...])` with three scripted questions. It
-should read them in the companion voice and return a transcript. This is the
-structured-elicitation use case and it has never been run.
+- Chrome address bar, a Google Doc, Notes, Slack, and a terminal.
+- **Put an image on the clipboard first**, dictate, then paste. The image must
+  still be there — text-only restore would look fine and be wrong.
+- **Arabic.** This is why injection is clipboard+⌘V rather than synthesized
+  keystrokes; if Arabic is mangled the decision was wrong, not the tuning.
+- Release-to-visible under ~1.5 s for a 10 s utterance.
+- With Claude Code **quit**, it must still work. That is the point of dictation
+  living at the runtime level.
 
-## 3. Type-while-listening fusion (construction)
+If the text lands but the filler-stripping is wrong for how you talk, tune the
+`_FILLERS` list in `src/voxmcp/dictation.py` (and its test), or set
+`vox set VOX_DICTATION_CLEANUP=off` for raw Whisper output.
 
-The remaining unbuilt feature, in Ali's words:
+## 3. Read-aloud, verbatim
 
-> "sometimes I wish you are able to read my text at the same time I send it when
-> you are expecting me to speak. I need to wait for you to listen to everything
-> I said, then you will get the message I sent — which just wastes a turn."
+Select text, press **⌃⌥⌘S**. Press again to stop.
 
-A running MCP tool call blocks the host turn, so typed text sits queued until
-`listen` returns. The 75 s cap shortens the dead wait; it does not fix it.
+- Chrome, Notes, a PDF in Preview, and a terminal. AX read is tried first and
+  returns nothing in some Chromium/Electron surfaces; the ⌘C fallback covers
+  those, and your clipboard must be intact afterwards.
+- **Spot-check verbatim on paraphrase-prone material**: numbers, version
+  strings, names, a line of code. Nothing on this path can rewrite them, so any
+  drift is Kokoro's pronunciation, not a model — different bug, different fix.
+- With an agent already speaking, ⌃⌥⌘S must **queue**, not cut in.
+- Nothing selected → the error earcon, not silence.
 
-**Route A — the Vox-side primitive (build this).** A `deliver_text` control
-action that ends an in-flight listen early and returns the typed string:
+## 4. Type-while-listening: confirm the hook fires
 
-- `src/voxmcp/mcp_server.py`: add `deliver_text` to the `/control` allowed-action
-  list and to `dispatch_control`, carrying a `text` argument.
-- `src/voxmcp/audio.py`: `CaptureControl` gains `deliver_text(value)` setting a
-  `threading.Event` plus the string, alongside the existing `cancel` /
-  `end_utterance` / `interrupt` events. `capture()`'s loop already polls those
-  each iteration — add the same check and stop with a new
-  `CaptureStopReason.DELIVERED_TEXT`.
-- `src/voxmcp/engine.py`: `_capture_once` skips Whisper for that reason and
-  returns the supplied text with `status: "delivered_text"`. If no listen is
-  active it is a no-op.
-- Tests: extend the fake-recorder pattern in `tests/test_engine.py` — a listen
-  that receives `deliver_text` returns the typed string, runs no STT, and leaves
-  the session idle.
+The last unfinished item from the previous plan. `deliver_text` is built and
+verified end to end at the runtime level, and it works through the gate (there
+is a test for it — the frame source checks `text_delivered`, which it did not
+originally, and typed turns would have been lost).
 
-**Route B — host glue (probably not buildable).** Something must POST
-`deliver_text` when Ali submits a prompt while a listen is in flight. That needs
-a Claude Code pre-submit hook that can fire during an active tool call. If none
-exists, ship the primitive and stop — a manual hotkey can still POST it.
-**Do not ship a polling hack** that guesses when Ali is typing.
+What is unproven is the **host** half: `.claude/settings.json` →
+`scripts/claude_code_deliver_text.sh` is a `UserPromptSubmit` hook, and hooks
+load at session start. So: start a **fresh** Claude Code session, get a listen
+in flight, and type instead of speaking. Acceptance: the listen returns
+immediately with `backend: delivered_text` and no Whisper call.
+
+If the hook does not fire during a running tool call, `vox control deliver-text`
+stays the manual path. **Do not ship a poller** that guesses when you are typing.
 
 ---
 
@@ -137,8 +132,14 @@ exists, ship the primitive and stop — a manual hotkey can still POST it.
   can drive it.
 - `installer.py` does not create `~/.vox/settings.json`. Missing means defaults,
   which is correct, but a fresh install has no example to copy.
-- `initial_noise_floor_dbfs` only matters for the first ~0.25 s before the
-  rolling window fills. Harmless, slightly vestigial.
+- The FreeClip cancels its own speaker out of the mic feed (−61 dBFS measured),
+  so playing audio through it can never test capture. Speak, or use a separate
+  output device.
+- A session-lived stream keeps the headset in the 16 kHz HFP call profile for
+  as long as the session is up, so Kokoro sounds like a phone call until you
+  pause or stop. This was a deliberate trade for killing the per-turn transient;
+  if it grates, the alternative is closing the stream during playback, which
+  reintroduces one stream-open per turn and is incompatible with barge-in.
 - The voice turn contract is a prompt, not a mechanism. It cut the mean agent
   turn from 30.2 s to 18.1 s but one exchange still ran 26 s. Nothing enforces
   it.
