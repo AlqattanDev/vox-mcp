@@ -73,10 +73,6 @@ class FakeSupervisor:
     async def all_statuses(self): return {}
 
 
-class FakeCompat:
-    pass
-
-
 class CountingSpeech(FakeSpeech):
     def __init__(self) -> None:
         self.spans: list[str] = []
@@ -183,7 +179,6 @@ def make_engine(tmp_path: Path, *, speech=True, recorder=None, player=None, spee
         supervisor=FakeSupervisor(),
         store=store,
         logger=JsonlEventLogger(config.event_log_path),
-        compatibility=FakeCompat(),
         lease=LeaseManager(ttl_seconds=600),
         gate=OperationGate(),
     )

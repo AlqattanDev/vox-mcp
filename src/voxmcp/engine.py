@@ -34,7 +34,6 @@ from .audio import (
     PlaybackHandle,
 )
 from .capture_source import PersistentCaptureSource
-from .compat import LegacyCompatibility
 from .dictation import Runner as ClipboardRunner
 from .dictation import clean_dictation, copy_to_clipboard
 from .companion import COMPANION_AGENT, ask_companion
@@ -93,7 +92,7 @@ def _default_home() -> Path:
 
 
 class VoxEngine:
-    """Coordinates state, hardware, local speech services, and compatibility tools."""
+    """Coordinates state, hardware, and local speech services."""
 
     def __init__(
         self,
@@ -107,7 +106,6 @@ class VoxEngine:
         supervisor: ServiceSupervisor,
         store: AudioStore,
         logger: JsonlEventLogger,
-        compatibility: LegacyCompatibility,
         lease: LeaseManager | None = None,
         gate: OperationGate | None = None,
     ) -> None:
@@ -120,7 +118,6 @@ class VoxEngine:
         self.supervisor = supervisor
         self.store = store
         self.logger = logger
-        self.compatibility = compatibility
         self.lease = lease or LeaseManager(ttl_seconds=max(30.0, config.idle_timeout_seconds))
         self.gate = gate or OperationGate()
         self.gate.on_event = self._log_queue_event
@@ -335,8 +332,6 @@ class VoxEngine:
             ensure_service=ensure,
             whisper_cli=whisper_root / "build" / "bin" / "whisper-cli",
             whisper_model=whisper_root / "models" / "ggml-large-v3-turbo.bin",
-            clone_profiles_path=Path.home() / ".voicemode" / "voices.json",
-            clone_voices_dir=Path.home() / ".voicemode" / "voices",
         )
         engine = cls(
             config=config,
@@ -354,11 +349,6 @@ class VoxEngine:
             logger=JsonlEventLogger(
                 config.event_log_path,
                 include_transcripts=config.persist_transcripts,
-            ),
-            compatibility=LegacyCompatibility(
-                tts_base_url=config.tts_url,
-                stt_base_url=config.stt_url,
-                base_dir=Path.home() / ".voicemode",
             ),
         )
         engine._audio_tempdir = audio_tempdir
@@ -1047,15 +1037,6 @@ class VoxEngine:
     ) -> dict[str, Any]:
         if not message.strip():
             return {"status": "skipped", "reason": "empty_message"}
-        try:
-            from voice_mode.pronounce import get_manager, is_enabled
-
-            if is_enabled():
-                message = get_manager().process_tts(message)
-        except Exception:
-            # Pronunciation customization is optional; malformed legacy rules
-            # must never take the entire local speech path down.
-            pass
         self.state.begin_speaking(client_id=client_id)
         with self._active_lock:
             self._last_spoken_agent = self._pending_agent
@@ -1502,13 +1483,6 @@ class VoxEngine:
             capture.latest_wav_path,
             language=language or self.default_language,
         )
-        try:
-            from voice_mode.pronounce import get_manager, is_enabled
-
-            if is_enabled() and transcription.text:
-                transcription.text = get_manager().process_stt(transcription.text)
-        except Exception:
-            pass
         if is_non_speech_transcript(transcription.text):
             # Audio tripped the gate but Whisper found no words in it — a noise
             # burst, or a marker like [BLANK_AUDIO]. Handing that back as the
@@ -2513,36 +2487,10 @@ class VoxEngine:
         if provider not in {None, "kokoro", "local"}:
             raise VoxError("Vox local-only mode exposes only local Kokoro voices")
         voices = await self._available_voices()
-        clone_names: list[str] = []
-        try:
-            clone_document = json.loads((Path.home() / ".voicemode" / "voices.json").read_text())
-            clone_names = sorted(
-                name
-                for name, value in clone_document.get("voices", {}).items()
-                if isinstance(name, str) and isinstance(value, dict)
-            )
-        except (OSError, ValueError, TypeError):
-            pass
-        clone_backend_ready = False
-        if clone_names:
-            try:
-                async with httpx.AsyncClient(
-                    timeout=1.0, trust_env=False, follow_redirects=False
-                ) as client:
-                    probe = await client.get("http://127.0.0.1:8890/v1/models")
-                    clone_backend_ready = probe.is_success
-            except httpx.HTTPError:
-                pass
         return {
             "provider": "kokoro",
             "endpoint": self.config.tts_url,
             "voices": voices,
-            "clone_voices": clone_names,
-            "clone_backend": {
-                "endpoint": "http://127.0.0.1:8890/v1",
-                "ready": clone_backend_ready,
-                "local_only": True,
-            },
             "default": self.default_voice,
             "agents": dict(self.agent_voices.assignments),
             "local_only": True,
@@ -2706,54 +2654,6 @@ class VoxEngine:
             }
 
         return await self._run_operation(client_id, "survey", operation)
-
-    async def dj(self, client_id: str, action: str, **kwargs: Any) -> dict[str, Any]:
-        del client_id
-        result = await self.compatibility.dj(
-            action,
-            target=kwargs.get("target"),
-            volume=kwargs.get("volume"),
-            limit=int(kwargs.get("limit", 50)),
-        )
-        return result.to_dict()
-
-    async def clone_voice(
-        self, client_id: str, action: str, **kwargs: Any
-    ) -> dict[str, Any]:
-        del client_id
-        audio = Path(kwargs["audio_path"]).expanduser() if kwargs.get("audio_path") else None
-        result = await self.compatibility.clone(
-            action,
-            name=kwargs.get("name"),
-            audio=audio,
-            reference_text=kwargs.get("reference_text"),
-        )
-        return result.to_dict()
-
-    async def soundfonts(
-        self,
-        client_id: str,
-        *,
-        enabled: bool | None = None,
-        action: str | None = None,
-        **_: Any,
-    ) -> dict[str, Any]:
-        del client_id
-        if action is not None:
-            action = action.lower().strip()
-            if action == "on":
-                enabled = True
-            elif action == "off":
-                enabled = False
-            elif action != "status":
-                raise VoxError(f"Unknown soundfonts action: {action}")
-        if enabled is None:
-            disabled = Path.home() / ".voicemode" / "soundfonts-disabled"
-            return {
-                "enabled": not disabled.exists(),
-                "implementation": "frozen VoiceMode compatibility layer",
-            }
-        return (await self.compatibility.soundfonts(enabled)).to_dict()
 
     async def exchange_history(
         self,

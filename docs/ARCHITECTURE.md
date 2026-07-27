@@ -93,11 +93,3 @@ service logs.
 Setting `VOX_PERSIST_AUDIO=false` moves this bounded recovery store into an
 ephemeral private temporary directory for the daemon lifetime.
 
-## Frozen compatibility layer
-
-The MIT-licensed VoiceMode 8.11.0 Python package is vendored for mature fringe
-features: DJ/library operations, soundfonts, exchange tooling, voice clones,
-model utilities, and shell completions. Vox launches it through fixed argv
-arrays with cloud credentials removed and local endpoint variables forced.
-The main conversation path does not import its implicit conversation state
-machine.

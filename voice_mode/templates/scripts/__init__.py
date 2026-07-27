@@ -1,1 +1,0 @@
-# Script templates for Voice Mode services

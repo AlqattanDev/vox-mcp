@@ -50,16 +50,8 @@ vox-mcp = "voxmcp.mcp_server:main"
 voxd = "voxmcp.daemon:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/voxmcp", "voice_mode"]
-include = [
-  "src/voxmcp/**/*.py",
-  "voice_mode/**/*.py",
-  "voice_mode/**/*.sh",
-  "voice_mode/**/*.plist",
-  "voice_mode/**/*.service",
-  "voice_mode/templates/**/*",
-  "voice_mode/data/**/*",
-]
+packages = ["src/voxmcp"]
+include = ["src/voxmcp/**/*.py"]
 exclude = ["**/__pycache__", "**/*.pyc", "**/.DS_Store"]
 
 [tool.hatch.build.targets.wheel.force-include]

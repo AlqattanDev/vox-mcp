@@ -74,8 +74,8 @@ Default turn bounds are deliberately generous for this user’s speaking style:
   was actually said (see below).
 - Up to 75 seconds for a long dictated turn.
 
-All four are configurable. Unlike VoiceMode, the speech-onset timeout and
-trailing-silence timeout are separate.
+All four are configurable, and the speech-onset timeout and trailing-silence
+timeout are separate knobs.
 
 ### Vox reads whatever room it is in
 

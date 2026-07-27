@@ -86,9 +86,6 @@ def test_help_lists_the_complete_command_surface() -> None:
         "service",
         "transcribe",
         "voices",
-        "dj",
-        "clone",
-        "soundfonts",
         "install",
         "rollback",
         "start-runtime",
@@ -185,7 +182,7 @@ def test_speak_listen_and_converse_preserve_explicit_options() -> None:
     )
 
 
-def test_diagnostics_services_and_compatibility_tools_are_mcp_calls(
+def test_diagnostics_and_service_tools_are_mcp_calls(
     tmp_path: Path,
 ) -> None:
     caller = FakeCaller()
@@ -200,17 +197,6 @@ def test_diagnostics_services_and_compatibility_tools_are_mcp_calls(
             {"action": "logs", "service_name": "whisper", "lines": 25},
         ),
         (["voices", "--provider", "kokoro"], "voice_registry", {"provider": "kokoro"}),
-        (
-            ["dj", "play", "/tmp/local.mp3", "--volume", "35"],
-            "dj",
-            {"action": "play", "target": "/tmp/local.mp3", "volume": 35},
-        ),
-        (["soundfonts", "off"], "soundfonts", {"action": "off"}),
-        (
-            ["clone", "show", "river"],
-            "voice_clone",
-            {"action": "show", "name": "river"},
-        ),
         (
             ["transcribe", str(audio), "--language", "en", "--word-timestamps"],
             "transcribe",

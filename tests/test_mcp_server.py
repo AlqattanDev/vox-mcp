@@ -31,9 +31,6 @@ TOOL_NAMES = {
     "voice_registry",
     "voice_survey",
     "companion",
-    "dj",
-    "voice_clone",
-    "soundfonts",
     "exchange_history",
 }
 
@@ -52,9 +49,6 @@ class FakeEngine:
         "transcribe",
         "voice_registry",
         "survey",
-        "dj",
-        "clone_voice",
-        "soundfonts",
         "exchange_history",
         "status",
         "health",
@@ -105,7 +99,6 @@ async def test_compact_tool_surface_and_host_owned_client_identity(tmp_path: Pat
         by_name = {tool.name: tool for tool in tools}
         assert set(by_name) == TOOL_NAMES
         assert by_name["voice_registry"].annotations.readOnlyHint is True
-        assert by_name["voice_clone"].annotations.destructiveHint is True
 
         spoken = await client.call_tool("speak", {"message": "Working on it."})
         conversation = await client.call_tool("converse", {"message": "Your turn."})
@@ -294,11 +287,6 @@ async def test_tool_arguments_are_adapted_to_engine_contract(tmp_path: Path) -> 
             "voice_survey",
             {"turns": [{"message": "A", "voice": "af_sky"}], "agent": "companion"},
         )
-        await client.call_tool(
-            "voice_clone",
-            {"action": "add", "name": "local", "audio_file": "/tmp/voice.wav"},
-        )
-        await client.call_tool("soundfonts", {"enabled": True})
 
     calls = {name: arguments for name, arguments in engine.calls}
     owner = calls["session"]["client_id"]
@@ -317,8 +305,6 @@ async def test_tool_arguments_are_adapted_to_engine_contract(tmp_path: Path) -> 
     # Without this the tool dropped `agent` on the floor and a scripted
     # interview could never be read in the companion's voice.
     assert calls["survey"]["agent"] == "companion"
-    assert calls["clone_voice"]["audio_path"] == "/tmp/voice.wav"
-    assert calls["soundfonts"]["enabled"] is True
     assert all(arguments["client_id"] == owner for arguments in calls.values())
 
 

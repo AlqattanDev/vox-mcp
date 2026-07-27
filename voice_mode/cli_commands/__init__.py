@@ -1,3 +1,0 @@
-"""
-Voice Mode CLI commands.
-"""

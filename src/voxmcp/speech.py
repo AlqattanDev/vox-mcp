@@ -8,7 +8,6 @@ variables, and accepts only URLs already validated as loopback by VoxConfig.
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import json
 import os
 import shutil
@@ -67,8 +66,6 @@ class LocalSpeechClient:
         client_factory: Callable[..., httpx.AsyncClient] = httpx.AsyncClient,
         whisper_cli: Path | None = None,
         whisper_model: Path | None = None,
-        clone_profiles_path: Path | None = None,
-        clone_voices_dir: Path | None = None,
     ) -> None:
         self.tts_base_url = tts_base_url
         self.stt_base_url = stt_base_url
@@ -78,8 +75,6 @@ class LocalSpeechClient:
         self.client_factory = client_factory
         self.whisper_cli = whisper_cli
         self.whisper_model = whisper_model
-        self.clone_profiles_path = clone_profiles_path
-        self.clone_voices_dir = clone_voices_dir
 
     def _client(self, timeout: float) -> httpx.AsyncClient:
         return self.client_factory(
@@ -97,61 +92,6 @@ class LocalSpeechClient:
                 # eventual typed error remain deterministic.
                 pass
 
-    def _clone_profile(self, voice: str) -> dict[str, str] | None:
-        profile: dict[str, Any] | None = None
-        if self.clone_profiles_path is not None:
-            try:
-                document = json.loads(self.clone_profiles_path.read_text())
-                candidate = document.get("voices", {}).get(voice)
-                if isinstance(candidate, dict):
-                    profile = candidate
-            except (OSError, ValueError, TypeError):
-                pass
-
-        voices_dir = self.clone_voices_dir
-        if profile is None and voices_dir is not None:
-            voice_dir = voices_dir / voice
-            wav = voice_dir / "default.wav"
-            text = voice_dir / "default.txt"
-            if wav.is_file() and text.is_file():
-                profile = {"ref_audio": str(wav), "ref_text": text.read_text().strip()}
-        if profile is None or voices_dir is None:
-            return None
-
-        raw_audio = str(profile.get("ref_audio") or "").strip()
-        ref_text = str(profile.get("ref_text") or "").strip()
-        if not raw_audio or not ref_text:
-            raise VoxError(f"Clone profile {voice!r} is missing reference audio or text")
-        audio = Path(raw_audio).expanduser()
-        if not audio.is_absolute():
-            audio = voices_dir / audio
-        audio = audio.resolve()
-        root = voices_dir.expanduser().resolve()
-        try:
-            audio.relative_to(root)
-        except ValueError as exc:
-            raise VoxError(f"Clone profile {voice!r} escapes the local voices directory") from exc
-        if not audio.is_file():
-            raise VoxError(f"Clone reference audio does not exist: {audio}")
-
-        base_url = str(profile.get("base_url") or "http://127.0.0.1:8890/v1")
-        parsed = urlsplit(base_url)
-        try:
-            address = ipaddress.ip_address(parsed.hostname or "")
-        except ValueError as exc:
-            raise VoxError(f"Clone profile {voice!r} does not use a literal loopback endpoint") from exc
-        if parsed.scheme != "http" or not address.is_loopback:
-            raise VoxError(f"Clone profile {voice!r} is not local-only")
-        return {
-            "base_url": base_url,
-            "model": str(
-                profile.get("model")
-                or "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-4bit"
-            ),
-            "ref_audio": str(audio),
-            "ref_text": ref_text,
-        }
-
     async def synthesize(
         self,
         text: str,
@@ -168,13 +108,9 @@ class LocalSpeechClient:
             raise VoxError("TTS speed must be between 0.25 and 4.0")
 
         destination.parent.mkdir(parents=True, exist_ok=True)
-        clone_profile = self._clone_profile(voice)
-        endpoint = api_url(
-            clone_profile["base_url"] if clone_profile else self.tts_base_url,
-            "audio/speech",
-        )
+        endpoint = api_url(self.tts_base_url, "audio/speech")
         payload: dict[str, object] = {
-            "model": clone_profile["model"] if clone_profile else model,
+            "model": model,
             "input": text,
             "voice": voice.lower(),
             "speed": speed,
@@ -182,16 +118,6 @@ class LocalSpeechClient:
         }
         if instructions:
             payload["instructions"] = instructions
-        if clone_profile:
-            payload.update(
-                {
-                    "ref_audio": clone_profile["ref_audio"],
-                    "ref_text": clone_profile["ref_text"],
-                    "stream": True,
-                    "streaming_interval": 0.3,
-                    "lang_code": "auto",
-                }
-            )
 
         started = time.monotonic()
         last_error: Exception | None = None
@@ -213,7 +139,7 @@ class LocalSpeechClient:
                     raise ServiceUnavailableError("Kokoro returned an empty audio response")
                 os.replace(temp_path, destination)
                 return SpeechResult(
-                    backend="mlx-audio" if clone_profile else "kokoro",
+                    backend="kokoro",
                     elapsed_ms=round((time.monotonic() - started) * 1000),
                     attempts=attempt,
                     path=str(destination),
@@ -223,10 +149,9 @@ class LocalSpeechClient:
                 if temp_path is not None:
                     temp_path.unlink(missing_ok=True)
                 if attempt == 1:
-                    await self._recover("mlx-audio" if clone_profile else "kokoro")
+                    await self._recover("kokoro")
                     continue
-        backend = "MLX clone TTS on 127.0.0.1:8890" if clone_profile else "Kokoro TTS"
-        raise ServiceUnavailableError(f"Local {backend} failed after recovery: {last_error}")
+        raise ServiceUnavailableError(f"Local Kokoro TTS failed after recovery: {last_error}")
 
     async def transcribe(
         self,

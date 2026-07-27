@@ -21,7 +21,7 @@ keys are ignored rather than injected into the process environment.
 
 Repo `~/vox-mcp` → private `AlqattanDev/vox-mcp`. Launch agent
 `com.vox.runtime` runs `~/Applications/Vox.app` → `~/vox-mcp/.venv/bin/voxd`.
-Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
+Package is `src/voxmcp/`.
 
 ## What works
 

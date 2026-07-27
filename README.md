@@ -47,9 +47,9 @@ loopback address; Vox refuses to start if they do not.
 
 ## Status
 
-This directory contains the implementation, installer, host skills, tests,
-and the frozen VoiceMode compatibility layer. See `docs/EXPERIENCE.md` for the
-listening contract and `docs/ARCHITECTURE.md` for the process model.
+This directory contains the implementation, installer, host skills, and
+tests. See `docs/EXPERIENCE.md` for the listening contract and
+`docs/ARCHITECTURE.md` for the process model.
 
 Build, inspect the dry-run, then activate transactionally:
 
@@ -69,7 +69,7 @@ Quick checks after installation:
 ```
 
 The MCP tools are headed by `converse`, `speak`, `listen`, `voice_session`,
-`voice_control`, `service`, `diagnostics`, `transcribe`, and `dj`.
+`voice_control`, `service`, `diagnostics`, and `transcribe`.
 
 ## Multiple agents, one microphone
 
