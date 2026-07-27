@@ -252,7 +252,7 @@ full 1.6 s — and is never cut off mid-thought.
 | `com.vox.runtime` | ~73 MB | ~73 MB |
 | **total** | **~2.7 GB** | **~3.2 GB** |
 
-Tests: `.venv/bin/python -m pytest tests/` — **387 passing**.
+Tests: `.venv/bin/python -m pytest tests/` — **400 passing**.
 
 **Slash commands** (in `~/.claude/commands/`, global): `/speak` reads the
 agent's last reply aloud (no mic); `/listen` opens the mic for one utterance

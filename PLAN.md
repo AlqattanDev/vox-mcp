@@ -18,7 +18,7 @@ restart); a Python-only change needs just
 `launchctl kickstart -k gui/$(id -u)/com.vox.runtime`. Settings go in
 `~/.vox/settings.json` via `vox set NAME=value` — **not** `launchctl setenv`,
 which never reaches the runtime. Tests: `.venv/bin/python -m pytest tests/`
-(394 passing at handoff).
+(400 passing at handoff).
 
 **The build fails without a persistent codesigning identity.** That is
 deliberate — see `STATUS.md` → Deploy. If it stops you, fix the identity rather
