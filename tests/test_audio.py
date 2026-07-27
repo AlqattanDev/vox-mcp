@@ -718,6 +718,67 @@ def test_default_input_uses_native_device_rate() -> None:
     assert device.input_channels == 2
 
 
+class DisconnectingSoundDevice:
+    """A backend whose launch-time snapshot points at unplugged earbuds.
+
+    Only reinitializing PortAudio reveals that the default input moved to the
+    built-in microphone — exactly what happens when Bluetooth headphones
+    disconnect mid-session.
+    """
+
+    def __init__(self) -> None:
+        class Default:
+            device = (7, 8)
+
+        self.default = Default()
+        self.refreshed = False
+
+    def _terminate(self) -> None:
+        pass
+
+    def _initialize(self) -> None:
+        self.refreshed = True
+        self.default.device = (3, 4)
+
+    def query_devices(self, device: Any, kind: str) -> dict[str, Any]:
+        assert kind == "input"
+        if device == 7:
+            raise OSError("Internal PortAudio error [PaErrorCode -9986]")
+        assert device == 3
+        return {
+            "name": "MacBook Pro Microphone",
+            "default_samplerate": 48_000.0,
+            "max_input_channels": 1,
+        }
+
+
+def test_resolving_input_refreshes_the_device_list_first() -> None:
+    """Disconnected headphones must not leave capture opening a ghost device.
+
+    Measured live: the FreeClip 2 disconnected and every ⌘§ press failed with
+    PaErrorCode -9986 on the ghost device until a runtime restart, because
+    resolution trusted PortAudio's launch-time snapshot.
+    """
+
+    backend = DisconnectingSoundDevice()
+    device = resolve_input_device(backend)
+    assert backend.refreshed
+    assert device.index == 3
+    assert device.name == "MacBook Pro Microphone"
+
+
+def test_resolution_leaves_the_snapshot_alone_under_a_live_stream() -> None:
+    """Reinitializing PortAudio under an open InputStream would kill the turn."""
+
+    from voxmcp.audio import _PortAudioInUse
+
+    backend = DisconnectingSoundDevice()
+    with _PortAudioInUse():
+        with pytest.raises(AudioDeviceError, match="Cannot query input device"):
+            resolve_input_device(backend)
+    assert not backend.refreshed
+
+
 def test_recorder_opens_mock_stream_at_native_rate_without_microphone() -> None:
     def native_frame(value: float) -> np.ndarray:
         return frame(value, sample_rate=48_000)

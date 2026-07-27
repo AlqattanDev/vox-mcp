@@ -85,11 +85,16 @@ Package is `src/voxmcp/`. Vendored `voice_mode/` is frozen compatibility.
   `diagnostics(privacy)` rather than interrupting itself.
   `VOX_BARGE_IN_REQUIRE_HEADPHONES=0` overrides deliberately. On speakers, the
   **Reply button / a ⌘§ tap** is the interruption path and needs no acoustics.
-  The device list is **re-read on every availability check** — PortAudio
-  snapshots devices at process start, so headphones plugged in after the runtime
-  launched were invisible and barge-in kept refusing on the speakers it no
-  longer used. Skipped while a capture stream is open, because reinitializing
-  PortAudio under a live `InputStream` would take the turn with it.
+  The device list is **re-read on every availability check and every input
+  resolution** — PortAudio snapshots devices at process start, so headphones
+  plugged in after the runtime launched were invisible to barge-in, and
+  headphones that *disconnected* left every capture opening a ghost device:
+  measured live as `PaErrorCode -9986` on "HUAWEI FreeClip 2" on every ⌘§
+  press until a restart. `resolve_input_device` now refreshes first, so the
+  mic is whatever macOS says it is *now* — headphones are never assumed, in
+  either direction. Skipped while a capture stream is open, because
+  reinitializing PortAudio under a live `InputStream` would take the turn
+  with it.
 - **Barge-in is verified live on headphones** (2026-07-26, HUAWEI FreeClip 2).
   Recognition is by device *name*, so these open-ear buds are not on the
   headphone list and needed the override — but they measured **+27.6 dB in the

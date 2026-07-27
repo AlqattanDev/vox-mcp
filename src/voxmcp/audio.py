@@ -430,12 +430,15 @@ class _PortAudioInUse:
             _OPEN_INPUT_STREAMS -= 1
 
 
-def refresh_output_devices(sounddevice: Any | None = None) -> bool:
-    """Re-read the device list so hardware plugged in mid-session is seen.
+def refresh_devices(sounddevice: Any | None = None) -> bool:
+    """Re-read the device list so hardware changes mid-session are seen.
 
-    Without this, plugging in headphones after the runtime started leaves
-    barge-in looking at the speakers it had already refused to arm on, and no
-    amount of waiting fixes it. Costs about 1.5 ms.
+    PortAudio snapshots devices once; a long-lived runtime keeps that snapshot
+    forever. Both directions rot: headphones plugged in after launch leave
+    barge-in refusing on the speakers it no longer uses, and headphones that
+    *disconnect* leave every capture open targeting a ghost device — measured
+    live as PaErrorCode -9986 on every ⌘§ press until a restart. Costs about
+    1.5 ms.
 
     Returns False (leaving the stale list in place) when a capture stream is
     open, because tearing PortAudio down under one would take the turn with it.
@@ -459,7 +462,7 @@ def default_output_name(sounddevice: Any | None = None) -> str:
     """Name of the current default output device, or '' if unknowable."""
 
     module = sounddevice or _load_sounddevice()
-    refresh_output_devices(module)
+    refresh_devices(module)
     try:
         default = module.default.device
         index = default[1] if isinstance(default, (list, tuple)) else default
@@ -841,8 +844,15 @@ class AdaptiveCaptureState:
 
 
 def resolve_input_device(sounddevice: Any, device: int | str | None = None) -> AudioDeviceInfo:
-    """Resolve the configured/default input and preserve its native rate."""
+    """Resolve the configured/default input and preserve its native rate.
 
+    Refreshes the device list first: the default input is whatever macOS says
+    *now*, not whatever was plugged in when the runtime launched. Skipped
+    automatically (refresh returns False) while a capture stream is open,
+    because reinitializing PortAudio under a live InputStream kills the turn.
+    """
+
+    refresh_devices(sounddevice)
     resolved: int | str | None = device
     if resolved is None:
         default = getattr(getattr(sounddevice, "default", None), "device", None)
