@@ -84,7 +84,7 @@ def test_state_retains_preroll_and_stops_on_trailing_silence() -> None:
         decision = state.feed(frame(0.001))
         assert decision.phase is CapturePhase.WAITING_FOR_SPEECH
 
-    for _ in range(5):
+    for _ in range(12):  # a real utterance, not a click: see false_onset_speech_s
         state.feed(frame(0.2))
     for _ in range(6):
         decision = state.feed(frame(0.001))
@@ -94,10 +94,10 @@ def test_state_retains_preroll_and_stops_on_trailing_silence() -> None:
     assert result.reason is CaptureStopReason.TRAILING_SILENCE
     assert result.speech_detected is True
     assert result.trailing_silence_s == pytest.approx(0.12)
-    assert result.speech_duration_s == pytest.approx(0.10)
-    # At speech confirmation: 300 ms pre-roll. Afterwards: 40 ms speech and
+    assert result.speech_duration_s == pytest.approx(0.24)
+    # At speech confirmation: 300 ms pre-roll. Afterwards: 180 ms speech and
     # 120 ms trailing silence.
-    assert result.audio_duration_s == pytest.approx(0.46)
+    assert result.audio_duration_s == pytest.approx(0.60)
     assert np.allclose(result.samples[:20], 0.001)
     assert np.max(result.samples) == pytest.approx(0.2)
 
@@ -105,11 +105,12 @@ def test_state_retains_preroll_and_stops_on_trailing_silence() -> None:
 def test_trailing_silence_cannot_end_before_minimum_turn_duration() -> None:
     state = AdaptiveCaptureState(
         1_000,
-        config(min_duration_s=0.20, trailing_silence_s=0.04, speech_start_s=0.02),
+        config(min_duration_s=0.40, trailing_silence_s=0.04, speech_start_s=0.02),
         speech_vote,
     )
-    state.feed(frame(0.2))
-    for _ in range(8):
+    for _ in range(10):  # 200 ms — an utterance, so only min_duration holds it
+        state.feed(frame(0.2))
+    for _ in range(9):
         decision = state.feed(frame(0.001))
         assert decision.stop_reason is None
     decision = state.feed(frame(0.001))
@@ -191,6 +192,166 @@ def test_the_guard_is_bounded_by_the_full_window_not_the_max_duration() -> None:
     spent = silence_until_stop(state, limit_s=10.0)
     assert spent == pytest.approx(1.6, abs=0.02)
     assert spent < state.config.max_duration_s
+
+
+def reply_window_config(**overrides: Any) -> CaptureConfig:
+    """What a converse reply window actually is: 5 s of waiting, real closes."""
+
+    values: dict[str, Any] = {
+        "onset_timeout_s": 5.0,
+        "trailing_silence_s": 1.6,
+        "short_trailing_silence_s": 0.6,
+        "short_utterance_speech_s": 1.5,
+        "long_utterance_speech_s": 3.0,
+        "min_duration_s": 0.5,
+        "max_duration_s": 30.0,
+        "speech_start_s": 0.06,
+    }
+    values.update(overrides)
+    return config(**values)
+
+
+def feed_silence(state: AdaptiveCaptureState, seconds: float) -> None:
+    for _ in range(round(seconds / 0.02)):
+        if state.finished:
+            return
+        state.feed(frame(0.001))
+
+
+def test_a_click_does_not_eat_the_reply_window() -> None:
+    """The bug Ali hit on Pi: 5 s of reply window spent in 1.68 s.
+
+    A click, a breath or a chair satisfies ``speech_start_s`` in 60 ms, and from
+    that moment the turn is an utterance — the only way out is trailing silence,
+    which arrives 1.6 s later and hangs up. Measured live: 1.68 s of audio,
+    0.08 s of it speech, and Ali never got to answer. A close that carries
+    almost no speech is not a close; the window has to come back.
+    """
+
+    state = AdaptiveCaptureState(1_000, reply_window_config(), speech_vote)
+    for _ in range(4):  # 80 ms — exactly the blip that ended the live turn
+        state.feed(frame(0.2))
+    assert state.phase is CapturePhase.CAPTURING
+    assert state.speech_duration_s == pytest.approx(0.08)
+
+    feed_silence(state, 2.0)  # past the 1.68 s the microphone used to close at
+    assert state.finished is False
+    assert state.phase is CapturePhase.WAITING_FOR_SPEECH
+    assert state.false_onsets == 1
+
+    feed_silence(state, 3.5)
+    assert state.finished is True
+    result = state.result()
+    # The window is five seconds of waiting in total, not five per false start.
+    assert result.elapsed_s == pytest.approx(5.0, abs=0.05)
+    assert result.reason is CaptureStopReason.ONSET_TIMEOUT
+    # The click is thrown away rather than sent to Whisper as a turn.
+    assert result.samples.size == 0
+    assert result.speech_detected is False
+
+
+def test_the_window_comes_back_in_time_for_a_late_answer() -> None:
+    # The point of giving the window back: an answer that starts after the click
+    # is still the user's turn, and endpoints on its own trailing silence.
+    state = AdaptiveCaptureState(1_000, reply_window_config(), speech_vote)
+    for _ in range(4):
+        state.feed(frame(0.2))
+    feed_silence(state, 2.0)
+    assert state.false_onsets == 1
+
+    feed_speech(state, 0.9)  # "no, keep it" — three seconds into the window
+    assert silence_until_stop(state) == pytest.approx(0.6, abs=0.02)
+    result = state.result()
+    assert result.reason is CaptureStopReason.TRAILING_SILENCE
+    assert result.speech_duration_s == pytest.approx(0.9, abs=0.02)
+
+
+def test_a_real_one_word_answer_is_still_a_turn() -> None:
+    # The line has to sit above a click and below "yes". A one-word answer
+    # measures 0.3-0.4 s of speech; discarding it would be the worse bug.
+    state = AdaptiveCaptureState(1_000, reply_window_config(), speech_vote)
+    feed_speech(state, 0.4)
+    assert state.speech_duration_s >= state.config.false_onset_speech_s
+    assert silence_until_stop(state) == pytest.approx(1.6, abs=0.02)
+    assert state.false_onsets == 0
+    assert state.result().reason is CaptureStopReason.TRAILING_SILENCE
+
+
+def test_a_restless_room_cannot_hold_the_microphone_open() -> None:
+    # Every false start is forgiven, none of them buys more time: a room that
+    # clicks once a second must still hand the window back on schedule.
+    state = AdaptiveCaptureState(1_000, reply_window_config(), speech_vote)
+    for _ in range(12):
+        for _ in range(4):
+            if not state.finished:
+                state.feed(frame(0.2))
+        feed_silence(state, 2.0)
+        if state.finished:
+            break
+
+    assert state.finished is True
+    result = state.result()
+    assert result.reason is CaptureStopReason.ONSET_TIMEOUT
+    assert result.samples.size == 0
+    # Bounded by the window plus the one close being waited on when it expired —
+    # never by max_duration, and never open indefinitely.
+    assert result.elapsed_s < 5.0 + state.config.trailing_silence_s + 0.1
+
+
+def test_an_armed_barge_in_mic_is_untouched_by_the_reply_window_rule() -> None:
+    # onset_timeout_s=None means there is no window to give back, and on both
+    # paths that pass it — barge-in, and a turn opened by holding the key —
+    # someone is already talking. They keep today's close exactly.
+    state = AdaptiveCaptureState(
+        1_000, reply_window_config(onset_timeout_s=None), speech_vote
+    )
+    for _ in range(4):
+        state.feed(frame(0.2))
+    assert silence_until_stop(state, limit_s=5.0) == pytest.approx(1.6, abs=0.02)
+    assert state.false_onsets == 0
+    assert state.result().reason is CaptureStopReason.TRAILING_SILENCE
+
+
+def test_the_reply_window_runs_the_real_capture_path() -> None:
+    # Through AudioRecorder, the way a listen actually runs: a click at the top
+    # of the window must not end the capture, and the frames must keep being
+    # consumed for the whole five seconds.
+    consumed = 0
+
+    def clicked_then_silent() -> Any:
+        nonlocal consumed
+        for index in range(400):  # 8 s of frames available
+            consumed = index + 1
+            yield frame(0.2 if index < 4 else 0.001)
+
+    recorder = AudioRecorder(
+        reply_window_config(), speech_classifier=speech_vote
+    )
+    result = recorder.capture_from_frames(clicked_then_silent(), 1_000)
+    assert result.reason is CaptureStopReason.ONSET_TIMEOUT
+    assert result.samples.size == 0
+    assert consumed == pytest.approx(250, abs=3)  # 5 s at 20 ms a frame
+
+
+def test_cancelling_during_a_resumed_reply_window_cancels_only_the_turn() -> None:
+    # Cancel keeps naming itself: the resumed window must not launder a user
+    # cancel into a timeout, and the audio is still discarded for privacy.
+    cancelled = CaptureControl()
+
+    def click_then_cancel() -> Any:
+        for index in range(400):
+            if index == 150:  # 3 s in, mid-window, after the click was dropped
+                cancelled.cancel()
+            yield frame(0.2 if index < 4 else 0.001)
+
+    recorder = AudioRecorder(
+        reply_window_config(), speech_classifier=speech_vote
+    )
+    result = recorder.capture_from_frames(
+        click_then_cancel(), 1_000, control=cancelled
+    )
+    assert result.reason is CaptureStopReason.CANCELLED
+    assert result.samples.size == 0
 
 
 def test_naming_the_close_applies_it_to_every_utterance_length() -> None:
@@ -561,7 +722,7 @@ def test_frame_driven_capture_reaches_for_vad_like_the_device_path(
     monkeypatch.setattr(WebRTCVADClassifier, "create", staticmethod(fake_create))
     recorder = AudioRecorder(config(speech_start_s=0.02, trailing_silence_s=0.06))
     result = recorder.capture_from_frames(
-        iter([frame(0.4)] * 5 + [frame(0.0)] * 5),
+        iter([frame(0.4)] * 12 + [frame(0.0)] * 5),
         1_000,
     )
     assert calls == [1]
@@ -936,8 +1097,9 @@ def test_recorder_opens_mock_stream_at_native_rate_without_microphone() -> None:
         [
             native_frame(0.001),
             native_frame(0.001),
-            native_frame(0.2),
-            native_frame(0.2),
+        ]
+        + [native_frame(0.2)] * 12  # an utterance, so the close is a real close
+        + [
             native_frame(0.001),
             native_frame(0.001),
         ]

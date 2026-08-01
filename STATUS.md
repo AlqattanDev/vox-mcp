@@ -92,11 +92,14 @@ Package is `src/voxmcp/`.
   the fast path is off** and the full window applies — a breath or a first
   syllable is not a finished sentence, and giving it the quickest close is what
   ended turns before they started. A caller who passes `trailing_silence_s`
-  gets that number for every utterance length, floor included. A single
+  gets that number for every utterance length, floor included. **Under 0.2s of
+  speech there is no utterance to close at all** — the audio is dropped and the
+  reply window resumes (see “The reply window is 5 s” below). A single
   utterance caps at 75s. Env: `VOX_TRAILING_SILENCE_SECONDS`,
   `VOX_SHORT_TRAILING_SILENCE_SECONDS`, `VOX_MIN_SPEECH_SECONDS`,
   `VOX_SHORT_UTTERANCE_SPEECH_SECONDS`,
-  `VOX_LONG_UTTERANCE_SPEECH_SECONDS`, `VOX_MAX_UTTERANCE_SECONDS`. Lowering the
+  `VOX_LONG_UTTERANCE_SPEECH_SECONDS`, `VOX_MAX_UTTERANCE_SECONDS`,
+  `VOX_FALSE_ONSET_SPEECH_SECONDS`, `VOX_ONSET_TIMEOUT_SECONDS`. Lowering the
   ceiling below the floor clamps instead of raising.
 - **Barge-in needs headphones, and knows it.** Measured on this MacBook: Kokoro
   through the built-in speakers returns into the mic at **−22 dBFS p90 / −17.6
@@ -277,7 +280,7 @@ full 1.6 s — and is never cut off mid-thought.
 | `com.vox.runtime` | ~73 MB | ~73 MB |
 | **total** | **~2.7 GB** | **~3.2 GB** |
 
-Tests: `.venv/bin/python -m pytest tests/` — **416 passing**.
+Tests: `.venv/bin/python -m pytest tests/` — **424 passing**.
 
 **Slash commands** (in `~/.claude/commands/`, global): `/speak` reads the
 agent's last reply aloud (no mic); `/listen` opens the mic for one utterance
@@ -378,11 +381,28 @@ played into the same headset the mic is in — cannot bleed into the recording.
 transient to fool, the pop just reaches Whisper as a click, and waiting would
 cost a full second of dead air on a key the user is already talking into.
 
-**The reply window is 5 s** (`onset_timeout_s`, was 15). This is how long the mic
+**The reply window is 5 s** (`onset_timeout_s`, was 15) — five seconds of
+*waiting for a voice*, not five seconds of microphone. This is how long the mic
 stays open after the agent stops speaking. Fifteen seconds was fifteen seconds in
 which the room could interrupt an agent that had gone back to work. Still `None`
 on the two paths where a clock would be wrong: an armed barge-in mic, and a turn
 the user opened with the key.
+
+**A click does not spend the window.** 60 ms of anything — a lip smack, a chair,
+a Bluetooth pop — satisfies `speech_start_s`, and from that moment the turn was
+an utterance whose only exit was trailing silence 1.6 s later. So a 5 s reply
+window closed in 1.68 s, of which 0.08 s was "speech", and Ali never got to
+answer: measured live on Pi and reported back as `no_speech`. A close carrying
+less than `false_onset_speech_s` (**0.2 s**, `VOX_FALSE_ONSET_SPEECH_SECONDS`) of
+speech now throws the audio away and hands the window back instead of ending the
+turn, and the reason becomes `onset_timeout` — nobody spoke. The clock is not
+rewound, so a restless room cannot hold the mic open: the window is five seconds
+in total, not five per false start. The line sits above the 0.06 s that trips the
+gate and below the 0.3–0.4 s a real one-word "yes" measures. Off wherever
+`onset_timeout_s` is `None`, because barge-in and the held key have no window to
+give back and someone is already talking on both. `capture.elapsed_seconds` on
+every heard result is how long the mic was open, which
+`audio_duration_seconds` never said.
 
 **One hotkey, meaning carried by the gesture** — a permission-free Carbon
 registration on `kVK_ISO_Section` (verified to map to "§" under this machine's

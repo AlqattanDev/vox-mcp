@@ -72,10 +72,13 @@ Read `io_mode` from status. Panel or `voice_session(set_mode|cycle_mode)` sets i
   `speak` or `converse(wait_for_response=false)`. Mic open only for a real question.
 - **Reply window.** In an active back-and-forth, do NOT `speak`-and-vanish on a
   turn the user might want to answer. End such turns with
-  `converse(..., onset_timeout=4)`: the mic cracks open for a few seconds so the
-  user can jump in, and if they stay silent it returns `no_speech` fast instead
-  of hanging the mic open. Reserve bare `speak` (no window) for a genuine
-  terminal sign-off. `onset_timeout` also exists on `listen`.
+  `converse(..., onset_timeout=5)`: the mic stays open for that many seconds of
+  *waiting for a voice* so the user can jump in, and if they stay silent it
+  returns `no_speech` instead of hanging the mic open. The window is spent
+  waiting, not on the first noise in the room — a click or a breath is dropped
+  and the window keeps running. Reserve bare `speak` (no window) for a genuine
+  terminal sign-off. `onset_timeout` also exists on `listen`; the default when
+  neither passes one is 5 s.
 - One spoken question at a time. Put code/paths/tables on screen.
 - Mic opens only inside `listen` or response-waiting `converse` after playback drains.
 - No-speech timeout → session stays idle; ask once if still there; no listen loops.

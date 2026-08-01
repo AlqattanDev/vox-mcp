@@ -299,12 +299,15 @@ class VoxEngine:
             audio_root = Path(audio_tempdir.name)
         store = AudioStore(audio_root, replay_items=8, ttl_hours=24)
         capture = CaptureConfig(
-            onset_timeout_s=float(os.environ.get("VOX_ONSET_TIMEOUT_SECONDS", "15")),
+            onset_timeout_s=float(os.environ.get("VOX_ONSET_TIMEOUT_SECONDS", "5")),
             trailing_silence_s=float(os.environ.get("VOX_TRAILING_SILENCE_SECONDS", "1.6")),
             short_trailing_silence_s=float(
                 os.environ.get("VOX_SHORT_TRAILING_SILENCE_SECONDS", "0.6")
             ),
             min_speech_s=float(os.environ.get("VOX_MIN_SPEECH_SECONDS", "0.5")),
+            false_onset_speech_s=float(
+                os.environ.get("VOX_FALSE_ONSET_SPEECH_SECONDS", "0.2")
+            ),
             short_utterance_speech_s=float(
                 os.environ.get("VOX_SHORT_UTTERANCE_SPEECH_SECONDS", "1.5")
             ),
@@ -2853,6 +2856,11 @@ def _capture_dict(result: CaptureResult) -> dict[str, Any]:
         "reason": result.reason.value,
         "speech_detected": result.speech_detected,
         "sample_rate": result.sample_rate,
+        # How long the microphone was actually open, which is not the same as
+        # how much audio was kept: a discarded false start leaves the window
+        # running, so only this number says whether the caller got the reply
+        # window it asked for.
+        "elapsed_seconds": round(result.elapsed_s, 3),
         "audio_duration_seconds": round(result.audio_duration_s, 3),
         "speech_duration_seconds": round(result.speech_duration_s, 3),
         "trailing_silence_seconds": round(result.trailing_silence_s, 3),

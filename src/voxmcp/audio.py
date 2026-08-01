@@ -123,6 +123,16 @@ class CaptureConfig:
     # window instead; a second of latency on "yes" costs less than losing the
     # sentence after it.
     min_speech_s: float = 0.5
+    # Below this much speech, an "utterance" was never an utterance: 60 ms of
+    # room noise, a lip smack or a chair is enough to satisfy speech_start_s and
+    # leave the waiting phase for good, and from there the only exit is trailing
+    # silence. That turns a 5 s reply window into a 1.68 s one — measured live on
+    # Pi: 0.08 s of speech, 1.6 s of silence, mic shut before Ali drew breath.
+    # So a close that carries less speech than this does not end the turn while
+    # an onset window is still running; the audio is dropped and the window
+    # resumes. Set above the 0.06 s that trips the gate and well below the
+    # 0.3-0.4 s a real one-word answer measures, so "yes" is still a turn.
+    false_onset_speech_s: float = 0.2
     short_utterance_speech_s: float = 1.5
     long_utterance_speech_s: float = 3.0
     min_duration_s: float = 0.5
@@ -182,6 +192,8 @@ class CaptureConfig:
             object.__setattr__(self, "short_trailing_silence_s", self.trailing_silence_s)
         if self.min_speech_s < 0:
             raise ValueError("min_speech_s must not be negative")
+        if self.false_onset_speech_s < 0:
+            raise ValueError("false_onset_speech_s must not be negative")
         if self.short_utterance_speech_s < 0:
             raise ValueError("short_utterance_speech_s must not be negative")
         if self.short_utterance_speech_s > self.long_utterance_speech_s:
@@ -746,6 +758,9 @@ class AdaptiveCaptureState:
         self._pre_roll_samples = 0
         self._capture_parts: list[FloatAudio] = []
         self._stop_reason: CaptureStopReason | None = None
+        # How many times a non-utterance was discarded and the reply window
+        # resumed. Diagnostic only; nothing branches on it.
+        self.false_onsets = 0
 
     @property
     def speech_detected(self) -> bool:
@@ -862,6 +877,48 @@ class AdaptiveCaptureState:
         span = config.trailing_silence_s - config.short_trailing_silence_s
         return config.short_trailing_silence_s + ratio * span
 
+    def _was_false_onset(self) -> bool:
+        """Did this "utterance" carry too little speech to be one at all?
+
+        Only asked of a turn that has an onset window, because the window is
+        what the answer restores.  The two paths that pass ``None`` — an armed
+        barge-in mic and a turn the user opened by holding the key — have no
+        window to go back to, and on both of them a person is already talking,
+        so a short close there is the right close.
+        """
+
+        return (
+            self.config.onset_timeout_s is not None
+            and self.speech_duration_s + 1e-9 < self.config.false_onset_speech_s
+        )
+
+    def _resume_waiting_for_speech(self) -> None:
+        """Throw the non-utterance away and give the reply window back.
+
+        The clock is deliberately *not* rewound: ``elapsed_s`` still counts from
+        the moment the microphone opened, so the window is five seconds of
+        waiting in total and not five seconds per false start.  A room that
+        clicks every second cannot hold the microphone open forever.
+        """
+
+        self.phase = CapturePhase.WAITING_FOR_SPEECH
+        self._capture_parts.clear()
+        self._pre_roll.clear()
+        self._pre_roll_samples = 0
+        self.speech_duration_s = 0.0
+        self.trailing_silence_s = 0.0
+        self._speech_run_s = 0.0
+        self._utterance_elapsed_s = 0.0
+        self.false_onsets += 1
+        if (
+            self.config.onset_timeout_s is not None
+            and self.elapsed_s + 1e-9 >= self.config.onset_timeout_s
+        ):
+            # The window ran out while the false start was being waited on, so
+            # nobody spoke in it. Say that, rather than blaming trailing silence
+            # on an utterance that has just been discarded.
+            self.stop(CaptureStopReason.ONSET_TIMEOUT)
+
     def _remember_pre_roll(self, frame: FloatAudio) -> None:
         # Even with pre-roll disabled, retain the short run of frames used to
         # confirm speech.  Otherwise the first 60 ms of an utterance disappears
@@ -965,7 +1022,10 @@ class AdaptiveCaptureState:
                 self._utterance_elapsed_s + 1e-9 >= self.config.min_duration_s
                 and self.trailing_silence_s + 1e-9 >= self._effective_trailing_silence_s()
             ):
-                self.stop(CaptureStopReason.TRAILING_SILENCE)
+                if self._was_false_onset():
+                    self._resume_waiting_for_speech()
+                else:
+                    self.stop(CaptureStopReason.TRAILING_SILENCE)
             elif self._utterance_elapsed_s + 1e-9 >= self.config.max_duration_s:
                 self.stop(CaptureStopReason.MAX_DURATION)
 

@@ -161,7 +161,7 @@ def test_opening_the_gate_drops_whatever_was_already_in_flight() -> None:
     source.open()
     device.emit(frame(0.9))  # dropped at the callback: gate still shut
     source.open_gate()
-    device.emit(*[frame(0.4) for _ in range(5)])
+    device.emit(*[frame(0.4) for _ in range(12)])  # an utterance, not a click
     device.emit(*[frame(0.0) for _ in range(10)])
 
     control = CaptureControl()
@@ -205,7 +205,7 @@ def test_the_open_guard_swallows_the_bluetooth_stream_open_transient() -> None:
     clock.advance(0.24)
     device.emit(*[frame(0.9) for _ in range(18)])  # the pop, at full tilt
     clock.advance(0.4)  # now past the guard
-    device.emit(*[frame(0.3) for _ in range(5)])
+    device.emit(*[frame(0.3) for _ in range(12)])
     device.emit(*[frame(0.0) for _ in range(10)])
 
     control = CaptureControl()
@@ -283,7 +283,7 @@ def test_opting_out_of_the_guard_does_not_leak_past_the_capture() -> None:
     clock.advance(0.24)
     device.emit(*[frame(0.9) for _ in range(18)])  # the pop
     clock.advance(0.4)
-    device.emit(*[frame(0.3) for _ in range(5)])
+    device.emit(*[frame(0.3) for _ in range(12)])
     device.emit(*[frame(0.0) for _ in range(10)])
 
     next_control = CaptureControl()

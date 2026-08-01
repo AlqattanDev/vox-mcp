@@ -1792,6 +1792,34 @@ async def test_a_gate_open_turn_does_not_hang_up_while_you_are_thinking(tmp_path
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(30)
+async def test_a_click_does_not_end_the_reply_window_after_the_agent_speaks(
+    tmp_path: Path,
+):
+    """The live failure, through converse: 80 ms of noise took Ali's turn.
+
+    On Pi the agent spoke, asked for a reply window, and the window was over
+    before he could answer — 1.68 s of capture, 0.08 s of it speech, back as
+    ``no_speech``. The window has to be spent waiting for a voice, so the reason
+    the turn ends must be the window running out, not a click endpointing.
+    """
+
+    engine, mic = make_live_engine(tmp_path, silent_frames=10_000)
+    mic.SPEECH_FRAMES = 4  # 80 ms, then silence for the rest of the window
+    try:
+        result = await engine.converse("claude", "Anything else?", onset_timeout=1.0)
+    finally:
+        await engine.session("claude", "stop")
+
+    assert result["spoken"]["status"] == "completed"
+    heard = result["heard"]
+    assert heard["status"] == "no_speech"
+    assert heard["reason"] == "onset_timeout"
+    # The whole window, not the 0.2 s the click plus its trailing silence took.
+    assert heard["capture"]["elapsed_seconds"] >= 0.9
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
 async def test_persistent_capture_can_be_switched_off(tmp_path: Path):
     """A kill switch, because this owns the microphone for the whole session."""
 

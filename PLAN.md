@@ -18,7 +18,7 @@ restart); a Python-only change needs just
 `launchctl kickstart -k gui/$(id -u)/com.vox.runtime`. Settings go in
 `~/.vox/settings.json` via `vox set NAME=value` — **not** `launchctl setenv`,
 which never reaches the runtime. Tests: `.venv/bin/python -m pytest tests/`
-(400 passing at handoff).
+(424 passing at handoff).
 
 **The build fails without a persistent codesigning identity.** That is
 deliberate — see `STATUS.md` → Deploy. If it stops you, fix the identity rather
@@ -90,6 +90,11 @@ Listening happens only while the key is held.
    `converse`) the mic opens for about five seconds and then gives up. Long
    enough to draw breath and answer; if it is not, `onset_timeout` is per-call
    and the skill can pass more. A ⌘§ tap during that window ends the turn.
+   **Say nothing and cough, or move the chair, and the window must survive it**:
+   the reply must come back `reason: onset_timeout` with
+   `capture.elapsed_seconds` near the full window, never `trailing_silence` at
+   about 1.7 s. That regression is what Ali hit on Pi, and it is fixed in code
+   with tests — this is the aloud check.
 4. **Barge-in still works.** With `VOX_BARGE_IN_ENABLED=1` and the earbuds, talk
    over a long reply. Acceptance: playback dies within ~0.2 s,
    `spoken.status == "barge_in"`, and the transcript contains **the first word
