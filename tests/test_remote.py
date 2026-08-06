@@ -414,3 +414,16 @@ def test_the_phone_is_reachable_from_the_tailnet_and_nowhere_else() -> None:
         with pytest.raises(WebSocketDisconnect):
             with client.websocket_connect("/phone/ws?t=right"):
                 pass
+
+
+def test_a_token_copied_out_of_a_wrapped_terminal_still_connects() -> None:
+    """A terminal wrap turns into spaces mid-token; that is not a wrong token."""
+
+    from starlette.testclient import TestClient
+
+    from voxmcp.mcp_server import create_mcp
+
+    app = create_mcp(control_token="rightlongtoken").http_app(path="/mcp", transport="http")
+    with TestClient(app, client=("127.0.0.1", 5555)) as client:
+        with client.websocket_connect("/phone/ws?t=right   longtoken") as socket:
+            socket.send_bytes(b"")

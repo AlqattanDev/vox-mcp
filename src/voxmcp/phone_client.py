@@ -84,7 +84,8 @@ PHONE_HTML = """<!doctype html>
   const go = el("go"), stopBtn = el("stop"), tokenBox = el("tokenbox"), tokenInput = el("token");
 
   const params = new URLSearchParams(location.search);
-  let token = params.get("t") || localStorage.getItem("vox.token") || "";
+  // A token copied out of a wrapped terminal line arrives with spaces in it.
+  let token = (params.get("t") || localStorage.getItem("vox.token") || "").replace(/\\s+/g, "");
   if (!token) tokenBox.hidden = false;
 
   let ws = null, ctx = null, stream = null, node = null, src = null;
@@ -250,7 +251,7 @@ PHONE_HTML = """<!doctype html>
 
   go.addEventListener("click", async () => {
     if (!token) {
-      token = tokenInput.value.trim();
+      token = tokenInput.value.replace(/\\s+/g, "");
       if (!token) { note("Paste the token from: cat ~/.vox/control.token"); return; }
     }
     say("Connecting\\u2026", "");

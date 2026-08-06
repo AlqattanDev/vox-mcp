@@ -897,7 +897,17 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
         expected_tokens = effective_control_tokens()
         if not expected_tokens or not supplied:
             return False
-        return any(secrets.compare_digest(supplied, expected) for expected in expected_tokens)
+        # Whitespace anywhere in the token is dropped, not just at the ends.
+        # The token reaches the phone by being copied out of a terminal, and a
+        # terminal wraps: the copy comes back with the wrap turned into spaces
+        # in the middle of the string. A token is base64url and can never
+        # legitimately contain a space, so there is nothing to lose by
+        # forgiving it — and the alternative is a "connection failed" whose
+        # cause is invisible on the phone.
+        cleaned = "".join(supplied.split())
+        if not cleaned:
+            return False
+        return any(secrets.compare_digest(cleaned, expected) for expected in expected_tokens)
 
     @server.custom_route("/phone", methods=["GET"], include_in_schema=False)
     async def phone_route(request: Request) -> Response:
