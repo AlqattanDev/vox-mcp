@@ -71,6 +71,28 @@ Quick checks after installation:
 The MCP tools are headed by `converse`, `speak`, `listen`, `voice_session`,
 `voice_control`, `service`, `diagnostics`, and `transcribe`.
 
+## Talking to it from a phone
+
+The microphone and the speaker do not have to be the ones attached to this
+machine. Expose the two phone paths over Tailscale once:
+
+```bash
+tailscale serve --bg --set-path=/phone    http://127.0.0.1:8766/phone
+tailscale serve --bg --set-path=/phone/ws http://127.0.0.1:8766/phone/ws
+cat ~/.vox/control.token
+```
+
+Then open `https://<this-machine>.<tailnet>.ts.net/phone` on the phone, paste
+that token, and tap Connect. The browser captures at 16 kHz and plays what it
+is sent; Whisper and Kokoro still run here, so the audio reaches nothing but
+the phone in your hand. Every tool is unchanged — `converse`, `listen`,
+`speak`, the earcons and barge-in all follow the phone, because none of them
+ever addressed hardware directly.
+
+`/phone` and `/phone/ws` are the only surfaces reachable from off this machine.
+They require a tailnet or loopback peer, the socket requires the control token,
+and `/mcp` and `/control` remain loopback-only.
+
 ## Multiple agents, one microphone
 
 Every Claude Code window reports the same MCP host name, so the lease cannot

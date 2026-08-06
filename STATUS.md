@@ -244,6 +244,25 @@ Package is `src/voxmcp/`.
   target = broadcast (any agent). Fire-and-forget over HTTP (202); the earcon +
   red glyph cue you to talk. Health exposes `agents` + `notes_waiting`; the panel
   names who has a note waiting.
+- **The phone can be the microphone and the speaker.** Open
+  `https://<this-machine>.<tailnet>.ts.net/phone` on the phone, paste the token from
+  `~/.vox/control.token`, tap Connect: from then on the mic that opens is the
+  phone's and the Kokoro wavs play there, while Whisper and Kokoro stay on this
+  machine. This is what makes a laptop with a dead screen usable — SSH already
+  carried the shell and the agent; only the voice was stuck in the room.
+  Capture reuses `PersistentCaptureSource` whole by handing it a stream factory
+  whose device is the WebSocket (`RemoteInputStream`), so gate, open-guard,
+  stall detection and the endpointer are the same code the local mic runs;
+  playback reuses `PlaybackHandle` by satisfying the same four-method process
+  protocol `afplay` does. An injected recorder or a pinned `input_device` always
+  wins, so tests and a deliberate device choice are never displaced by a phone.
+  `/phone` and `/phone/ws` are the only surfaces reachable off this machine:
+  peers must be loopback or inside the tailnet CGNAT range, the socket requires
+  the control token, and `tailscale serve` exposes those two paths and nothing
+  else — `/mcp` and `/control` stay loopback-only. One phone at a time; a second
+  connection replaces the first. `health.phone` reports who is attached, because
+  a phone that silently dropped otherwise looks exactly like a laptop nobody is
+  answering.
 - **Loud rooms endpoint.** Adaptive floor + `noise_rise_smoothing` backstop.
   Music still degrades VAD (Silero later).
 - **Whisper `small`.** One server `com.vox.whisper` `:2022`.
@@ -321,6 +340,13 @@ used them:
 - **Companion beyond two turns.** Live-verified for one answer plus one
   escalation. The `budget_turns` loop, the STOP/PAUSE intents inside it, and
   `voice_survey(agent="companion")` as the interview path are untested aloud.
+- **The phone as the room.** Verified end to end against the live runtime — the
+  socket accepted a real token over Tailscale HTTPS, a spoken reply arrived as a
+  77 KB wav and played nowhere on this machine, and PCM pushed into the socket
+  ran the endpointer and reached Whisper at 16 kHz. What no human has done yet
+  is hold a real conversation on it: echo behaviour on a phone speaker, whether
+  barge-in survives the added network delay, and what a backgrounded tab or a
+  cellular handover does to a turn are all unmeasured.
 - **The turn contract under pressure.** It cut the mean from 30.2 s to 18.1 s,
   but one exchange still ran 26 s. It is a prompt, not a mechanism, and nothing
   enforces it.

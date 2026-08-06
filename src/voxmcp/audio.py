@@ -1702,6 +1702,48 @@ class AudioPlayer:
             )
         raise PlaybackError(f"Unsupported player executable: {player}")
 
+    def _remote_playback(
+        self,
+        audio_path: Path,
+        *,
+        volume: float,
+        cleanup_paths: Iterable[Path] = (),
+    ) -> "PlaybackHandle | None":
+        """Send this wav to the attached phone, or return None to play locally.
+
+        Every spoken reply, cue and replay already funnels through
+        ``play_file``, so this one branch is all it takes for the phone to
+        become the speaker — and a failure here falls back to the room rather
+        than swallowing the audio.
+        """
+
+        from .remote import PHONE, RemoteAudioUnavailable, RemotePlaybackProcess, wav_duration_s
+
+        if not PHONE.connected:
+            return None
+        try:
+            payload = audio_path.read_bytes()
+            playback_id = PHONE.start_playback(
+                payload,
+                volume=volume,
+                duration_s=wav_duration_s(payload),
+            )
+        except (OSError, RemoteAudioUnavailable):
+            return None
+        handle = PlaybackHandle(
+            RemotePlaybackProcess(playback_id),
+            ("vox-phone", playback_id),
+            self.registry,
+            cleanup_paths,
+        )
+        self.registry.register(handle)
+        threading.Thread(
+            target=handle.monitor,
+            name=f"vox-phone-playback-{handle.id[:8]}",
+            daemon=True,
+        ).start()
+        return handle
+
     def play_file(
         self,
         path: Path | str,
@@ -1712,6 +1754,11 @@ class AudioPlayer:
         cleanup_paths: Iterable[Path] = (),
     ) -> PlaybackHandle:
         audio_path = Path(path).expanduser().resolve(strict=True)
+        remote = self._remote_playback(audio_path, volume=volume, cleanup_paths=cleanup_paths)
+        if remote is not None:
+            if blocking:
+                remote.wait()
+            return remote
         player = self._resolve_player(preferred_player)
         command = self._command(player, audio_path, volume)
         try:

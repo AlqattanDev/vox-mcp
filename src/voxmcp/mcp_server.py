@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import ipaddress
+import json
 import os
 import re
 import secrets
@@ -24,6 +25,8 @@ from fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
+from starlette.routing import WebSocketRoute
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from . import __version__
 from .audio import default_latest_recording_path
@@ -175,16 +178,42 @@ def _redact_sensitive(value: Any) -> Any:
     return normalized
 
 
-def _loopback_peer(request: Request) -> bool:
-    if request.client is None:
+def _loopback_client(client: Any) -> bool:
+    if client is None:
         return False
-    host = request.client.host.strip().lower()
+    host = str(getattr(client, "host", "")).strip().lower()
     if host == "localhost":
         return True
     try:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def _loopback_peer(request: Request) -> bool:
+    return _loopback_client(request.client)
+
+
+# The one place a Vox surface is reachable from off this machine. It is the
+# phone standing in for the local devices, so it cannot be loopback-only — but
+# it is not the open internet either: `tailscale serve` hands the request over
+# with the peer's tailnet address, and every tailnet address lives in the CGNAT
+# range below. Anything outside it never reaches the socket, and inside it the
+# control token is still required.
+_TAILNET_V4 = ipaddress.ip_network("100.64.0.0/10")
+_TAILNET_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
+
+
+def _phone_peer_allowed(client: Any) -> bool:
+    if _loopback_client(client):
+        return True
+    if client is None:
+        return False
+    try:
+        address = ipaddress.ip_address(str(getattr(client, "host", "")).strip())
+    except ValueError:
+        return False
+    return address in _TAILNET_V4 or address in _TAILNET_V6
 
 
 def _bearer_token(request: Request) -> str | None:
@@ -863,6 +892,91 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
         except Exception:
             return JSONResponse({"ok": False, "error": "control_failed"}, status_code=500)
         return JSONResponse({"ok": True, "result": payload})
+
+    def _phone_token_ok(supplied: str | None) -> bool:
+        expected_tokens = effective_control_tokens()
+        if not expected_tokens or not supplied:
+            return False
+        return any(secrets.compare_digest(supplied, expected) for expected in expected_tokens)
+
+    @server.custom_route("/phone", methods=["GET"], include_in_schema=False)
+    async def phone_route(request: Request) -> Response:
+        # The page carries no secret of its own; the token is checked when the
+        # socket opens. Serving it unauthenticated keeps the token out of a URL
+        # that would otherwise sit in the phone's history and autocomplete.
+        if not _phone_peer_allowed(request.client):
+            return Response("not reachable from this network", status_code=403)
+        from .phone_client import PHONE_HTML
+
+        return Response(
+            PHONE_HTML,
+            media_type="text/html; charset=utf-8",
+            headers={"cache-control": "no-store"},
+        )
+
+    async def phone_socket(websocket: WebSocket) -> None:
+        """One phone, acting as this machine's microphone and speaker."""
+
+        from .remote import PHONE
+
+        if not _phone_peer_allowed(websocket.client):
+            await websocket.close(code=1008)
+            return
+        if not _phone_token_ok(websocket.query_params.get("t", "").strip()):
+            await websocket.close(code=1008)
+            return
+
+        await websocket.accept()
+        loop = asyncio.get_running_loop()
+        outbound: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+
+        def enqueue(message: dict[str, Any]) -> None:
+            outbound.put_nowait(message)
+
+        info = PHONE.attach(
+            send=enqueue,
+            loop=loop,
+            user_agent=websocket.headers.get("user-agent", ""),
+        )
+
+        async def pump_outbound() -> None:
+            while True:
+                message = await outbound.get()
+                if message is None:
+                    return
+                await websocket.send_json(message)
+
+        writer = asyncio.create_task(pump_outbound())
+        try:
+            while True:
+                message = await websocket.receive()
+                kind = message.get("type")
+                if kind == "websocket.disconnect":
+                    break
+                payload = message.get("bytes")
+                if payload:
+                    # The realtime path: int16 mono PCM straight into the fan-out.
+                    PHONE.push_pcm(payload)
+                    continue
+                text = message.get("text")
+                if not text:
+                    continue
+                try:
+                    event = json.loads(text)
+                except ValueError:
+                    continue
+                if isinstance(event, dict) and event.get("type") == "ended":
+                    playback_id = str(event.get("id", ""))
+                    if playback_id:
+                        PHONE.finish_playback(playback_id)
+        except WebSocketDisconnect:
+            pass
+        finally:
+            PHONE.detach(info.connection_id)
+            outbound.put_nowait(None)
+            writer.cancel()
+
+    server._additional_http_routes.append(WebSocketRoute("/phone/ws", endpoint=phone_socket))
 
     return server
 

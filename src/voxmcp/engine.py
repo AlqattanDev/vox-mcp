@@ -754,6 +754,36 @@ class VoxEngine:
             pass
         self._log("barge_in.detected", client_id=self._active_client)
 
+    def phone_status(self) -> dict[str, Any]:
+        """Whether a phone is currently standing in for the local devices."""
+
+        from .remote import PHONE
+
+        return PHONE.status()
+
+    def _capture_backend(
+        self, recorder: AudioRecorder
+    ) -> tuple[Any, Any, Callable[..., Any] | None]:
+        """Pick the device this capture runs on: the phone if one is attached.
+
+        An injected recorder always wins. A test that hands Vox a fake stream
+        must not have its frames quietly replaced by a phone that happens to be
+        connected, and the same rule keeps the real microphone reachable when
+        someone deliberately pins a device.
+        """
+
+        if (
+            recorder.sounddevice is not None
+            or recorder.stream_factory is not None
+            or self.input_device is not None
+        ):
+            return self.input_device, recorder.sounddevice, recorder.stream_factory
+        from .remote import PHONE, RemoteSoundDevice, remote_stream_factory
+
+        if not PHONE.connected:
+            return self.input_device, recorder.sounddevice, recorder.stream_factory
+        return None, RemoteSoundDevice(), remote_stream_factory
+
     async def _ensure_source(self) -> PersistentCaptureSource | None:
         """Open the capture stream and take a hold on it, or return None.
 
@@ -781,14 +811,15 @@ class VoxEngine:
             source = self._source
         if source is not None and source.stream_open:
             return source
+        device, sounddevice, stream_factory = self._capture_backend(self.recorder)
         source = PersistentCaptureSource(
             self.recorder.config,
-            device=self.input_device,
+            device=device,
             # The stream has to reach the same hardware the recorder was built
             # against, injected fakes included — otherwise a test recorder ends
             # up driving the real microphone.
-            sounddevice=self.recorder.sounddevice,
-            stream_factory=self.recorder.stream_factory,
+            sounddevice=sounddevice,
+            stream_factory=stream_factory,
             open_guard_s=self._stream_open_guard_s,
             on_event=self._log,
         )
@@ -1998,11 +2029,12 @@ class VoxEngine:
         if source is None:
             # Persistent capture is switched off, but dictation still needs a
             # stream. Borrow one for the length of the hold and give it back.
+            device, sounddevice, stream_factory = self._capture_backend(recorder)
             source = PersistentCaptureSource(
                 recorder.config,
-                device=self.input_device,
-                sounddevice=recorder.sounddevice,
-                stream_factory=recorder.stream_factory,
+                device=device,
+                sounddevice=sounddevice,
+                stream_factory=stream_factory,
                 open_guard_s=self._stream_open_guard_s,
                 on_event=self._log,
             )
@@ -2837,6 +2869,9 @@ class VoxEngine:
             "last_stop_reason": session["last_stop_reason"],
             "idle_deadline_at": session["idle_deadline_at"],
             "io_mode": status.get("io_mode", "talk"),
+            # Which room the voice is actually in. Without this, a phone that
+            # silently dropped looks identical to a laptop nobody is answering.
+            "phone": self.phone_status(),
             "undelivered_heard": {
                 "present": bool(undelivered.get("present")),
                 "age_s": undelivered.get("age_s"),
