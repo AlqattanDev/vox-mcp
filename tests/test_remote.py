@@ -427,3 +427,34 @@ def test_a_token_copied_out_of_a_wrapped_terminal_still_connects() -> None:
     with TestClient(app, client=("127.0.0.1", 5555)) as client:
         with client.websocket_connect("/phone/ws?t=right   longtoken") as socket:
             socket.send_bytes(b"")
+
+
+def test_a_say_from_the_phone_reaches_read_aloud_verbatim() -> None:
+    """The phone can ask for any text read back; it rides the read_aloud path."""
+
+    from starlette.testclient import TestClient
+
+    from voxmcp.mcp_server import create_mcp
+
+    spoken: list[tuple[str, str]] = []
+    heard = threading.Event()
+
+    class FakeEngine:
+        async def read_aloud(self, client_id: str, *, text: str | None = None) -> dict:
+            spoken.append((client_id, text or ""))
+            heard.set()
+            return {"status": "ok"}
+
+    app = create_mcp(FakeEngine(), control_token="right").http_app(
+        path="/mcp", transport="http"
+    )
+    with TestClient(app, client=("127.0.0.1", 5555)) as client:
+        with client.websocket_connect("/phone/ws?t=right") as socket:
+            socket.send_json({"type": "say", "text": "  the exact words  "})
+            assert heard.wait(timeout=2.0)
+            # Empty and non-say messages must not dispatch anything.
+            socket.send_json({"type": "say", "text": "   "})
+            socket.send_json({"type": "nonsense"})
+            socket.send_bytes(b"")
+
+    assert spoken == [("phone", "the exact words")]

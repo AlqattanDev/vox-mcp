@@ -975,10 +975,25 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
                     event = json.loads(text)
                 except ValueError:
                     continue
-                if isinstance(event, dict) and event.get("type") == "ended":
+                if not isinstance(event, dict):
+                    continue
+                if event.get("type") == "ended":
                     playback_id = str(event.get("id", ""))
                     if playback_id:
                         PHONE.finish_playback(playback_id)
+                elif event.get("type") == "say":
+                    # The phone asking for a message read back verbatim. It
+                    # rides the existing read_aloud path — straight to Kokoro,
+                    # no model anywhere that could paraphrase — and the wav
+                    # comes back over this same socket as a normal play,
+                    # because an attached phone is already the speaker.
+                    spoken = str(event.get("text", "")).strip()[:4000]
+                    if spoken:
+                        task = asyncio.create_task(
+                            dispatch_control("read_aloud", "phone", extra={"text": spoken})
+                        )
+                        _BACKGROUND_TASKS.add(task)
+                        task.add_done_callback(_BACKGROUND_TASKS.discard)
         except WebSocketDisconnect:
             pass
         finally:
