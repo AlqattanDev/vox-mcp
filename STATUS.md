@@ -263,6 +263,13 @@ Package is `src/voxmcp/`.
   connection replaces the first. `health.phone` reports who is attached, because
   a phone that silently dropped otherwise looks exactly like a laptop nobody is
   answering.
+- **Verified aloud on a real phone** (2026-08-08, Pixel 9 Pro, Chrome Beta, over
+  Tailscale HTTPS). Kokoro played out of the phone from across the house and
+  18 s of speech into it came back through the endpointer and Whisper at
+  16 kHz, no dropped frames. One thing bites on the *first* turn only: while
+  Chrome is showing its microphone prompt no frames exist, so the turn dies on
+  `source_stall_timeout_s` with an `AudioDeviceError`. Grant the permission
+  once and every turn after it is clean.
 - **Loud rooms endpoint.** Adaptive floor + `noise_rise_smoothing` backstop.
   Music still degrades VAD (Silero later).
 - **Whisper `small`.** One server `com.vox.whisper` `:2022`.
@@ -340,13 +347,9 @@ used them:
 - **Companion beyond two turns.** Live-verified for one answer plus one
   escalation. The `budget_turns` loop, the STOP/PAUSE intents inside it, and
   `voice_survey(agent="companion")` as the interview path are untested aloud.
-- **The phone as the room.** Verified end to end against the live runtime — the
-  socket accepted a real token over Tailscale HTTPS, a spoken reply arrived as a
-  77 KB wav and played nowhere on this machine, and PCM pushed into the socket
-  ran the endpointer and reached Whisper at 16 kHz. What no human has done yet
-  is hold a real conversation on it: echo behaviour on a phone speaker, whether
-  barge-in survives the added network delay, and what a backgrounded tab or a
-  cellular handover does to a turn are all unmeasured.
+- **The phone under pressure.** A real conversation is verified (see below), but
+  the long tail is not: barge-in over the added network delay, a backgrounded
+  tab, a screen that locks, and a cellular handover mid-turn are all unmeasured.
 - **The turn contract under pressure.** It cut the mean from 30.2 s to 18.1 s,
   but one exchange still ran 26 s. It is a prompt, not a mechanism, and nothing
   enforces it.
