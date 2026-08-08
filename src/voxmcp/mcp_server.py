@@ -957,6 +957,33 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
                 await websocket.send_json(message)
 
         writer = asyncio.create_task(pump_outbound())
+
+        async def read_aloud_for_phone(
+            text: str, *, say_id: str | None, replace: bool
+        ) -> None:
+            """Read one selection to the phone, and say when it is really over.
+
+            A long selection is split into spans here and played one at a
+            time, each released by the phone's own ``ended``. Only this side
+            knows there is another span coming, so a phone that opened a
+            socket purely to be the speaker has no way to tell "this wav
+            finished" from "the reading finished" — it left after the first
+            span and the rest was spoken into the room. ``say_done`` is that
+            missing sentence.
+            """
+
+            if replace:
+                # A second tap replaces the first rather than queueing behind
+                # it: the user asked for this message, not for both in a row.
+                await dispatch_control("cancel", "phone")
+            try:
+                await dispatch_control("read_aloud", "phone", extra={"text": text})
+            finally:
+                done: dict[str, Any] = {"type": "say_done"}
+                if say_id:
+                    done["id"] = say_id
+                PHONE.notify(done)
+
         try:
             while True:
                 message = await websocket.receive()
@@ -990,7 +1017,11 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
                     spoken = str(event.get("text", "")).strip()[:4000]
                     if spoken:
                         task = asyncio.create_task(
-                            dispatch_control("read_aloud", "phone", extra={"text": spoken})
+                            read_aloud_for_phone(
+                                spoken,
+                                say_id=str(event.get("id", "")) or None,
+                                replace=event.get("replace") is True,
+                            )
                         )
                         _BACKGROUND_TASKS.add(task)
                         task.add_done_callback(_BACKGROUND_TASKS.discard)

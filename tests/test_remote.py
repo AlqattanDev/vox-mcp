@@ -458,3 +458,74 @@ def test_a_say_from_the_phone_reaches_read_aloud_verbatim() -> None:
             socket.send_bytes(b"")
 
     assert spoken == [("phone", "the exact words")]
+
+
+def test_the_phone_is_told_when_the_whole_reading_is_over(monkeypatch) -> None:
+    """A long selection is many spans; only this side knows the last one played.
+
+    Without this the phone leaves after span one — it acked a wav, and a wav
+    is all it can see — and the rest of the reading falls back to the Mac's
+    own speaker with nobody in the room to hear it.
+    """
+
+    from starlette.testclient import TestClient
+
+    from voxmcp import remote
+    from voxmcp.mcp_server import create_mcp
+
+    link = PhoneLink()
+    monkeypatch.setattr(remote, "PHONE", link)
+    started = threading.Event()
+    release = threading.Event()
+
+    class FakeEngine:
+        async def read_aloud(self, client_id: str, *, text: str | None = None) -> dict:
+            started.set()
+            await asyncio.get_running_loop().run_in_executor(None, release.wait, 5.0)
+            return {"status": "ok"}
+
+    app = create_mcp(FakeEngine(), control_token="right").http_app(
+        path="/mcp", transport="http"
+    )
+    with TestClient(app, client=("127.0.0.1", 5555)) as client:
+        with client.websocket_connect("/phone/ws?t=right") as socket:
+            socket.send_json({"type": "say", "id": "u7", "text": "three sentences"})
+            assert started.wait(timeout=2.0)
+            # Mid-reading the phone is handed a span, and acking it is not the
+            # end of anything.
+            playback_id = link.start_playback(b"RIFF", volume=1.0, duration_s=0.1)
+            assert socket.receive_json()["type"] == "play"
+            socket.send_json({"type": "ended", "id": playback_id})
+            release.set()
+            assert socket.receive_json() == {"type": "say_done", "id": "u7"}
+
+
+def test_a_second_tap_replaces_the_reading_instead_of_queueing_behind_it() -> None:
+    """Tapping speak aloud twice must restart, not read the first one again."""
+
+    from starlette.testclient import TestClient
+
+    from voxmcp.mcp_server import create_mcp
+
+    actions: list[str] = []
+    done = threading.Event()
+
+    class FakeEngine:
+        async def control(self, client_id: str, action: str, **_: object) -> dict:
+            actions.append(f"control:{action}")
+            return {"status": "cancel_signalled"}
+
+        async def read_aloud(self, client_id: str, *, text: str | None = None) -> dict:
+            actions.append(f"read:{text}")
+            done.set()
+            return {"status": "ok"}
+
+    app = create_mcp(FakeEngine(), control_token="right").http_app(
+        path="/mcp", transport="http"
+    )
+    with TestClient(app, client=("127.0.0.1", 5555)) as client:
+        with client.websocket_connect("/phone/ws?t=right") as socket:
+            socket.send_json({"type": "say", "text": "second one", "replace": True})
+            assert done.wait(timeout=2.0)
+
+    assert actions == ["control:cancel", "read:second one"]

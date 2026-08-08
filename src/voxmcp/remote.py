@@ -211,6 +211,17 @@ class PhoneLink:
             return False
         return True
 
+    def notify(self, message: dict[str, Any]) -> bool:
+        """Send one control message to the attached phone, if there is one.
+
+        Playback and the microphone have their own methods because they own
+        state here. This is for the messages that only report something the
+        Mac knows and the phone cannot work out — chiefly that a whole spoken
+        utterance is over, not just the span the phone last acked.
+        """
+
+        return self._post(dict(message))
+
     # --------------------------------------------------------------- capture
 
     def set_mic_open(self, open_: bool) -> None:
