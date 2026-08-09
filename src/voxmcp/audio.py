@@ -1719,7 +1719,9 @@ class AudioPlayer:
 
         from .remote import PHONE, RemoteAudioUnavailable, RemotePlaybackProcess, wav_duration_s
 
-        if not PHONE.connected:
+        # Attached is not chosen: a phone the user is not speaking from must
+        # not take the reply out of the room they are sitting in.
+        if not PHONE.is_destination:
             return None
         try:
             payload = audio_path.read_bytes()

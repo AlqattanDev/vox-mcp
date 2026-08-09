@@ -265,6 +265,9 @@ class VoxEngine:
         # released, which is the only state in which macOS stops showing the
         # microphone indicator.
         self._source_holds = 0
+        # Which machine the open capture stream reaches, so a stream held over
+        # from the previous turn is not reused after the user moved.
+        self._source_is_phone = False
         self._source_release_task: asyncio.Task[Any] | None = None
         self._dictation_control: CaptureControl | None = None
         self._dictation_future: asyncio.Future[Any] | None = None
@@ -780,7 +783,9 @@ class VoxEngine:
             return self.input_device, recorder.sounddevice, recorder.stream_factory
         from .remote import PHONE, RemoteSoundDevice, remote_stream_factory
 
-        if not PHONE.connected:
+        # Attached is not chosen. A phone left connected on the desk used to
+        # take the microphone from the Mac its owner was sitting at.
+        if not PHONE.is_destination:
             return self.input_device, recorder.sounddevice, recorder.stream_factory
         return None, RemoteSoundDevice(), remote_stream_factory
 
@@ -809,9 +814,25 @@ class VoxEngine:
         self._hold_source()
         with self._active_lock:
             source = self._source
-        if source is not None and source.stream_open:
-            return source
         device, sounddevice, stream_factory = self._capture_backend(self.recorder)
+        from .remote import RemoteSoundDevice
+
+        wants_phone = isinstance(sounddevice, RemoteSoundDevice)
+        if source is not None and source.stream_open:
+            if wants_phone == self._source_is_phone:
+                return source
+            # The user moved: this stream reaches the machine they were at a
+            # moment ago, not the one they just spoke from. Reusing it would
+            # record the wrong room — the device is deliberately held open
+            # between turns, so without this the first turn after a switch
+            # always went to the old microphone.
+            self._log(
+                "capture.backend_switched",
+                to="phone" if wants_phone else "mac",
+            )
+            await asyncio.to_thread(source.close)
+            with self._active_lock:
+                self._source = None
         source = PersistentCaptureSource(
             self.recorder.config,
             device=device,
@@ -831,6 +852,7 @@ class VoxEngine:
             return None
         with self._active_lock:
             self._source = source
+            self._source_is_phone = wants_phone
         return source
 
     def _hold_source(self) -> None:

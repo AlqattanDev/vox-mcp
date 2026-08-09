@@ -242,12 +242,39 @@ def test_dropping_the_phone_releases_everything_still_in_flight() -> None:
         link.start_playback(b"RIFF", volume=1.0, duration_s=0.1)
 
 
-def test_the_player_uses_the_phone_when_one_is_attached(tmp_path: Path, monkeypatch) -> None:
+def test_the_player_uses_the_phone_the_user_last_spoke_from(tmp_path: Path, monkeypatch) -> None:
+    """Attached is not chosen — the reply goes where the user is."""
+
     from voxmcp import remote
 
     link = PhoneLink()
     _loop, sent = attach(link)
     monkeypatch.setattr(remote, "PHONE", link)
+    # Merely attached: the reply belongs in the room the user is sitting in,
+    # so it must reach the local player and not the phone on the desk.
+    played_in_the_room: list[list[str]] = []
+
+    class Local:
+        pid = 1
+        def poll(self) -> int | None: return None
+        def wait(self, timeout: float | None = None) -> int: return 0
+        def terminate(self) -> None: ...
+        def kill(self) -> None: ...
+
+    def to_the_room(command: list[str], **_kwargs: Any) -> Local:
+        played_in_the_room.append(command)
+        return Local()
+
+    room = AudioPlayer(registry=PlaybackRegistry(), popen_factory=to_the_room)
+    room.play_file(
+        write_wav_atomic(tmp_path / "room.wav", np.zeros(800, dtype=np.float32), 16_000),
+        volume=0.5,
+    )
+    assert played_in_the_room, "an attached but unspoken-to phone stole the reply"
+    assert not [m for m in sent if m["type"] == "play"]
+
+    # Now he speaks from the phone. From here the phone is where the voice goes.
+    link.choose(True)
     wav = write_wav_atomic(tmp_path / "cue.wav", np.zeros(800, dtype=np.float32), 16_000)
 
     spawned: list[Any] = []
@@ -333,6 +360,11 @@ def test_an_injected_recorder_is_never_replaced_by_the_phone() -> None:
         assert sounddevice is fake
         assert device is engine.input_device
 
+        # Attached but not spoken from: the microphone stays this machine's.
+        device, sounddevice, factory = engine._capture_backend(AudioRecorder())
+        assert not isinstance(sounddevice, RemoteSoundDevice)
+
+        link.choose(True)
         _device, remote_sd, factory = engine._capture_backend(AudioRecorder())
         assert isinstance(remote_sd, RemoteSoundDevice)
         assert factory is not None
@@ -499,6 +531,102 @@ def test_the_phone_can_start_and_end_a_turn() -> None:
             time.sleep(0.2)
 
     assert asked == ["phone:gate_open", "phone:gate_close", "phone:cancel"]
+
+
+def test_the_voice_follows_the_user_between_the_mac_and_the_phone(monkeypatch) -> None:
+    """Ali's rule, in his words: *the voice follows you.*
+
+    The old rule was "a connected phone is the microphone", which is a fact
+    about the network rather than about where the person is. Sitting at the
+    Mac with the app open on the desk, his replies came out of the phone and
+    his dictation recorded from it. Pressing something is the signal; being
+    attached is not.
+    """
+
+    from starlette.testclient import TestClient
+
+    from voxmcp import remote
+    from voxmcp.mcp_server import create_mcp
+
+    link = PhoneLink()
+    monkeypatch.setattr(remote, "PHONE", link)
+
+    class FakeEngine:
+        async def control(self, action: str, client_id: str, **_: object) -> dict:
+            return {"status": "ok"}
+
+        async def note(self, client_id: str, **_: object) -> dict:
+            return {"status": "ok"}
+
+    app = create_mcp(FakeEngine(), control_token="right").http_app(
+        path="/mcp", transport="http"
+    )
+    with TestClient(app, client=("127.0.0.1", 5555)) as client:
+        with client.websocket_connect("/phone/ws?t=right") as socket:
+            # Attached and silent. He is at the Mac; the Mac keeps the voice.
+            assert link.connected is True
+            assert link.is_destination is False
+
+            # He presses talk on the phone. The voice moves to him.
+            socket.send_json({"type": "control", "action": "gate_open"})
+            deadline = time.time() + 2.0
+            while not link.is_destination and time.time() < deadline:
+                time.sleep(0.02)
+            assert link.is_destination is True
+
+            # He comes home and uses the key on the Mac. It moves back.
+            client.post(
+                "/control",
+                json={"action": "gate_open"},
+                headers={"Authorization": "Bearer right"},
+            )
+            assert link.is_destination is False
+
+            # He leaves again and talks from the phone. It follows him, even
+            # though the conversation began on the Mac.
+            socket.send_json({"type": "control", "action": "gate_open"})
+            deadline = time.time() + 2.0
+            while not link.is_destination and time.time() < deadline:
+                time.sleep(0.02)
+            assert link.is_destination is True
+
+        # The phone left. A phone that is gone cannot be where he is speaking.
+        deadline = time.time() + 2.0
+        while link.connected and time.time() < deadline:
+            time.sleep(0.02)
+        assert link.is_destination is False
+
+
+def test_an_agent_speaking_does_not_move_the_voice(monkeypatch) -> None:
+    """A reply follows the user; it does not reset where the voice goes.
+
+    This is the half that makes "I started on the laptop and left the house"
+    work: he presses talk on the phone, and every later turn of that
+    conversation keeps reaching the phone even though the agent, not him, is
+    the one starting them.
+    """
+
+    from starlette.testclient import TestClient
+
+    from voxmcp import remote
+    from voxmcp.mcp_server import create_mcp
+
+    link = PhoneLink()
+    attach(link)
+    monkeypatch.setattr(remote, "PHONE", link)
+    link.choose(True)
+
+    class FakeEngine:
+        async def control(self, action: str, client_id: str, **_: object) -> dict:
+            return {"status": "ok"}
+
+    app = create_mcp(FakeEngine(), control_token="right").http_app(
+        path="/mcp", transport="http"
+    )
+    with TestClient(app, client=("127.0.0.1", 5555)):
+        pass
+    # Nothing a non-user action does may take the voice off the phone.
+    assert link.is_destination is True
 
 
 def test_the_phone_is_told_when_the_whole_reading_is_over(monkeypatch) -> None:

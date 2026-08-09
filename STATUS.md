@@ -263,6 +263,19 @@ Package is `src/voxmcp/`.
   connection replaces the first. `health.phone` reports who is attached, because
   a phone that silently dropped otherwise looks exactly like a laptop nobody is
   answering.
+- **The voice follows the user; being attached is not being chosen.** A phone
+  is the microphone and the speaker only when it is attached *and* the last
+  place the user spoke from. Pressing something is the signal — the talk bar
+  in the app, the key or the menu bar on this Mac — and an agent calling
+  `converse` never moves it, which is what lets a conversation begun on the
+  Mac follow its owner out of the house. The rule replaces "a connected phone
+  is the microphone", which was a fact about the network rather than about
+  where the person was: with the app open on the desk, Ali's replies came out
+  of his phone and his dictation recorded from it while he sat at the Mac.
+  `health.phone.is_destination` says which it is. A phone that detaches gives
+  the voice straight back, and a capture stream held open from the previous
+  turn is closed rather than reused when the destination changes — otherwise
+  the first turn after a switch still reached the old microphone.
 - **The phone can start and end a turn, not only carry one.** The socket takes
   `{"type":"control","action"}` for `gate_open`, `gate_close` and `cancel`, and
   refuses every other action — the rest of the controls stay on this machine,
@@ -314,7 +327,7 @@ full 1.6 s — and is never cut off mid-thought.
 | `com.vox.runtime` | ~73 MB | ~73 MB |
 | **total** | **~2.7 GB** | **~3.2 GB** |
 
-Tests: `.venv/bin/python -m pytest tests/` — **449 passing**.
+Tests: `.venv/bin/python -m pytest tests/` — **451 passing**.
 
 **Slash commands** (in `~/.claude/commands/`, global): `/speak` reads the
 agent's last reply aloud (no mic); `/listen` opens the mic for one utterance

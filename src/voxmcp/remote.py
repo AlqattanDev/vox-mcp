@@ -96,6 +96,7 @@ class PhoneLink:
         self._subscribers: set[queue.Queue[np.ndarray]] = set()
         self._playbacks: dict[str, _Playback] = {}
         self._mic_open = False
+        self._chosen = False
         self._on_event: Callable[..., Any] | None = None
 
     # ------------------------------------------------------------- lifecycle
@@ -158,6 +159,8 @@ class PhoneLink:
             self._info = None
             self._send = None
             self._loop = None
+            # A phone that left cannot still be where the user is speaking.
+            self._chosen = False
             playbacks = tuple(self._playbacks.values())
             self._playbacks.clear()
         # Nothing will ever ack these now; releasing them is what keeps a turn
@@ -167,10 +170,39 @@ class PhoneLink:
         self._emit("phone.detached", connection=info.connection_id)
         return True
 
+    def choose(self, phone: bool) -> None:
+        """Record which machine the user just spoke from.
+
+        Connected is not chosen. A phone in a pocket, or an app left open on
+        the desk, used to take the microphone and the speaker away from the
+        Mac the user was sitting at — the voice went to whichever device
+        happened to be attached, which is a fact about the network and not
+        about where the person is. Ali's rule, in his words: *the voice
+        follows you*. So attaching only makes the phone available, and
+        speaking is what makes it the destination.
+        """
+
+        with self._lock:
+            if self._chosen == phone:
+                return
+            self._chosen = phone
+        self._emit("phone.chosen" if phone else "phone.released")
+
     @property
     def connected(self) -> bool:
         with self._lock:
             return self._info is not None
+
+    @property
+    def is_destination(self) -> bool:
+        """Should the microphone and the speaker be the phone's right now?
+
+        Both halves have to be true: attached, and the last place the user
+        spoke. Everything that used to ask `connected` asks this instead.
+        """
+
+        with self._lock:
+            return self._info is not None and self._chosen
 
     @property
     def info(self) -> PhoneInfo | None:
@@ -181,6 +213,7 @@ class PhoneLink:
         with self._lock:
             info = self._info
             mic_open = self._mic_open
+            chosen = self._chosen
             playing = len(self._playbacks)
         if info is None:
             return {"connected": False}
@@ -192,6 +225,9 @@ class PhoneLink:
             "sample_rate": info.sample_rate,
             "mic_open": mic_open,
             "playbacks_in_flight": playing,
+            # Whether this phone is merely reachable or is actually where the
+            # voice goes — the distinction a connected-but-idle phone needs.
+            "is_destination": chosen,
         }
 
     # ------------------------------------------------------------- transport

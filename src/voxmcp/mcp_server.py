@@ -317,6 +317,31 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
             values.append(configured_token)
         return tuple(values)
 
+    # The controls a person can only produce by pressing something: a key on
+    # this Mac, a button in the menu bar, the bar in the phone app. An agent
+    # calling `converse` is not in here, and that is the point — a reply must
+    # follow the user rather than reset where the voice goes on every turn.
+    _USER_PRESSED = frozenset(
+        {"gate_open", "gate_close", "reply", "note", "dictate_start", "read_aloud"}
+    )
+
+    def _note_where_the_user_spoke(action: str, client_id: str) -> None:
+        """Point the voice at whichever machine the user just used.
+
+        The old rule was "a connected phone is the microphone", which is a
+        fact about the network rather than about where the person is: a phone
+        left attached on the desk took the voice away from the Mac its owner
+        was talking to. Ali's rule instead — *the voice follows you* — needs
+        only this, because pressing something is the one unambiguous signal
+        that says where he is.
+        """
+
+        if action not in _USER_PRESSED:
+            return
+        from .remote import PHONE
+
+        PHONE.choose(client_id == "phone")
+
     async def dispatch_control(
         action: str,
         client_id: str,
@@ -325,6 +350,7 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
         extra: Mapping[str, Any] | None = None,
     ) -> Any:
         options = dict(extra or {})
+        _note_where_the_user_spoke(action, client_id)
         if action == "note":
             return await _invoke(
                 current_engine(),
