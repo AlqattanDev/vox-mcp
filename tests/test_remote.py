@@ -460,6 +460,47 @@ def test_a_say_from_the_phone_reaches_read_aloud_verbatim() -> None:
     assert spoken == [("phone", "the exact words")]
 
 
+def test_the_phone_can_start_and_end_a_turn() -> None:
+    """The phone as the turn key, not only as the microphone.
+
+    Without this the phone could be available and nothing more: the mic opened
+    when something on the Mac asked for it, so turning voice on started no
+    conversation, and once a turn had begun nothing on the phone could end it.
+    Three actions and no others — the rest of the controls stay on the Mac,
+    where the agent is.
+    """
+
+    from starlette.testclient import TestClient
+
+    from voxmcp.mcp_server import create_mcp
+
+    asked: list[str] = []
+    seen = threading.Event()
+
+    class FakeEngine:
+        async def control(self, action: str, client_id: str, **_: object) -> dict:
+            asked.append(f"{client_id}:{action}")
+            seen.set()
+            return {"status": "ok"}
+
+    app = create_mcp(FakeEngine(), control_token="right").http_app(
+        path="/mcp", transport="http"
+    )
+    with TestClient(app, client=("127.0.0.1", 5555)) as client:
+        with client.websocket_connect("/phone/ws?t=right") as socket:
+            for action in ("gate_open", "gate_close", "cancel"):
+                seen.clear()
+                socket.send_json({"type": "control", "action": action})
+                assert seen.wait(timeout=2.0)
+            # Anything else the phone invents is ignored rather than obeyed.
+            socket.send_json({"type": "control", "action": "stop"})
+            socket.send_json({"type": "control"})
+            socket.send_json({"type": "say", "text": "settle"})
+            time.sleep(0.2)
+
+    assert asked == ["phone:gate_open", "phone:gate_close", "phone:cancel"]
+
+
 def test_the_phone_is_told_when_the_whole_reading_is_over(monkeypatch) -> None:
     """A long selection is many spans; only this side knows the last one played.
 

@@ -1025,6 +1025,22 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
                         )
                         _BACKGROUND_TASKS.add(task)
                         task.add_done_callback(_BACKGROUND_TASKS.discard)
+                elif event.get("type") == "control":
+                    # The phone as the turn key, not only as the microphone.
+                    #
+                    # Until this existed the phone could not begin or end a
+                    # turn: the mic opened only when something on the Mac
+                    # asked, so "voice on" in the app meant no more than
+                    # "available", and there was no way to stop a turn once it
+                    # had started. These three are the whole of it —
+                    # gate_open starts (or joins) a turn, gate_close ends it
+                    # and submits what was said, cancel throws it away. Every
+                    # other control stays on the Mac, where the agent is.
+                    action = str(event.get("action", ""))
+                    if action in {"gate_open", "gate_close", "cancel"}:
+                        task = asyncio.create_task(dispatch_control(action, "phone"))
+                        _BACKGROUND_TASKS.add(task)
+                        task.add_done_callback(_BACKGROUND_TASKS.discard)
         except WebSocketDisconnect:
             pass
         finally:

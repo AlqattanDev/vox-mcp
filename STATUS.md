@@ -263,6 +263,14 @@ Package is `src/voxmcp/`.
   connection replaces the first. `health.phone` reports who is attached, because
   a phone that silently dropped otherwise looks exactly like a laptop nobody is
   answering.
+- **The phone can start and end a turn, not only carry one.** The socket takes
+  `{"type":"control","action"}` for `gate_open`, `gate_close` and `cancel`, and
+  refuses every other action — the rest of the controls stay on this machine,
+  where the agent is. Without it an attached phone was only ever *available*:
+  the mic opened when something here asked for one, so connecting started no
+  conversation, and once a turn had begun nothing on the phone could end it.
+  `gate_open` joins the turn a `converse` is already waiting on, or starts one
+  addressed to whichever agent last spoke.
 - **Verified aloud on a real phone** (2026-08-08, Pixel 9 Pro, Chrome Beta, over
   Tailscale HTTPS). Kokoro played out of the phone from across the house and
   18 s of speech into it came back through the endpointer and Whisper at
@@ -306,7 +314,7 @@ full 1.6 s — and is never cut off mid-thought.
 | `com.vox.runtime` | ~73 MB | ~73 MB |
 | **total** | **~2.7 GB** | **~3.2 GB** |
 
-Tests: `.venv/bin/python -m pytest tests/` — **424 passing**.
+Tests: `.venv/bin/python -m pytest tests/` — **449 passing**.
 
 **Slash commands** (in `~/.claude/commands/`, global): `/speak` reads the
 agent's last reply aloud (no mic); `/listen` opens the mic for one utterance
