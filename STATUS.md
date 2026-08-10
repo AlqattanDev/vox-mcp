@@ -240,10 +240,24 @@ Package is `src/voxmcp/`.
   picker (each agent = a project/voice); the note is **addressed to that agent**
   and surfaces as `undelivered_heard` only in *its* status, so only that agent
   claims it — not whoever polls first. `NotesStore` (`~/.vox/state/notes.json`)
-  holds one pending note per agent, so notes to different agents coexist. Empty
-  target = broadcast (any agent). Fire-and-forget over HTTP (202); the earcon +
-  red glyph cue you to talk. Health exposes `agents` + `notes_waiting`; the panel
+  holds a **queue** per agent, so saying a second thing to an agent that is
+  still busy no longer throws the first away; claiming hands over everything
+  waiting, oldest first, joined by newlines, with a `count`. Twenty per agent
+  is the ceiling, and a note older than a day is dropped rather than delivered
+  — the panel already hid it, so handing it over meant the agent was told
+  something from yesterday that nothing on screen admitted to. A file written
+  in the old one-note-per-agent shape is read as a queue of one. Empty target =
+  broadcast (any agent). Fire-and-forget over HTTP (202); the earcon + red
+  glyph cue you to talk. Health exposes `agents` + `notes_waiting`; the panel
   names who has a note waiting.
+- **The crash-recovery slot is addressed too.** `last_heard.json` is one global
+  record of the most recent completed transcript, kept so a host that drops the
+  tool call mid-turn does not lose what was said. `claim_undelivered` used to
+  take it without checking who it was for, so a second project could walk off
+  with the first one's words simply by asking first. It now matches the agent
+  the record carries. A record with no agent on it is nobody's in particular
+  and stays claimable by whoever asks, so nothing written by an older build is
+  stranded.
 - **The phone can be the microphone and the speaker.** Open
   `https://<this-machine>.<tailnet>.ts.net/phone` on the phone, paste the token from
   `~/.vox/control.token`, tap Connect: from then on the mic that opens is the
@@ -327,7 +341,9 @@ full 1.6 s — and is never cut off mid-thought.
 | `com.vox.runtime` | ~73 MB | ~73 MB |
 | **total** | **~2.7 GB** | **~3.2 GB** |
 
-Tests: `.venv/bin/python -m pytest tests/` — **451 passing**.
+Tests: `.venv/bin/python -m pytest tests/` — **463 passing**. Run it that way,
+from the repo root: `tests/test_agents.py` imports a helper from
+`tests.test_engine`, so a bare `pytest` cannot collect it.
 
 **Slash commands** (in `~/.claude/commands/`, global): `/speak` reads the
 agent's last reply aloud (no mic); `/listen` opens the mic for one utterance

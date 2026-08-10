@@ -116,18 +116,32 @@ class LastHeardStore:
         except (TypeError, ValueError):
             return None
 
-    def undelivered(self, *, max_age_s: float = 86400.0) -> LastHeard | None:
+    def undelivered(
+        self, *, agent: str | None = None, max_age_s: float = 86400.0
+    ) -> LastHeard | None:
+        """The pending transcript, optionally only if it belongs to ``agent``.
+
+        Pass no agent to ask "is anything pending at all" — that is the status
+        panel's question and it is about the machine, not about one project.
+        Pass an agent before *taking* it: this is one global slot, so without
+        the check a second project could claim the first one's words simply by
+        asking first. A record with no agent on it is nobody's in particular
+        and stays claimable by whoever asks.
+        """
+
         current = self.read()
         if current is None or current.delivered:
             return None
         if max_age_s > 0 and (time.time() - current.captured_at) > max_age_s:
             return None
+        if agent is not None and current.agent is not None and current.agent != agent:
+            return None
         return current
 
-    def claim(self) -> LastHeard | None:
+    def claim(self, agent: str | None = None) -> LastHeard | None:
         """Return undelivered transcript and mark it delivered (one-shot recovery)."""
 
-        current = self.undelivered()
+        current = self.undelivered(agent=agent)
         if current is None:
             return None
         self.mark_delivered(current.turn_id)

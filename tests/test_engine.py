@@ -851,6 +851,92 @@ async def test_note_addresses_one_agent_and_only_it_claims(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_two_notes_to_a_busy_agent_both_survive(tmp_path: Path):
+    # Notes used to be one slot per agent, so saying a second thing to an agent
+    # that was still busy threw the first away without a word.
+    engine = make_engine(tmp_path)
+    await engine.session("claude", "start")
+    await engine.note("http-control", target_agent="mobilescape")
+    await engine.note("http-control", target_agent="mobilescape")
+
+    waiting = await engine._status_for_agent("mobilescape")
+    assert waiting["undelivered_heard"]["present"] is True
+
+    claimed = await engine.session(
+        "mobilescape", "claim_undelivered", agent="mobilescape"
+    )
+    # Both, in the order they were said, as one thing to read.
+    assert claimed["claimed_heard"]["transcript"] == "hello world\nhello world"
+    assert claimed["claimed_heard"]["count"] == 2
+    assert engine.notes.get("mobilescape") is None
+
+
+@pytest.mark.asyncio
+async def test_a_stale_note_is_dropped_rather_than_delivered(tmp_path: Path):
+    # `get` has always hidden an old note, so claiming one anyway meant the
+    # panel said nothing was waiting and the agent was told something from
+    # yesterday.
+    engine = make_engine(tmp_path)
+    await engine.session("claude", "start")
+    await engine.note("http-control", target_agent="mobilescape")
+    engine.notes.put(
+        "mobilescape",
+        transcript="from last week",
+        turn_id="old",
+        reason="stale",
+    )
+    assert engine.notes.claim("mobilescape", max_age_s=0.0001) is None
+    assert engine.notes.pending_targets(max_age_s=0.0001) == []
+
+
+@pytest.mark.asyncio
+async def test_another_agent_cannot_claim_a_recovered_transcript(tmp_path: Path):
+    # The crash-recovery slot is one global record and carries the agent it was
+    # captured for. Claiming it unfiltered let a second project walk off with
+    # the first one's words simply by asking first.
+    engine = make_engine(tmp_path)
+    await engine.session("claude", "start")
+    engine.last_heard.write(
+        transcript="the thing I actually said",
+        reason="recovered",
+        session_id="s1",
+        client_id="mcp:host:claude-code",
+        agent="mobilescape",
+        turn_id="t1",
+        delivered=False,
+    )
+
+    stolen = await engine.session("infra", "claim_undelivered", agent="infra")
+    assert stolen["claimed_heard"] is None
+
+    mine = await engine.session(
+        "mobilescape", "claim_undelivered", agent="mobilescape"
+    )
+    assert mine["claimed_heard"]["transcript"] == "the thing I actually said"
+
+
+@pytest.mark.asyncio
+async def test_an_unaddressed_recovered_transcript_stays_claimable_by_anyone(
+    tmp_path: Path,
+):
+    # A record with no agent on it is nobody's in particular — usually a turn
+    # from before agents were labelled. Scoping must not strand it forever.
+    engine = make_engine(tmp_path)
+    await engine.session("claude", "start")
+    engine.last_heard.write(
+        transcript="nobody in particular",
+        reason="recovered",
+        session_id="s1",
+        client_id="mcp:host:claude-code",
+        agent=None,
+        turn_id="t2",
+        delivered=False,
+    )
+    claimed = await engine.session("whoever", "claim_undelivered", agent="whoever")
+    assert claimed["claimed_heard"]["transcript"] == "nobody in particular"
+
+
+@pytest.mark.asyncio
 async def test_broadcast_note_is_claimable_by_any_agent(tmp_path: Path):
     engine = make_engine(tmp_path)
     await engine.session("claude", "start")

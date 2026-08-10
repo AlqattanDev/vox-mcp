@@ -2269,9 +2269,15 @@ class VoxEngine:
                     "transcript": str(note.get("transcript", "")),
                     "kind": "note",
                     "target_agent": note.get("target_agent", "*"),
+                    # How many separate times the user spoke while this agent
+                    # was busy. One transcript, but not one sentence.
+                    "count": int(note.get("count", 1)),
                 }
                 return payload
-            claimed = self.last_heard.claim()
+            # Addressed, like the note above. The recovery slot is global and
+            # carries the agent it was captured for, so claiming it unfiltered
+            # let a different project walk off with these words.
+            claimed = self.last_heard.claim(agent or DEFAULT_AGENT)
             payload["claimed_heard"] = (
                 claimed.public(include_transcript=True) if claimed is not None else None
             )
@@ -2775,6 +2781,9 @@ class VoxEngine:
                 "present": True,
                 "kind": "note",
                 "char_count": len(transcript),
+                # Separate times the user spoke while this agent was busy, and
+                # how long the first of them has been waiting.
+                "count": int(note.get("count", 1)),
                 "age_s": round(time.time() - float(note.get("captured_at", time.time())), 1),
             }
         return status
