@@ -139,6 +139,19 @@ class CaptureConfig:
     max_duration_s: float = 75.0
     pre_roll_s: float = 0.3
     speech_start_s: float = 0.06
+    # How long a run of speech-classified frames must last, mid-utterance,
+    # before it is allowed to rewind the trailing-silence countdown. The onset
+    # already debounces the *start* of a turn with speech_start_s; this is the
+    # same idea applied to the *reset*. A lighter click, a keyboard tap, a
+    # single loud transient is one or two frames in a field of silence — it
+    # clears the energy gate but never sustains — so it must not keep resetting
+    # the hang-up timer the way any single loud frame used to. Real speech is
+    # continuous: a voiced segment runs well past a hundred milliseconds, so a
+    # run this short bracketed by silence is not talking and counts as silence
+    # toward the close. Kept short — under the shortest real voiced run — so it
+    # never grows silence into a sentence and closes on Ali mid-word; a
+    # transient longer than this is left to the energy gate to reject.
+    speech_hold_s: float = 0.06
     frame_ms: int = 20
     initial_noise_floor_dbfs: float = -60.0
     minimum_speech_dbfs: float = -60.0
@@ -208,6 +221,8 @@ class CaptureConfig:
             raise ValueError("pre_roll_s must be in [0, 2]")
         if not 0 < self.speech_start_s <= 1.0:
             raise ValueError("speech_start_s must be in (0, 1]")
+        if not 0 <= self.speech_hold_s <= 1.0:
+            raise ValueError("speech_hold_s must be in [0, 1]")
         if self.frame_ms not in (10, 20, 30):
             raise ValueError("frame_ms must be 10, 20, or 30")
         if not -96.0 <= self.initial_noise_floor_dbfs <= 0.0:
@@ -753,6 +768,14 @@ class AdaptiveCaptureState:
         self.speech_duration_s = 0.0
         self.trailing_silence_s = 0.0
         self._speech_run_s = 0.0
+        # A leaky measure of how much speech there has been *recently*: it rises
+        # on speech frames and bleeds off on silence, saturating at a small cap.
+        # It reads density, not consecutiveness, so the natural dips inside real
+        # speech keep it full while a lone transient in a field of silence never
+        # lifts it far. It is what a silence-region reset consults so a lighter
+        # click cannot rewind the hang-up timer but a jittery near-floor voice
+        # still can.
+        self._speech_credit_s = 0.0
         self._utterance_elapsed_s = 0.0
         self._pre_roll: deque[FloatAudio] = deque()
         self._pre_roll_samples = 0
@@ -908,6 +931,7 @@ class AdaptiveCaptureState:
         self.speech_duration_s = 0.0
         self.trailing_silence_s = 0.0
         self._speech_run_s = 0.0
+        self._speech_credit_s = 0.0
         self._utterance_elapsed_s = 0.0
         self.false_onsets += 1
         if (
@@ -1012,8 +1036,30 @@ class AdaptiveCaptureState:
         else:
             self._capture_parts.append(frame.copy())
             self._utterance_elapsed_s += duration_s
+            hold = self.config.speech_hold_s
             if is_speech:
                 self.speech_duration_s += duration_s
+                self._speech_run_s += duration_s
+                self._speech_credit_s = min(2.0 * hold, self._speech_credit_s + duration_s)
+            else:
+                self._speech_run_s = 0.0
+                self._speech_credit_s = max(0.0, self._speech_credit_s - duration_s)
+            # Rewinding the hang-up timer is immediate *while speech is live* —
+            # trailing silence is still near zero, so the natural dips between
+            # phonemes reset the moment voicing resumes, exactly as before. Only
+            # once trailing silence has grown past the hold — a genuine silence
+            # region has opened — does a single speech frame stop being enough:
+            # re-opening from silence takes *recent speech density*, measured by
+            # the leaky credit, not one loud frame. That is what tells Ali's
+            # lighter from his voice. A lone transient in a field of silence
+            # arrives with the credit bled to nothing, so it cannot rewind and
+            # counts as silence toward the close — the way any single loud frame
+            # used to hold the microphone open. A real voice, even a jittery one
+            # dipping through the gate near the floor, keeps the credit full and
+            # re-opens at once.
+            in_silence_region = self.trailing_silence_s + 1e-9 >= hold
+            reopens = self._speech_credit_s + 1e-9 >= hold
+            if is_speech and (not in_silence_region or reopens):
                 self.trailing_silence_s = 0.0
             else:
                 self.trailing_silence_s += duration_s

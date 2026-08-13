@@ -298,6 +298,66 @@ def test_a_restless_room_cannot_hold_the_microphone_open() -> None:
     assert result.elapsed_s < 5.0 + state.config.trailing_silence_s + 0.1
 
 
+def feed_spiked_silence(
+    state: AdaptiveCaptureState, seconds: float, *, period_frames: int = 10
+) -> float:
+    """Silence with a lone speech spike every ``period_frames`` frames.
+
+    This is Ali's lighter: complete silence, then one frame that clears the
+    energy gate, then silence again — a transient that never sustains, struck
+    every ``period_frames`` * 20 ms. Returns the span fed, or the span at which
+    the turn endpointed.
+    """
+
+    for index in range(round(seconds / 0.02)):
+        if state.finished:
+            return index * 0.02
+        state.feed(frame(0.2) if index % period_frames == 0 else frame(0.001))
+    return seconds
+
+
+def test_a_lone_spike_does_not_hold_the_microphone_open() -> None:
+    """Ali's lighter: one spike in a field of silence is not talking.
+
+    A single 20 ms frame that clears the energy gate used to zero the
+    trailing-silence countdown outright, so a click, a tap, or a lighter struck
+    every fifth of a second held the microphone open indefinitely. The leaky
+    speech credit makes a reset from a silence region require *recent speech
+    density*, so an isolated transient — arriving with the credit long since
+    bled to nothing — counts as silence toward the close, and the turn
+    endpoints on its own trailing window instead.
+    """
+
+    state = AdaptiveCaptureState(1_000, adaptive_config(), speech_vote)
+    assert state.config.speech_hold_s == pytest.approx(0.06)  # the shipped default
+    feed_speech(state, 3.5)  # a long utterance: the full 1.6 s trailing window
+    assert state.phase is CapturePhase.CAPTURING
+
+    spent = feed_spiked_silence(state, 6.0)
+    assert state.finished is True
+    assert state.result().reason is CaptureStopReason.TRAILING_SILENCE
+    # The strikes are silence, so the close arrives on the trailing window and
+    # is not pushed out toward max_duration by every strike.
+    assert spent == pytest.approx(1.6, abs=0.15)
+
+
+def test_without_the_hold_a_spike_train_never_endpoints() -> None:
+    """The bug the credit fixes, pinned: ``speech_hold_s=0`` is the old behavior.
+
+    With no hold every lone spike zeroes the countdown, so a spike five times a
+    second keeps the microphone open — trailing silence never reaches the
+    window, exactly as Ali hit it.
+    """
+
+    state = AdaptiveCaptureState(
+        1_000, adaptive_config(speech_hold_s=0.0, max_duration_s=30.0), speech_vote
+    )
+    feed_speech(state, 3.5)
+    spent = feed_spiked_silence(state, 6.0)
+    assert state.finished is False  # held open by the spike train, as it was
+    assert spent == pytest.approx(6.0)  # ran the whole feed without closing
+
+
 def test_an_armed_barge_in_mic_is_untouched_by_the_reply_window_rule() -> None:
     # onset_timeout_s=None means there is no window to give back, and on both
     # paths that pass it — barge-in, and a turn opened by holding the key —

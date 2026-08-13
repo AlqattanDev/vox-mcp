@@ -320,6 +320,7 @@ class VoxEngine:
             min_duration_s=float(os.environ.get("VOX_MIN_UTTERANCE_SECONDS", "0.5")),
             max_duration_s=float(os.environ.get("VOX_MAX_UTTERANCE_SECONDS", "75")),
             pre_roll_s=float(os.environ.get("VOX_PRE_ROLL_SECONDS", "0.3")),
+            speech_hold_s=float(os.environ.get("VOX_SPEECH_HOLD_SECONDS", "0.06")),
             # The absolute floor below which nothing is speech, whatever the
             # adaptive noise floor says. It has to clear the room's own tone:
             # a quiet room that still sits above this value gets classified as
