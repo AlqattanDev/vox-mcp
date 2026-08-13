@@ -175,6 +175,7 @@ def test_plists_use_direct_absolute_loopback_only_commands(tmp_path: Path) -> No
     ]
     assert runtime["EnvironmentVariables"]["VOX_RUNTIME"] == str(paths.runtime_executable)
     assert Path(runtime["EnvironmentVariables"]["VOX_RUNTIME"]).is_absolute()
+    assert runtime["EnvironmentVariables"]["PATH"].startswith("/opt/homebrew/bin:")
     assert runtime["KeepAlive"] == {"SuccessfulExit": False}
 
     whisper = plistlib.loads(rendered["com.vox.whisper"])

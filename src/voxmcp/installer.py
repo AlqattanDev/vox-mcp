@@ -317,6 +317,12 @@ def generate_launchd_plists(
         "ProgramArguments": [str(app_executable)],
         "EnvironmentVariables": {
             "VOX_RUNTIME": str(paths.runtime_executable),
+            # For the same reason as the Whisper job: launchd hands the daemon
+            # /usr/bin:/bin:/usr/sbin:/sbin, so a Homebrew ffmpeg is invisible to
+            # it. Without ffmpeg the say(1) TTS fallback silently reports itself
+            # unavailable and `doctor` says the required dependencies are not
+            # ready, on a machine where ffmpeg is in fact installed.
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
             "NO_PROXY": "127.0.0.1,localhost,::1",
             "no_proxy": "127.0.0.1,localhost,::1",
         },
