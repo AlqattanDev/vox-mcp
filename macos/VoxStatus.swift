@@ -344,7 +344,14 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // Clicking the pill ends the turn, exactly as a left-click on the menu
         // bar glyph does — the cue you are looking at should also be the control.
         hud.onTap { [weak self] in
-            guard let self, self.microphoneOpen, !self.controlInFlight, !self.dictating else { return }
+            guard let self else { return }
+            // While Vox is speaking the pill shows a stop glyph, so a click on
+            // it stops the read — the same thing ⌘§ does mid-speech.
+            if self.state.lowercased() == "speaking" {
+                self.sendControl("cancel", notice: "Stopped reading.", serialized: false)
+                return
+            }
+            guard self.microphoneOpen, !self.controlInFlight, !self.dictating else { return }
             self.endTurn()
         }
         registerHotKeys()
