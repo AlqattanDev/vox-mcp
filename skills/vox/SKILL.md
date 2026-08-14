@@ -79,11 +79,38 @@ Read `io_mode` from status. Panel or `voice_session(set_mode|cycle_mode)` sets i
   and the window keeps running. Reserve bare `speak` (no window) for a genuine
   terminal sign-off. `onset_timeout` also exists on `listen`; the default when
   neither passes one is 5 s.
-- One spoken question at a time. Put code/paths/tables on screen.
+- One spoken question at a time.
 - Mic opens only inside `listen` or response-waiting `converse` after playback drains.
 - No-speech timeout → session stays idle; ask once if still there; no listen loops.
 - Escape/cancel ends only the current turn.
 - Overlapping turns queue; do not hand-serialize or spin on BusyError.
+
+## Visible chat text (not optional)
+
+TTS is not the host transcript. The user often cannot “scroll the plan” out of
+speech. **Anything they need to keep** (plans, tables, paths, steps, diffs,
+commands, comparisons) must appear in the **same turn’s chat/text reply** —
+the host message body the UI actually renders — not only inside
+`speak` / `converse` `message=`.
+
+Hard rules:
+
+1. **Write the text block first** (or in the same assistant message as the
+   tools). Then speak a short verdict. Never speak “the plan is in the reply”
+   unless that plan is already in the message body you emitted this turn.
+2. **Forbidden in TTS** (and do not paraphrase them): “on screen”, “in this
+   message”, “details below”, “scroll up”, “as I wrote above”, “check the
+   chat” — unless the matching content is already present in this turn’s
+   visible text. Prefer naming a **file path** you wrote with tools
+   (`PARTNER.md`, `notes/….md`) over claiming the UI showed something.
+3. **Speech stays short**: verdict + at most one question. Lists, code, and
+   multi-step plans live in chat text (and optionally a project file).
+4. **Proof, not intention.** “On screen” is not a feeling. Either this turn’s
+   message body contains the content, or a tool wrote a path you can re-read.
+   If neither is true, you have not shown it — say the content, or say you
+   have not written it yet.
+5. **Same duty for every host** (Claude, Codex, Grok, Fable, …). This failure
+   mode is agents claiming visibility after only calling TTS.
 
 ## User-initiated reply (they grab the turn)
 
