@@ -234,6 +234,48 @@ final class LevelMeterView: NSView {
     }
 }
 
+/// Whether some other menu-bar app is currently showing Vox's state for it.
+///
+/// Vox is shared: several agents drive it, and at least one of them (bro) draws
+/// its own always-visible menu bar item that already renders speaking and
+/// listening. Two icons then say the same thing side by side. So a host may
+/// claim the display by writing a file in **Vox's own directory** — no app name,
+/// no path into anyone else's install, and nothing here that knows what claimed
+/// it:
+///
+///     ~/.vox/status-host.json   {"name":"bro","pid":1234,"since":1786990000}
+///
+/// While the claimant is ALIVE, Vox hides its status item; the hotkey, the HUD
+/// pill, the runtime and every control are untouched. Absent file, dead pid,
+/// unreadable JSON, or a machine with no such app at all — and Vox shows its
+/// item exactly as it always has. The liveness check is the point: a claimant
+/// that is SIGKILLed or crashes can never take the icon with it.
+///
+/// `VOX_STATUS_ITEM=always` opts out entirely and pins the item on screen.
+enum StatusHost {
+    static var file: URL {
+        let env = ProcessInfo.processInfo.environment
+        if let override = env["VOX_STATUS_HOST_FILE"], !override.isEmpty {
+            return URL(fileURLWithPath: (override as NSString).expandingTildeInPath)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".vox/status-host.json")
+    }
+
+    /// The name of the live claimant, or nil if nobody is showing Vox for us.
+    static func claimant() -> String? {
+        guard
+            let data = try? Data(contentsOf: file),
+            let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let pid = payload["pid"] as? Int, pid > 0
+        else { return nil }
+        // EPERM means the process exists and is simply not ours to signal.
+        errno = 0
+        guard kill(pid_t(pid), 0) == 0 || errno == EPERM else { return nil }
+        return (payload["name"] as? String) ?? "another menu bar"
+    }
+}
+
 /// The menu-bar companion is deliberately a session controller, not a hidden
 /// always-listening recorder. A click opens this panel; the microphone only
 /// opens when an MCP conversation explicitly starts a bounded listen.
@@ -298,6 +340,14 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var lastStopReason: String?
     private var ioMode = "talk"
     private let baseURL = URL(string: "http://127.0.0.1:8766")!
+    // Whether another menu bar is showing our state (see StatusHost). Checked at
+    // most once a second: presentation runs up to 12 times a second while the
+    // pill is live, and this is a file read plus a kill(2) probe.
+    private var statusItemHosted = false
+    private var lastStatusHostCheck = Date.distantPast
+    private let statusItemHandoffAllowed =
+        (ProcessInfo.processInfo.environment["VOX_STATUS_ITEM"] ?? "auto").lowercased()
+        != "always"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -830,7 +880,27 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }.resume()
     }
 
+    /// One icon in the menu bar, not two. Everything below still runs while the
+    /// item is hidden — the tooltip, the glyph and the panel are all rebuilt as
+    /// usual, so the moment the claim lapses the item comes back already correct.
+    private func updateStatusItemVisibility() {
+        guard statusItemHandoffAllowed else {
+            if !statusItem.isVisible { statusItem.isVisible = true }
+            return
+        }
+        let now = Date()
+        if now.timeIntervalSince(lastStatusHostCheck) >= 1.0 {
+            lastStatusHostCheck = now
+            statusItemHosted = StatusHost.claimant() != nil
+        }
+        guard statusItem.isVisible == statusItemHosted else { return }
+        statusItem.isVisible = !statusItemHosted
+        // A popover anchored to an item that just vanished would float loose.
+        if statusItemHosted, popover.isShown { popover.performClose(nil) }
+    }
+
     private func updatePresentation() {
+        updateStatusItemVisibility()
         let normalized = state.lowercased()
         let title: String
         switch normalized {
