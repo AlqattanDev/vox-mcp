@@ -68,6 +68,10 @@ Read `io_mode` from status. Panel or `voice_session(set_mode|cycle_mode)` sets i
 
 ## Conversation behavior
 
+- **No gap.** If you will listen after talking, use one
+  `converse(wait_for_response=true)` call. Never `speak` then later `listen`.
+  Never `speak`, then tools, then `listen`. The mic must open the instant
+  playback ends. `speak` is hang-up only.
 - Verdict first. Hang up when done: status/completion use
   `speak` or `converse(wait_for_response=false)`. Mic open only for a real question.
 - **Reply window.** In an active back-and-forth, do NOT `speak`-and-vanish on a
@@ -96,14 +100,14 @@ the host message body the UI actually renders — not only inside
 Hard rules:
 
 1. **Write the text block first** (or in the same assistant message as the
-   tools). Then speak a short verdict. Never speak “the plan is in the reply”
+   tools). Then speak the answer. Never speak “the plan is in the reply”
    unless that plan is already in the message body you emitted this turn.
 2. **Forbidden in TTS** (and do not paraphrase them): “on screen”, “in this
    message”, “details below”, “scroll up”, “as I wrote above”, “check the
    chat” — unless the matching content is already present in this turn’s
    visible text. Prefer naming a **file path** you wrote with tools
    (`PARTNER.md`, `notes/….md`) over claiming the UI showed something.
-3. **Speech stays short**: verdict + at most one question. Lists, code, and
+3. **Speech is conversation.** Talk normally, in complete thoughts. Lists, code, and
    multi-step plans live in chat text (and optionally a project file).
 4. **Proof, not intention.** “On screen” is not a feeling. Either this turn’s
    message body contains the content, or a tool wrote a path you can re-read.

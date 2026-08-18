@@ -275,10 +275,10 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
             "listening. The microphone is permitted only during listen/converse; "
             "cancel ends the current turn, while stop ends the session.\n"
             "Voice turn contract: a spoken turn is a conversation, not a report. "
-            "Keep spoken messages to one or two sentences and do not call other "
+            "Talk normally, in complete thoughts. Do not call other "
             "tools between conversation turns — the user is sitting in silence "
             "while you work, and that silence is the slowest part of voice mode. "
-            "Put detail on screen, never in the speaker."
+            "Put lists, code, and plans in the chat text, not in the speaker."
         ),
         mask_error_details=True,
         strict_input_validation=True,
@@ -429,8 +429,9 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
         name="converse",
         description=(
             "Speak a message locally and optionally listen for one response. "
-            "Speak one or two sentences, not a report: do not call other tools between "
-            "conversation turns, and put detail on screen rather than in the spoken message."
+            "Talk normally, in complete thoughts: do not call other tools between "
+            "conversation turns, and put lists, code, and plans in the chat text "
+            "rather than in the spoken message."
         ),
         annotations=LOCAL_ACTION,
     )
@@ -811,7 +812,7 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
             "\n"
             "Voice turn contract. The microphone and the speaker are fast; the pause between "
             "turns is you. Honour these while a voice session is live:\n"
-            "- Speak one or two sentences. Answer first, then stop. Length is latency.\n"
+            "- Talk normally, in complete thoughts. Answer first.\n"
             "- Do not call other tools between conversation turns. Finish investigating before "
             "you open the mic, not after.\n"
             "- Never read tables, code, file paths, or lists aloud. Say the conclusion; leave the "

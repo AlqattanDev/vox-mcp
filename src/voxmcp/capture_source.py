@@ -299,10 +299,11 @@ class PersistentCaptureSource:
         own explicit consent act with its own hardened thresholds and must be
         able to hear an interruption while the turn gate is shut.
 
-        ``respect_guard=False`` is for dictation.  The open guard keeps the
-        Bluetooth transient out of the *endpointer*; a raw capture has no onset
-        detection to fool, so honouring it there would only throw away the first
-        second of a hold the user is already speaking into.
+        ``respect_guard=False`` is for dictation and user-initiated notes.
+        The open guard keeps the Bluetooth transient out of the *endpointer*;
+        a raw capture has no onset detection to fool, and a note is a key the
+        user is already talking into — honouring the guard there would only
+        throw away their first second.
         """
 
         with self._lock:

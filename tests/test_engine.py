@@ -204,6 +204,24 @@ async def test_converse_speaks_then_listens_and_returns_idle(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_converse_marks_the_follow_up_listen_hot(tmp_path: Path):
+    """converse listen skips the cold-open chime and stream-open guard."""
+
+    engine = make_engine(tmp_path)
+    seen: list[bool] = []
+    original = engine._listen_locked
+
+    async def wrapped(*args, **kwargs):
+        seen.append(engine._hot_listen_after_tts)
+        return await original(*args, **kwargs)
+
+    engine._listen_locked = wrapped  # type: ignore[method-assign]
+    await engine.converse("claude", "Hi")
+    assert seen == [True]
+    assert engine._hot_listen_after_tts is False
+
+
+@pytest.mark.asyncio
 async def test_health_reports_zero_mic_level_when_closed(tmp_path: Path):
     # The menu-bar waveform reads mic_level; with the mic closed it must be a
     # hard 0 so a stale capture level can never make the meter look live.
@@ -971,6 +989,23 @@ async def test_reply_addresses_the_last_agent_that_spoke(tmp_path: Path):
     assert other["claimed_heard"] is None
     claimed = await engine.session("mobilescape", "claim_undelivered", agent="mobilescape")
     assert claimed["claimed_heard"]["transcript"] == "hello world"
+
+
+@pytest.mark.asyncio
+async def test_user_note_skips_the_stream_open_guard(tmp_path: Path):
+    """F4 / a menu-bar note must record immediately — the user is already talking."""
+
+    engine = make_engine(tmp_path)
+    seen: list[bool] = []
+    original = engine._capture_once
+
+    async def wrapped(*args, **kwargs):
+        seen.append(bool(kwargs.get("skip_open_guard")))
+        return await original(*args, **kwargs)
+
+    engine._capture_once = wrapped  # type: ignore[method-assign]
+    await engine.note("http-control")
+    assert seen == [True]
 
 
 @pytest.mark.asyncio
@@ -1926,16 +1961,20 @@ async def test_persistent_capture_can_be_switched_off(tmp_path: Path):
 async def test_closing_the_turn_during_warm_up_is_not_swallowed(tmp_path: Path):
     """Tap, tap — fast. The second tap must not land on nothing.
 
-    A turn spends its first second warming up: waiting out the stream-open
-    guard, then playing the cue. Found live: the capture control used to be
-    published only after that, so an impatient second tap signalled nothing
-    and the microphone stayed open with no way to close it.
+    An agent turn spends its first second warming up: waiting out the
+    stream-open guard, then playing the cue. Found live: the capture control
+    used to be published only after that, so an impatient second tap signalled
+    nothing and the microphone stayed open with no way to close it.
+
+    This is the agent-listen path deliberately. A note has no warm-up left to
+    close during — it opens on the key press — which the test below covers
+    instead.
     """
 
-    engine, _ = make_live_engine(tmp_path)
+    engine, _ = make_live_engine(tmp_path, silent_frames=0)
     engine._stream_open_guard_s = 1.0
+    turn = asyncio.create_task(engine.listen("claude"))
     try:
-        await engine.control("http-control", "gate_open")
         # Well inside the warm-up window, before any capture exists.
         await asyncio.sleep(0.1)
         assert engine.microphone_open is False
@@ -1945,8 +1984,33 @@ async def test_closing_the_turn_during_warm_up_is_not_swallowed(tmp_path: Path):
         assert await wait_for(lambda: engine.state.state.value == "idle")
         assert engine.microphone_open is False
         assert engine.gate_open is False
-        # Nothing was said, so nothing was submitted.
-        assert engine.notes.pending_targets() == []
+        await turn
+    finally:
+        turn.cancel()
+        await engine.session("http-control", "stop")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_a_note_opens_on_the_key_and_still_closes_on_a_second_tap(tmp_path: Path):
+    """The other half of tap-tap, for the path that no longer warms up.
+
+    A note skips the stream-open guard because the user is already talking into
+    the key, so there is no warm-up second to be impatient through: the
+    microphone is open immediately. The second tap has to close *that*.
+    """
+
+    engine, _ = make_live_engine(tmp_path, silent_frames=0)
+    engine._stream_open_guard_s = 1.0
+    try:
+        await engine.control("http-control", "gate_open")
+        assert await wait_for(lambda: engine.microphone_open is True, timeout=1.0)
+        closed = await engine.control("http-control", "gate_close")
+        assert closed["signalled"] is True
+
+        assert await wait_for(lambda: engine.state.state.value == "idle")
+        assert engine.microphone_open is False
+        assert engine.gate_open is False
     finally:
         await engine.session("http-control", "stop")
 

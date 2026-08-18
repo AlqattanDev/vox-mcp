@@ -211,6 +211,11 @@ class VoxEngine:
         self._stream_open_guard_s = max(
             0.0, float(os.environ.get("VOX_STREAM_OPEN_GUARD_SECONDS", "1.0"))
         )
+        # Set for the listen that immediately follows our own TTS in converse.
+        # The 1s stream-open guard and start chime exist for a cold listen
+        # (Bluetooth pop, "I can hear you now"). After we just spoke they
+        # only add a dead gap. Bare listen() is unchanged.
+        self._hot_listen_after_tts = False
         # How long the device stays open after the last capture lets go.
         #
         # This is not a grace period for idling: macOS lights its microphone
@@ -1329,6 +1334,8 @@ class VoxEngine:
         return self._earcon_paths
 
     async def _play_listen_start_cue(self) -> None:
+        if self._hot_listen_after_tts:
+            return
         cues = self._earcon_files()
         if cues is None:
             return
@@ -1408,6 +1415,7 @@ class VoxEngine:
         *,
         recorder: Any | None = None,
         language: str | None = None,
+        skip_open_guard: bool = False,
     ) -> tuple[CaptureResult, SpeechResult | None]:
         self.state.begin_listening(client_id=client_id)
         self._log("listening.started", client_id=client_id)
@@ -1424,6 +1432,10 @@ class VoxEngine:
         # gives it back can raise or be cancelled — the guard sleep and the cue
         # both await. A hold leaked there would pin the device open for the rest
         # of the session, which is the exact failure being fixed.
+        # A user-initiated note/reply skips that wait: they are already talking
+        # into the key, and eating the first second is worse than a Bluetooth
+        # click at the start of the clip.
+        skip_guard = skip_open_guard or self._hot_listen_after_tts
         try:
             if source is not None:
                 # Hold the gate shut across the cue. The cue is played through
@@ -1433,11 +1445,15 @@ class VoxEngine:
                 # sound nobody made. Waiting the guard out here is also what
                 # makes the rising blip honest: "I can hear you now", not "soon".
                 source.close_gate()
-                remaining = source.guard_remaining_s
+                remaining = 0.0 if skip_guard else source.guard_remaining_s
                 if remaining > 0:
                     await asyncio.sleep(remaining)
-            if not (control.cancelled or control.manual_end_requested or control.text_delivered):
+            if not skip_open_guard and not (
+                control.cancelled or control.manual_end_requested or control.text_delivered
+            ):
                 # Never announce an open microphone to someone who already closed it.
+                # Notes skip the cue: the key press is the start signal, and the
+                # blip would false-trigger onset if we opened the gate under it.
                 await self._play_listen_start_cue()
             loop = asyncio.get_running_loop()
             selected_recorder = recorder or self.recorder
@@ -1448,7 +1464,7 @@ class VoxEngine:
                 future = loop.run_in_executor(
                     None,
                     lambda: selected_recorder.capture_from_frames(
-                        source.frames(control),
+                        source.frames(control, respect_guard=not skip_guard),
                         source.sample_rate,
                         control=control,
                     ),
@@ -1787,47 +1803,51 @@ class VoxEngine:
             # Resolved inside the turn, not before it: resolving first would let
             # voice-lookup latency decide queue order instead of arrival order.
             # An explicit voice= always wins over the agent's assigned voice.
-            if skip_speak:
-                spoken = {
-                    "status": "skipped",
-                    "reason": "io_mode_dictate",
-                    "backend": None,
-                    "elapsed_ms": 0,
-                }
-            else:
-                spoken = await self._speak_locked(
-                    client_id,
-                    message,
-                    voice=voice or await self._agent_voice(agent),
-                    speed=speed,
-                    instructions=instructions,
-                    interruptible=True,
-                    barge_in=effective_wait and self.barge_in_availability()["available"],
+            self._hot_listen_after_tts = effective_wait and not skip_speak
+            try:
+                if skip_speak:
+                    spoken = {
+                        "status": "skipped",
+                        "reason": "io_mode_dictate",
+                        "backend": None,
+                        "elapsed_ms": 0,
+                    }
+                else:
+                    spoken = await self._speak_locked(
+                        client_id,
+                        message,
+                        voice=voice or await self._agent_voice(agent),
+                        speed=speed,
+                        instructions=instructions,
+                        interruptible=True,
+                        barge_in=effective_wait and self.barge_in_availability()["available"],
+                    )
+                result: dict[str, Any] = {"spoken": spoken, "io_mode": mode}
+                if spoken.get("status") == "barge_in":
+                    # The user talked over the reply. The capture that detected
+                    # them is still running and already holds their opening words
+                    # in its pre-roll, so it *is* the answer — opening a second
+                    # listen here would ask them to repeat themselves.
+                    result["barge_in"] = True
+                    result["heard"] = await self._harvest_barge_in(client_id, language=language)
+                elif effective_wait and spoken.get("status") != "cancelled":
+                    result["heard"] = await self._listen_locked(
+                        client_id,
+                        listen_duration_max=listen_duration_max,
+                        listen_duration_min=listen_duration_min,
+                        trailing_silence_s=trailing_silence_s,
+                        onset_timeout=onset_timeout,
+                        language=language,
+                    )
+                result["status"] = (
+                    result.get("heard", {}).get("status")
+                    if effective_wait
+                    else spoken.get("status")
                 )
-            result: dict[str, Any] = {"spoken": spoken, "io_mode": mode}
-            if spoken.get("status") == "barge_in":
-                # The user talked over the reply. The capture that detected
-                # them is still running and already holds their opening words
-                # in its pre-roll, so it *is* the answer — opening a second
-                # listen here would ask them to repeat themselves.
-                result["barge_in"] = True
-                result["heard"] = await self._harvest_barge_in(client_id, language=language)
-            elif effective_wait and spoken.get("status") != "cancelled":
-                result["heard"] = await self._listen_locked(
-                    client_id,
-                    listen_duration_max=listen_duration_max,
-                    listen_duration_min=listen_duration_min,
-                    trailing_silence_s=trailing_silence_s,
-                    onset_timeout=onset_timeout,
-                    language=language,
-                )
-            result["status"] = (
-                result.get("heard", {}).get("status")
-                if effective_wait
-                else spoken.get("status")
-            )
-            result["session"] = self.state.snapshot().to_dict()
-            return result
+                result["session"] = self.state.snapshot().to_dict()
+                return result
+            finally:
+                self._hot_listen_after_tts = False
 
         return await self._run_operation(client_id, "converse", operation, agent=agent)
 
@@ -2184,7 +2204,10 @@ class VoxEngine:
         recorder: Any | None = None,
     ) -> dict[str, Any]:
         capture, transcription = await self._capture_once(
-            client_id, recorder=recorder, language=language
+            client_id,
+            recorder=recorder,
+            language=language,
+            skip_open_guard=True,
         )
         if transcription is None:
             return {
