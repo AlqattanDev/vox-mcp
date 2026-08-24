@@ -15,7 +15,12 @@ from mcp.types import Implementation
 from voxmcp.daemon import DEFAULT_HOST, DEFAULT_MCP_PATH, run_http
 from voxmcp.errors import BusyError
 from voxmcp.lease import LeaseManager
-from voxmcp.mcp_server import create_mcp, run_stdio
+from voxmcp.mcp_server import (
+    MAXIMUM_LISTEN_DURATION_MAX,
+    MINIMUM_LISTEN_DURATION_MAX,
+    create_mcp,
+    run_stdio,
+)
 from voxmcp.models import TurnResult, TurnStatus
 
 
@@ -309,19 +314,53 @@ async def test_tool_arguments_are_adapted_to_engine_contract(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_listen_bounds_are_enforced_before_engine_use(tmp_path: Path) -> None:
+async def test_a_host_cannot_cut_the_user_off_sooner_than_the_floor(tmp_path: Path) -> None:
+    """The 15-second bug: a host set the cap and truncated Ali mid-sentence.
+
+    ``listen_duration_max`` reads to a model like a polling timeout, so models
+    set it like one. The event log has caps of 15, 20, 30 and 45 s, each one a
+    sentence cut off mid-word with the tail of the audio thrown away — and the
+    cap shrinking turn by turn inside a single conversation. Vox's endpointer
+    decides when a turn is over; this number is a backstop for a microphone
+    that never closes, and no host argument may pull it below the floor.
+    """
+
+    engine = FakeEngine(tmp_path / "latest.wav")
+    server = create_mcp(engine)
+
+    async with Client(server) as client:
+        await client.call_tool("listen", {"listen_duration_max": 15})
+
+    arguments = next(args for name, args in engine.calls if name == "listen")
+    assert arguments["listen_duration_max"] == MINIMUM_LISTEN_DURATION_MAX
+
+
+@pytest.mark.asyncio
+async def test_an_out_of_range_guess_is_clamped_rather_than_failed(tmp_path: Path) -> None:
+    """A guess out of range cost a whole turn, and the host just guessed again.
+
+    Raising ValueError out of the tool call produced 21 failed turns in the
+    event log — twice in a row in one case — while a person sat at what they
+    thought was an open microphone. The engine still never sees a value outside
+    the range that can work; it is clamped on the way in instead of refused.
+    """
+
     engine = FakeEngine(tmp_path / "latest.wav")
     server = create_mcp(engine)
 
     async with Client(server) as client:
         result = await client.call_tool(
             "listen",
-            {"listen_duration_max": 301},
+            {"listen_duration_max": 301, "listen_duration_min": 400},
             raise_on_error=False,
         )
 
-    assert result.is_error is True
-    assert not any(name == "listen" for name, _arguments in engine.calls)
+    assert result.is_error is False
+    arguments = next(args for name, args in engine.calls if name == "listen")
+    assert arguments["listen_duration_max"] == MAXIMUM_LISTEN_DURATION_MAX
+    # A floor above the ceiling is dropped rather than honoured: obeying it
+    # would hold the microphone open for the full five minutes.
+    assert arguments["listen_duration_min"] == 0.0
 
 
 @pytest.mark.asyncio

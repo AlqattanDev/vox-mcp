@@ -11,6 +11,7 @@ import asyncio
 import inspect
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -19,10 +20,11 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal, Mapping
+from typing import Annotated, Any, Literal, Mapping
 
 from fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
+from pydantic import Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import WebSocketRoute
@@ -231,11 +233,74 @@ def _control_token_from_request(request: Request) -> str | None:
     return native or _bearer_token(request)
 
 
-def _listen_bounds(listen_duration_max: float, listen_duration_min: float) -> None:
-    if not 0 < listen_duration_max <= 300:
-        raise ValueError("listen_duration_max must be in (0, 300]")
-    if not 0 <= listen_duration_min <= listen_duration_max:
-        raise ValueError("listen_duration_min must be between 0 and listen_duration_max")
+# The narrowest window a caller is allowed to leave a person to speak in.
+#
+# ``listen_duration_max`` reads to a model like a polling timeout, so models set
+# it like one: the event log has turns capped at 45, 30, 20 and finally 15
+# seconds, the number shrinking as one conversation went on, each turn cutting a
+# sentence off mid-word.  Vox decides when a turn has ended by listening to it;
+# this is the backstop for a microphone that never closes, not a scheduling hint,
+# and no argument may pull it below the length of an ordinary spoken answer.
+MINIMUM_LISTEN_DURATION_MAX = 60.0
+MAXIMUM_LISTEN_DURATION_MAX = 300.0
+
+_LISTEN_DURATION_MAX_FIELD = Field(
+    description=(
+        "Hard ceiling on one utterance, in seconds. Vox already ends the turn "
+        "when the speaker stops; this only stops a microphone that never closes. "
+        "It is not a polling or response timeout. Lowering it truncates the "
+        "speaker mid-sentence, so leave it alone: values below "
+        f"{MINIMUM_LISTEN_DURATION_MAX:g}s are raised to "
+        f"{MINIMUM_LISTEN_DURATION_MAX:g}s."
+    ),
+)
+_LISTEN_DURATION_MIN_FIELD = Field(
+    description=(
+        "How much audio must be captured before the turn is allowed to end, in "
+        "seconds. Guards against a click or a breath ending the turn; leave at "
+        "the default."
+    ),
+)
+_TRAILING_SILENCE_FIELD = Field(
+    description=(
+        "How long the speaker must stay quiet before the turn is considered "
+        "over, in seconds. Vox shortens this itself for short utterances. "
+        "Raise it only for a speaker who pauses mid-thought."
+    ),
+)
+_ONSET_TIMEOUT_FIELD = Field(
+    description=(
+        "Seconds to wait for the speaker to begin before giving up on a silent "
+        "turn. Null uses the configured default."
+    ),
+)
+
+
+def _listen_bounds(
+    listen_duration_max: float, listen_duration_min: float
+) -> tuple[float, float]:
+    """Clamp a caller's listen window into the range that can actually work.
+
+    These used to raise, and a host that guessed wrong lost the whole turn: 21
+    failed turns in the event log, each one a person waiting at a microphone
+    that was never opened, and each one answered by the host guessing again.  A
+    bad guess should cost a correction, not a turn.
+    """
+
+    if not math.isfinite(listen_duration_max):
+        listen_duration_max = MINIMUM_LISTEN_DURATION_MAX
+    listen_duration_max = min(
+        MAXIMUM_LISTEN_DURATION_MAX,
+        max(MINIMUM_LISTEN_DURATION_MAX, listen_duration_max),
+    )
+    if not math.isfinite(listen_duration_min) or listen_duration_min > listen_duration_max:
+        # A floor above the ceiling is a contradiction, and the reading that
+        # honours it holds the microphone open for minutes — the same failure
+        # the ceiling is here to prevent, from the other side. Drop it instead:
+        # the endpointer still decides, it just has no minimum under it.
+        listen_duration_min = 0.0
+    listen_duration_min = max(0.0, listen_duration_min)
+    return listen_duration_max, listen_duration_min
 
 
 READ_ONLY = ToolAnnotations(
@@ -441,13 +506,15 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
         wait_for_response: bool = True,
         voice: str | None = None,
         speed: float | None = None,
-        listen_duration_max: float = 75.0,
-        listen_duration_min: float = 0.5,
-        trailing_silence_s: float = 1.6,
-        onset_timeout: float | None = None,
+        listen_duration_max: Annotated[float, _LISTEN_DURATION_MAX_FIELD] = 75.0,
+        listen_duration_min: Annotated[float, _LISTEN_DURATION_MIN_FIELD] = 0.5,
+        trailing_silence_s: Annotated[float, _TRAILING_SILENCE_FIELD] = 1.6,
+        onset_timeout: Annotated[float | None, _ONSET_TIMEOUT_FIELD] = None,
         agent: str | None = None,
     ) -> Any:
-        _listen_bounds(listen_duration_max, listen_duration_min)
+        listen_duration_max, listen_duration_min = _listen_bounds(
+            listen_duration_max, listen_duration_min
+        )
         return await _invoke(
             current_engine(),
             "converse",
@@ -494,14 +561,16 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
     )
     async def listen(
         ctx: Context,
-        listen_duration_max: float = 75.0,
-        listen_duration_min: float = 0.5,
-        trailing_silence_s: float = 1.6,
-        onset_timeout: float | None = None,
+        listen_duration_max: Annotated[float, _LISTEN_DURATION_MAX_FIELD] = 75.0,
+        listen_duration_min: Annotated[float, _LISTEN_DURATION_MIN_FIELD] = 0.5,
+        trailing_silence_s: Annotated[float, _TRAILING_SILENCE_FIELD] = 1.6,
+        onset_timeout: Annotated[float | None, _ONSET_TIMEOUT_FIELD] = None,
         language: str | None = None,
         agent: str | None = None,
     ) -> Any:
-        _listen_bounds(listen_duration_max, listen_duration_min)
+        listen_duration_max, listen_duration_min = _listen_bounds(
+            listen_duration_max, listen_duration_min
+        )
         return await _invoke(
             current_engine(),
             "listen",

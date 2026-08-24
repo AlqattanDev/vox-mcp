@@ -179,6 +179,20 @@ class CaptureConfig:
     # A low percentile of raw levels has no such loop — speech has gaps, and a
     # room's quietest moments are the room.
     noise_window_s: float = 3.0
+    # How much room has to be heard before a *measured* spread is trusted.
+    #
+    # The window above says how far back to look; this says how much of it must
+    # actually exist first. Twelve frames was enough to commit, and 240 ms is
+    # not a room — on a converse reply it is the run-up to the first word, and
+    # it is all the estimator ever gets, because the stream-open guard drops the
+    # room tone that came before it. The value it read there was frozen for the
+    # whole turn by the CAPTURING guard below. Measured on Ali's mic: 4.2 dB of
+    # his own dynamic range instead of the 2.0 dB his room wanders, a VAD rise
+    # of 12.7 dB against a voice with ~10 dB of headroom, and a 15 s answer
+    # endpointed at 6.3 s. Under this much observation the starting guess is the
+    # safer number: it is wrong by a known, bounded amount, where a spread read
+    # off a voice is wrong in the direction that makes Vox deaf to that voice.
+    room_sample_s: float = 1.0
     # How flat a window has to be before it counts as a drone rather than a
     # voice. Speech varies syllable to syllable even when nobody pauses; a fan
     # does not. This is what separates "the room got louder, learn it" from
@@ -233,6 +247,8 @@ class CaptureConfig:
             raise ValueError("speech_margin_db must be in (0, 40]")
         if not 0 < self.noise_window_s <= 30.0:
             raise ValueError("noise_window_s must be in (0, 30]")
+        if self.room_sample_s < 0:
+            raise ValueError("room_sample_s must not be negative")
         if not 0 < self.vad_margin_db <= 40.0:
             raise ValueError("vad_margin_db must be in (0, 40]")
         if not 0 <= self.noise_spread_k <= 10.0:
@@ -760,6 +776,11 @@ class AdaptiveCaptureState:
         # Learned from the room itself, so the speech gate re-sizes when you
         # move between a quiet bedroom and a loud office without being told.
         self.noise_spread_db = self.config.vad_margin_db
+        # Never fewer than twelve frames, whatever the config says: that is the
+        # sample size that produced the wrong answer this floor exists to stop.
+        self._room_sample_frames = max(
+            12, round(config.room_sample_s * 1000.0 / config.frame_ms)
+        )
         window = max(
             8, round(self.config.noise_window_s * 1000.0 / self.config.frame_ms)
         )
@@ -863,7 +884,12 @@ class AdaptiveCaptureState:
             # and quietly raises the gate above the very speech being measured.
             # The floor is guarded from speech just above; the spread was not,
             # and it is read from the same window.
-            self.noise_spread_db = max(0.0, median - floor)
+            if stationary or len(self._recent_dbfs) >= self._room_sample_frames:
+                # A stationary window is the room by definition and commits at
+                # once, which keeps a quiet room responsive. Anything wider has
+                # to be backed by a real sample before it is allowed to move the
+                # gate; below that the starting guess stands.
+                self.noise_spread_db = max(0.0, median - floor)
         self._floor_measured = True
 
     def _effective_trailing_silence_s(self) -> float:
@@ -1702,11 +1728,51 @@ class AudioPlayer:
         popen_factory: Callable[..., PlaybackProcess] = subprocess.Popen,
         which: Callable[[str], str | None] = shutil.which,
         platform_name: str | None = None,
+        sounddevice: Any | None = None,
     ) -> None:
         self.registry = registry or PLAYBACK_REGISTRY
         self._popen = popen_factory
         self._which = which
         self._platform = platform_name or platform.system()
+        self._sounddevice = sounddevice
+
+    def play_cue(self, path: Path | str, *, volume: float = 1.0) -> None:
+        """Play a short cue in process and return when the sound has stopped.
+
+        Cues are the one playback the microphone waits on: the capture gate is
+        held shut across the start cue so the tone cannot bleed into the
+        endpointer.  Spawning a player for that is a bad trade — measured on
+        macOS, ``afplay`` needs 1.09 s of wall clock to play a 0.16 s cue,
+        nearly a full second of it process and CoreAudio startup, and the
+        microphone is deaf for every millisecond of it right at the moment the
+        assistant stops talking and the user starts.  In process the same cue
+        costs 0.27 s.
+
+        A phone that has taken over playback still gets the cue: the fast path
+        is the local speaker and nothing else, so the remote branch is taken
+        first.  A local device that will not open falls back to the player
+        subprocess — a slow cue beats a microphone opening in silence.
+        """
+
+        audio_path = Path(path).expanduser().resolve(strict=True)
+        volume = min(1.0, max(0.0, volume))
+        remote = self._remote_playback(audio_path, volume=volume)
+        if remote is not None:
+            remote.wait()
+            return
+        try:
+            device = self._sounddevice or _load_sounddevice()
+            with wave.open(str(audio_path), "rb") as reader:
+                if reader.getsampwidth() != 2 or reader.getnchannels() != 1:
+                    raise PlaybackError("cues must be mono 16-bit PCM")
+                sample_rate = reader.getframerate()
+                raw = reader.readframes(reader.getnframes())
+            samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+            samples = samples * (volume / 32768.0)
+            with _PortAudioInUse():
+                device.play(samples, sample_rate, blocking=True)
+        except Exception:
+            self.play_file(audio_path, volume=volume, blocking=True)
 
     def _resolve_player(self, preferred: str | None = None) -> str:
         candidates: tuple[str, ...]

@@ -1334,17 +1334,18 @@ class VoxEngine:
         return self._earcon_paths
 
     async def _play_listen_start_cue(self) -> None:
-        if self._hot_listen_after_tts:
-            return
+        # After TTS we used to skip this so converse went straight to the mic.
+        # Ali could not tell the speaker had handed him the turn. Play it.
         cues = self._earcon_files()
         if cues is None:
             return
         try:
             # Blocking and off the loop, *before* the mic opens, so the tone can
-            # never bleed into the recording.
-            await asyncio.to_thread(
-                self.player.play_file, cues[0], volume=self.volume, blocking=True
-            )
+            # never bleed into the recording. In process rather than through a
+            # player subprocess: the gate is shut for as long as this takes, and
+            # spawning afplay for a 0.16 s blip made that a full second of
+            # deafness at the exact moment the user starts answering.
+            await asyncio.to_thread(self.player.play_cue, cues[0], volume=self.volume)
         except Exception:
             pass
 

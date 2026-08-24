@@ -59,6 +59,9 @@ class FakeHandle:
 
 class FakePlayer:
     def play_file(self, *args, **kwargs): return FakeHandle()
+    # Cues are played in process, not by spawning a player: the capture gate is
+    # shut for as long as the start cue takes.
+    def play_cue(self, *args, **kwargs): return None
     def cancel_all(self): return 0
 
 
@@ -1204,10 +1207,12 @@ class CueCountingPlayer(FakePlayer):
         self.starts = 0
         self.stops = 0
 
-    def play_file(self, path, *args, **kwargs):
+    def play_cue(self, path, *args, **kwargs):
         if path == self.start:
             self.starts += 1
-        elif path == self.stop:
+
+    def play_file(self, path, *args, **kwargs):
+        if path == self.stop:
             self.stops += 1
         return FakeHandle()
 

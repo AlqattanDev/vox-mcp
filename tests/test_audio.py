@@ -1516,3 +1516,134 @@ def test_the_room_spread_is_not_learned_from_the_speaker() -> None:
         f"{state._vad_required_rise_db():.1f} dB on speech "
         f"(spread {state.noise_spread_db:.1f})"
     )
+
+
+def test_the_gate_is_not_latched_from_the_first_quarter_second() -> None:
+    """Ali's answers died at 6 s because the gate was sized from 240 ms.
+
+    ``_observe_room`` committed a spread as soon as twelve frames existed, and
+    the phase moved to CAPTURING a few frames later and froze it there for the
+    rest of the turn.  A quarter second is not a room: it is the run-up to the
+    first word, and on a converse reply it is all the estimator ever gets,
+    because the stream-open guard discards the room tone that came before.
+    Measured on a real capture: the spread read 4.2 dB — Ali's own dynamic range
+    — instead of the 2.0 dB his room actually wanders, the VAD rise went
+    6 dB -> 12.7 dB, and the gate closed above the voice it existed to hear.
+    34 % of his frames counted as speech and a 15 s answer endpointed at 6.3 s.
+    """
+
+    settings = reply_window_config()
+    state = AdaptiveCaptureState(1_000, settings, speech_vote)
+    for index in range(12):  # exactly the window the old estimator committed on
+        state.feed(frame(0.004 if index % 3 else 0.001))
+
+    assert state.phase is CapturePhase.WAITING_FOR_SPEECH
+    assert state.noise_spread_db == pytest.approx(settings.vad_margin_db)
+    assert state._vad_required_rise_db() == pytest.approx(
+        settings.noise_spread_k * settings.vad_margin_db
+    )
+
+
+def test_a_room_measured_before_anyone_talks_still_sizes_the_gate() -> None:
+    """The cross-room contract survives: a restless room is still learned.
+
+    The fix withholds a spread read from too short a sample, not every spread.
+    Given what the estimator was always meant to have — a stretch of room with
+    nobody talking over it — the wander is measured and the gate sized to it.
+    """
+
+    settings = reply_window_config()
+    state = AdaptiveCaptureState(1_000, settings, speech_vote)
+    for index in range(75):  # 1.5 s of room that will not hold still
+        state.feed(frame(0.001 if index % 5 == 0 else 0.004))
+
+    assert state.phase is CapturePhase.WAITING_FOR_SPEECH
+    assert state.noise_spread_db > settings.vad_margin_db
+
+
+class FinishedProcess:
+    """A player process that has already exited, so ``wait`` returns at once."""
+
+    def __init__(self) -> None:
+        self.pid = 4242
+        self.returncode: int | None = 0
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
+
+    def terminate(self) -> None:
+        pass
+
+    def kill(self) -> None:
+        pass
+
+
+def _cue_file(directory: Path) -> Path:
+    tone = np.sin(np.linspace(0.0, 40.0, 3_840, dtype=np.float32)) * 0.2
+    return write_wav_atomic(directory / "listen_start.wav", tone, 24_000)
+
+
+def test_the_listen_cue_does_not_cost_a_second_of_deafness(tmp_path: Path) -> None:
+    """Symptom: "it opens the mic, one or two seconds, then stops and redoes it".
+
+    The gate is held shut across the start cue so the tone cannot bleed into
+    the endpointer, and the cue was played by spawning ``afplay``. Measured on
+    Ali's Mac, ``afplay`` takes 1.09 s of wall clock to play a 0.16 s file:
+    0.93 s of process and CoreAudio startup before any sound. The event log
+    agrees — 1.18 s between ``listening.started`` and ``capture.gate_opened``
+    on every one of 855 turns after a spoken reply.
+
+    That second lands exactly where the assistant stops talking and the user
+    starts, and every word of it is dropped at the callback. A short answer
+    that fits inside it is heard as silence: 40 turns ended in ``onset_timeout``
+    and were re-listened, which is the restart Ali sees. Played in process the
+    same cue costs 0.27 s.
+    """
+
+    played: list[tuple[int, int, bool]] = []
+
+    class Device:
+        def play(self, samples: Any, samplerate: int, blocking: bool = False) -> None:
+            played.append((len(samples), samplerate, blocking))
+
+    def refuse(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("the cue must not wait for a player process to boot")
+
+    player = AudioPlayer(
+        registry=PlaybackRegistry(),
+        popen_factory=refuse,
+        which=lambda name: f"/mock/{name}",
+        platform_name="Darwin",
+        sounddevice=Device(),
+    )
+    player.play_cue(_cue_file(tmp_path), volume=0.5)
+
+    assert played == [(3_840, 24_000, True)]
+
+
+def test_a_cue_the_device_refuses_is_still_played(tmp_path: Path) -> None:
+    """The cue is a courtesy, but a silent microphone opening is a confusing one."""
+
+    commands: list[list[str]] = []
+
+    class Broken:
+        def play(self, *_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError("PortAudio would not open the output device")
+
+    def popen(command: list[str], **_kwargs: Any) -> FinishedProcess:
+        commands.append(command)
+        return FinishedProcess()
+
+    player = AudioPlayer(
+        registry=PlaybackRegistry(),
+        popen_factory=popen,
+        which=lambda name: f"/mock/{name}" if name == "afplay" else None,
+        platform_name="Darwin",
+        sounddevice=Broken(),
+    )
+    player.play_cue(_cue_file(tmp_path))
+
+    assert commands[0][:3] == ["/mock/afplay", "-v", "1.000"]
