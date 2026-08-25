@@ -2663,6 +2663,128 @@ async def test_the_floor_key_does_nothing_during_a_read_aloud(tmp_path: Path):
     assert "heard" not in result
 
 
+async def _speak_with_presses(engine, presses: int, **kwargs):
+    """Run one bare speak, pressing the floor key while the utterance plays."""
+
+    player = engine.player
+    turn = asyncio.create_task(engine.speak("claude", "Here is the update.", **kwargs))
+    await _await_event(player.started)
+    pressed = [await engine.control("panel", "toggle_floor") for _ in range(presses)]
+    player.release.set()
+    return await turn, pressed
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_taking_the_floor_during_a_bare_speak_answers_inside_that_call(tmp_path: Path):
+    """A narration cannot be told from a conversation by ear, so the key means
+    the same in both — and the answer comes back in the call that is still
+    open rather than waiting for the agent's next action."""
+
+    engine = make_engine(tmp_path, player=HeldPlayer())
+
+    result, pressed = await _speak_with_presses(engine, 1)
+
+    assert pressed[0] == {"status": "floor_toggled", "floor_open": True}
+    assert result["heard"]["transcript"] == "hello world"
+    assert result["floor_override"] == "taken"
+    assert result["status"] == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_a_speak_nobody_touched_returns_what_it_always_did(tmp_path: Path):
+    """The shape only changes on the override path."""
+
+    engine = make_engine(tmp_path, player=HeldPlayer())
+
+    result, _ = await _speak_with_presses(engine, 0)
+
+    assert "heard" not in result
+    assert "floor_override" not in result
+    assert result["status"] == "completed"
+    assert result["session"]["state"] == "idle"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_closing_the_floor_during_a_speak_is_where_it_started(tmp_path: Path):
+    """A narration plans no listen, so pressing back to closed asks for nothing."""
+
+    engine = make_engine(tmp_path, player=HeldPlayer())
+
+    result, pressed = await _speak_with_presses(engine, 2)
+
+    assert [press["floor_open"] for press in pressed] == [True, False]
+    assert "heard" not in result
+    assert "floor_override" not in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_a_floor_claimed_during_a_speak_gets_a_hot_listen(tmp_path: Path):
+    """A claimed floor is still a listen that follows our own TTS, so it skips
+    the cold-open chime and stream-open guard like a planned one."""
+
+    engine = make_engine(tmp_path, player=HeldPlayer())
+    seen: list[bool] = []
+    original = engine._listen_locked
+
+    async def wrapped(*args, **kwargs):
+        seen.append(engine._hot_listen_after_tts)
+        return await original(*args, **kwargs)
+
+    engine._listen_locked = wrapped  # type: ignore[method-assign]
+    await _speak_with_presses(engine, 1)
+
+    assert seen == [True]
+    assert engine._hot_listen_after_tts is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_a_floor_taken_during_a_speak_does_not_survive_the_utterance(tmp_path: Path):
+    """One press changes one narration, never the rest of the session."""
+
+    engine = make_engine(tmp_path, player=HeldPlayer())
+
+    await _speak_with_presses(engine, 1)
+    engine.player = HeldPlayer()
+    engine.player.release.set()
+    result = await engine.speak("claude", "And now the next one.")
+
+    assert "heard" not in result
+    assert "floor_override" not in result
+
+
+class HeldDeadPlayer(FakePlayer):
+    """A held clip that dies on its own, with nobody having cancelled."""
+
+    def __init__(self):
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def play_file(self, *args, **kwargs):
+        handle = HeldHandle(self.started, self.release)
+        handle.wait = lambda timeout=None: (self.started.set(), self.release.wait(5.0), -15)[-1]  # type: ignore[method-assign]
+        return handle
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_a_floor_taken_on_an_utterance_that_died_reports_no_override(tmp_path: Path):
+    """"Taken" is the answer arriving, so there is nothing to report without one."""
+
+    engine = make_engine(tmp_path, player=HeldDeadPlayer())
+
+    result, pressed = await _speak_with_presses(engine, 1)
+
+    assert pressed[0] == {"status": "floor_toggled", "floor_open": True}
+    assert result["status"] == "cancelled"
+    assert "heard" not in result
+    assert "floor_override" not in result
+
+
 class HeldBargingRecorder(FakeRecorder):
     """An armed capture that hears the person only once the test says so."""
 

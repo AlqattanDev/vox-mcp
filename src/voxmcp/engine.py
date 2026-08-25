@@ -1966,15 +1966,42 @@ class VoxEngine:
                     "io_mode": self._io_mode,
                     "session": self.state.snapshot().to_dict(),
                 }
-            result = await self._speak_locked(
-                client_id,
-                message,
-                voice=voice or await self._agent_voice(agent),
-                speed=speed,
-                instructions=instructions,
-                interruptible=interruptible,
-            )
-            return {**result, "io_mode": self._io_mode, "session": self.state.snapshot().to_dict()}
+            # A narration plans no listen, so the floor starts closed here and
+            # only a press can open it. The person cannot tell a narration from
+            # a conversation by ear, so the key has to mean the same in both.
+            self._open_floor(planned=False)
+            try:
+                spoken = await self._speak_locked(
+                    client_id,
+                    message,
+                    voice=voice or await self._agent_voice(agent),
+                    speed=speed,
+                    instructions=instructions,
+                    interruptible=interruptible,
+                )
+                # Whatever the floor says now the utterance has ended is what
+                # happens; a narration only ever started it closed.
+                floor = self._close_floor()
+                result: dict[str, Any] = {**spoken, "io_mode": self._io_mode}
+                if floor.open and spoken.get("status") != "cancelled":
+                    # The microphone opens inside this still-open call rather
+                    # than the answer being held as a note until the agent's
+                    # next action, which would make the person wait to be
+                    # heard. A claimed floor is still a listen that follows our
+                    # own TTS, so it skips the cold-open guard and chime like a
+                    # planned one.
+                    self._hot_listen_after_tts = True
+                    result["heard"] = await self._listen_locked(client_id)
+                if "heard" in result:
+                    # Beside what was said, never inside it, and worded as an
+                    # ordinary turn: nobody interrupted anything. Only ever
+                    # alongside a transcript — a claimed floor an utterance
+                    # died before delivering is nothing the agent can answer.
+                    result["floor_override"] = "taken"
+                result["session"] = self.state.snapshot().to_dict()
+                return result
+            finally:
+                self._hot_listen_after_tts = False
 
         return await self._run_operation(client_id, "speak", operation, agent=agent)
 

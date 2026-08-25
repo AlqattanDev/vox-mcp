@@ -540,7 +540,12 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
 
     @server.tool(
         name="speak",
-        description="Speak local TTS without opening the microphone.",
+        description=(
+            "Speak local TTS, opening no microphone unless the person takes the "
+            "floor while it plays — then the result carries what they said in "
+            "'heard' beside floor_override: 'taken'. Answer it as an ordinary "
+            "turn; nobody interrupted you."
+        ),
         annotations=LOCAL_ACTION,
     )
     async def speak(
