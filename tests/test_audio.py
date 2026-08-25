@@ -1647,3 +1647,26 @@ def test_a_cue_the_device_refuses_is_still_played(tmp_path: Path) -> None:
     player.play_cue(_cue_file(tmp_path))
 
     assert commands[0][:3] == ["/mock/afplay", "-v", "1.000"]
+
+
+def test_a_short_window_can_still_measure_the_room_it_is_watching() -> None:
+    """The armed barge-in capture shortens the window; the sample must follow.
+
+    Barge-in replaces ``noise_window_s`` with 0.8 s so the bleed of our own
+    reply becomes the floor within a sentence rather than a paragraph. The room
+    sample is 1 s, and it is counted in that same window — so the sample it was
+    waiting for was wider than the deque it was waiting in and never arrived.
+    The spread stayed pinned at the starting guess for the whole reply, which
+    dropped the rise a VAD-endorsed frame has to clear from 24 dB to 18 dB and
+    left the agent 6 dB more likely to interrupt itself on its own voice.
+    """
+
+    settings = reply_window_config(noise_window_s=0.8, noise_spread_k=6.0,
+                                   max_vad_margin_db=24.0)
+    state = AdaptiveCaptureState(1_000, settings, speech_vote)
+    for index in range(200):  # 4 s: five times the window it is allowed to see
+        state.feed(frame(0.02 if index % 4 else 0.002))
+
+    assert state.phase is CapturePhase.WAITING_FOR_SPEECH
+    assert state.noise_spread_db > settings.vad_margin_db
+    assert state._vad_required_rise_db() == pytest.approx(settings.max_vad_margin_db)

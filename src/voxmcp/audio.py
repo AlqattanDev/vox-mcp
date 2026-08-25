@@ -776,15 +776,18 @@ class AdaptiveCaptureState:
         # Learned from the room itself, so the speech gate re-sizes when you
         # move between a quiet bedroom and a loud office without being told.
         self.noise_spread_db = self.config.vad_margin_db
-        # Never fewer than twelve frames, whatever the config says: that is the
-        # sample size that produced the wrong answer this floor exists to stop.
-        self._room_sample_frames = max(
-            12, round(config.room_sample_s * 1000.0 / config.frame_ms)
-        )
         window = max(
             8, round(self.config.noise_window_s * 1000.0 / self.config.frame_ms)
         )
         self._recent_dbfs: deque[float] = deque(maxlen=window)
+        # Never fewer than twelve frames, whatever the config says: that is the
+        # sample size that produced the wrong answer this floor exists to stop.
+        # And never more than the window, which is where the frames are counted
+        # — barge-in narrows the window to 0.8 s, and a sample wider than the
+        # deque holding it is a sample that never arrives.
+        self._room_sample_frames = min(
+            window, max(12, round(config.room_sample_s * 1000.0 / config.frame_ms))
+        )
         self.elapsed_s = 0.0
         self.speech_duration_s = 0.0
         self.trailing_silence_s = 0.0
