@@ -247,9 +247,11 @@ final class LevelMeterView: NSView {
 ///
 /// While the claimant is ALIVE, Vox hides its status item; the hotkey, the HUD
 /// pill, the runtime and every control are untouched. Absent file, dead pid,
-/// unreadable JSON, or a machine with no such app at all — and Vox shows its
-/// item exactly as it always has. The liveness check is the point: a claimant
-/// that is SIGKILLed or crashes can never take the icon with it.
+/// recycled pid, unreadable JSON, or a machine with no such app at all — and
+/// Vox shows its item exactly as it always has. The liveness check is the
+/// point: a claimant that is SIGKILLed or crashes can never take the icon with
+/// it. `since` is load-bearing for that, not decoration — pid alone is a
+/// number the kernel hands out again within a day.
 ///
 /// `VOX_STATUS_ITEM=always` opts out entirely and pins the item on screen.
 enum StatusHost {
@@ -262,6 +264,20 @@ enum StatusHost {
             .appendingPathComponent(".vox/status-host.json")
     }
 
+    /// When the process holding `pid` started, in Unix seconds, or nil if that
+    /// cannot be read.  `kill(pid, 0)` answers "does *a* process have this
+    /// number", which is not the question — see `claimant()`.
+    private static func startTime(of pid: Int) -> Double? {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, Int32(pid)]
+        guard sysctl(&mib, u_int(mib.count), &info, &size, nil, 0) == 0, size > 0 else {
+            return nil
+        }
+        let started = info.kp_proc.p_starttime
+        return Double(started.tv_sec) + Double(started.tv_usec) / 1_000_000
+    }
+
     /// The name of the live claimant, or nil if nobody is showing Vox for us.
     static func claimant() -> String? {
         guard
@@ -272,6 +288,18 @@ enum StatusHost {
         // EPERM means the process exists and is simply not ours to signal.
         errno = 0
         guard kill(pid_t(pid), 0) == 0 || errno == EPERM else { return nil }
+        // ...but pids are recycled, and a stale claim file outlives the app that
+        // wrote it.  Measured here: a claim written 23 Aug 10:17 named pid 851,
+        // which by the next morning belonged to metrickitd — started 19 hours
+        // *after* the claim.  kill() said alive, so Vox hid its icon and kept it
+        // hidden across every restart, with no way for the user to tell why.
+        // A claimant cannot have started after it announced itself, so a start
+        // time later than `since` is a different process wearing the number.
+        // The two-second slack is for the gap between spawning and writing.
+        if let since = payload["since"] as? Double, let started = startTime(of: pid),
+            started > since + 2 {
+            return nil
+        }
         return (payload["name"] as? String) ?? "another menu bar"
     }
 }
