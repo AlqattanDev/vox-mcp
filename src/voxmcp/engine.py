@@ -14,7 +14,7 @@ import tempfile
 import threading
 import time
 import uuid
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -90,6 +90,23 @@ def split_for_tts(text: str, *, min_chunk: int = 60, min_total: int = 140) -> li
 
 def _default_home() -> Path:
     return Path(os.environ.get("VOX_HOME", "~/.vox")).expanduser()
+
+
+@dataclass(frozen=True, slots=True)
+class Floor:
+    """Who speaks next after one utterance, and who decided that.
+
+    ``planned`` is what the agent asked for when it made the call. The person
+    can override it while the utterance plays, and ``open`` — the plan, flipped
+    if they did — is what actually happens when the utterance ends.
+    """
+
+    planned: bool
+    overridden: bool = False
+
+    @property
+    def open(self) -> bool:
+        return self.planned != self.overridden
 
 
 class VoxEngine:
@@ -216,6 +233,12 @@ class VoxEngine:
         # (Bluetooth pop, "I can hear you now"). After we just spoke they
         # only add a dead gap. Bare listen() is unchanged.
         self._hot_listen_after_tts = False
+        # The floor — who speaks next — for the utterance currently playing,
+        # and None whenever no utterance that can hold one is on air. It lives
+        # for exactly one utterance: operations are serialised, so a single
+        # engine-level slot has the per-operation lifetime the floor needs, and
+        # a queued utterance behind this one starts from its own agent's plan.
+        self._floor: Floor | None = None
         # How long the device stays open after the last capture lets go.
         #
         # This is not a grace period for idling: macOS lights its microphone
@@ -485,6 +508,49 @@ class VoxEngine:
             self._pending_turn_id = None
             return heard, turn_id
 
+    def _open_floor(self, *, planned: bool) -> None:
+        """Put the floor on air for the utterance about to play."""
+
+        with self._active_lock:
+            self._floor = Floor(planned=planned)
+
+    def _close_floor(self) -> Floor:
+        """Take the floor off air and return how it ended up.
+
+        Called at the point that decides whether to listen, which is the last
+        instant a press can still count: the utterance has just ended.
+        """
+
+        with self._active_lock:
+            floor = self._floor or Floor(planned=False)
+            self._floor = None
+        return floor
+
+    @property
+    def floor_open(self) -> bool:
+        """Whether the microphone follows the utterance currently playing."""
+
+        with self._active_lock:
+            floor = self._floor
+        return floor.open if floor is not None else False
+
+    def _toggle_floor(self, client_id: str) -> dict[str, Any]:
+        """Flip who speaks next after the utterance on air.
+
+        A toggle rather than a set because the presser cannot know what the
+        agent planned: the menu-bar app asks for the other state and is told
+        what it got, which is also what makes a double press a provable no-op.
+        """
+
+        with self._active_lock:
+            floor = self._floor
+            if floor is None:
+                return {"status": "not_speaking", "floor_open": False}
+            floor = replace(floor, overridden=not floor.overridden)
+            self._floor = floor
+        self._log("floor.toggled", client_id=client_id, floor_open=floor.open)
+        return {"status": "floor_toggled", "floor_open": floor.open}
+
     async def _run_operation(
         self,
         client_id: str,
@@ -567,6 +633,9 @@ class VoxEngine:
                 raise
             finally:
                 self._clear_active()
+                # The floor never outlives the operation it was set on, however
+                # that operation ended.
+                self._close_floor()
                 with self._active_lock:
                     self._pending_agent = None
 
@@ -1812,13 +1881,17 @@ class VoxEngine:
             self._hot_listen_after_tts = effective_wait and not skip_speak
             try:
                 if skip_speak:
+                    # No utterance, so there is nothing to hold a floor: the
+                    # plan is the only thing there is to follow.
                     spoken = {
                         "status": "skipped",
                         "reason": "io_mode_dictate",
                         "backend": None,
                         "elapsed_ms": 0,
                     }
+                    resolved_wait, overridden = effective_wait, False
                 else:
+                    self._open_floor(planned=effective_wait)
                     spoken = await self._speak_locked(
                         client_id,
                         message,
@@ -1828,6 +1901,13 @@ class VoxEngine:
                         interruptible=True,
                         barge_in=effective_wait and self.barge_in_availability()["available"],
                     )
+                    # Whatever the floor says now that the utterance has ended
+                    # is what happens — the plan only decided where it started.
+                    floor = self._close_floor()
+                    resolved_wait, overridden = floor.open, floor.overridden
+                # A claimed floor is still a listen that follows our own TTS,
+                # so it skips the cold-open guard and chime like a planned one.
+                self._hot_listen_after_tts = resolved_wait and not skip_speak
                 result: dict[str, Any] = {"spoken": spoken, "io_mode": mode}
                 if spoken.get("status") == "barge_in":
                     # The user talked over the reply. The capture that detected
@@ -1836,7 +1916,7 @@ class VoxEngine:
                     # listen here would ask them to repeat themselves.
                     result["barge_in"] = True
                     result["heard"] = await self._harvest_barge_in(client_id, language=language)
-                elif effective_wait and spoken.get("status") != "cancelled":
+                elif resolved_wait and spoken.get("status") != "cancelled":
                     result["heard"] = await self._listen_locked(
                         client_id,
                         listen_duration_max=listen_duration_max,
@@ -1845,11 +1925,20 @@ class VoxEngine:
                         onset_timeout=onset_timeout,
                         language=language,
                     )
+                # A transcript is the turn's outcome whenever one exists —
+                # including one harvested from a barge-in over a floor the
+                # person had closed, which is still an answer.
                 result["status"] = (
-                    result.get("heard", {}).get("status")
-                    if effective_wait
+                    result["heard"].get("status")
+                    if "heard" in result
                     else spoken.get("status")
                 )
+                if overridden and spoken.get("status") != "barge_in":
+                    # Beside the transcript, never inside it, and worded as an
+                    # ordinary turn: the agent was not interrupted. A person
+                    # who talked over the reply has already said everything the
+                    # barge-in path reports, so it needs nothing added.
+                    result["floor_override"] = "taken" if resolved_wait else "declined"
                 result["session"] = self.state.snapshot().to_dict()
                 return result
             finally:
@@ -2415,6 +2504,10 @@ class VoxEngine:
         if action in {"manual_end", "push_to_talk_end"}:
             signal = self._signal_cancel(manual_end=True, cancel_task=False)
             return {"status": "manual_end_signalled", **signal}
+        if action == "toggle_floor":
+            # A flag flip, so it answers immediately: it must never stop the
+            # utterance, and the person is waiting to see the pill change.
+            return self._toggle_floor(client_id)
         if action == "gate_open":
             return await self._gate_open(client_id)
         if action == "gate_close":
@@ -2914,6 +3007,11 @@ class VoxEngine:
             # merely whether the device is held. The glyph tracks the gate.
             "gate_open": self.gate_open,
             "stream_open": self.stream_open,
+            # What the floor indicator on the pill draws: whether the
+            # microphone follows the utterance currently playing. Two states
+            # only — the person needs to know whether it is coming, not why —
+            # so this is false whenever nothing is speaking.
+            "floor_open": self.floor_open,
             "barge_in_enabled": self.config.barge_in_enabled,
             "mic_armed_for_barge_in": status.get("mic_armed_for_barge_in", False),
             "mic_level": round(mic_level, 3),

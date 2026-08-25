@@ -655,3 +655,26 @@ def test_default_daemon_prepares_menu_bar_token(monkeypatch: pytest.MonkeyPatch)
 
     assert runtime.prepared == 1
     assert len(http.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_floor_key_reaches_the_engine_over_loopback(tmp_path: Path) -> None:
+    """A flag flip, so it is awaited rather than backgrounded like a note."""
+
+    engine = FakeEngine(tmp_path / "latest.wav")
+    server = create_mcp(engine, control_token="correct-horse")
+    app = server.http_app(path="/mcp")
+
+    transport = ASGITransport(app=app, client=("127.0.0.1", 50123))
+    async with AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
+        toggled = await client.post(
+            "/control",
+            json={"action": "toggle_floor"},
+            headers={"X-Vox-Token": "correct-horse"},
+        )
+        unauthorised = await client.post("/control", json={"action": "toggle_floor"})
+
+    assert toggled.status_code == 200
+    assert unauthorised.status_code == 401
+    control_calls = [arguments for name, arguments in engine.calls if name == "control"]
+    assert control_calls == [{"action": "toggle_floor", "client_id": "http-control"}]

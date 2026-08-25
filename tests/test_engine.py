@@ -2508,3 +2508,242 @@ async def test_read_aloud_speaks_even_in_dictate_mode(tmp_path: Path):
         "completed"
     )
     assert speech.spans == ["but this is read"]
+
+
+class HeldHandle(BlockingHandle):
+    """Playback the test both starts and ends, so a press lands mid-utterance."""
+
+    def __init__(self, started: threading.Event, release: threading.Event):
+        super().__init__()
+        self._started = started
+        # The test ends the clip by hand; a cancel still ends it too.
+        self._done = release
+
+    def wait(self, timeout=None):
+        self._started.set()
+        return super().wait(timeout)
+
+
+class HeldPlayer(FakePlayer):
+    """A player whose utterance stays on air until the test lets it end."""
+
+    def __init__(self):
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def play_file(self, *args, **kwargs):
+        return HeldHandle(self.started, self.release)
+
+
+async def _await_event(event: threading.Event, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not event.is_set():
+        assert time.monotonic() < deadline, "the utterance never started playing"
+        await asyncio.sleep(0.005)
+
+
+async def _converse_with_presses(engine, presses: int, **kwargs):
+    """Run one converse, pressing the floor key while the utterance plays."""
+
+    player = engine.player
+    turn = asyncio.create_task(engine.converse("claude", "Hi", **kwargs))
+    await _await_event(player.started)
+    pressed = [await engine.control("panel", "toggle_floor") for _ in range(presses)]
+    player.release.set()
+    return await turn, pressed
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_taking_the_floor_during_a_converse_that_planned_no_listen(tmp_path: Path):
+    """The person claims the microphone the agent did not plan to offer."""
+
+    engine = make_engine(tmp_path, player=HeldPlayer())
+
+    result, pressed = await _converse_with_presses(engine, 1, wait_for_response=False)
+
+    assert pressed[0] == {"status": "floor_toggled", "floor_open": True}
+    assert result["heard"]["transcript"] == "hello world"
+    assert result["floor_override"] == "taken"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_declining_the_floor_completes_the_turn_without_listening(tmp_path: Path):
+    """Waving the microphone off is an ordinary turn, not a cancellation."""
+
+    engine = make_engine(tmp_path, player=HeldPlayer())
+
+    result, pressed = await _converse_with_presses(engine, 1)
+
+    assert pressed[0] == {"status": "floor_toggled", "floor_open": False}
+    assert "heard" not in result
+    assert result["floor_override"] == "declined"
+    assert result["status"] == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_two_floor_presses_inside_one_utterance_cost_nothing(tmp_path: Path):
+    """A misfire is undone by pressing again; the agent is never told."""
+
+    engine = make_engine(tmp_path, player=HeldPlayer())
+
+    result, pressed = await _converse_with_presses(engine, 2)
+
+    assert [press["floor_open"] for press in pressed] == [False, True]
+    assert result["heard"]["transcript"] == "hello world"
+    assert "floor_override" not in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_the_floor_does_not_survive_the_utterance(tmp_path: Path):
+    """One press changes one utterance, never the rest of the session."""
+
+    engine = make_engine(tmp_path, player=HeldPlayer())
+
+    await _converse_with_presses(engine, 1)
+    engine.player = HeldPlayer()
+    engine.player.release.set()
+    result = await engine.converse("claude", "And now the next one")
+
+    assert result["heard"]["transcript"] == "hello world"
+    assert "floor_override" not in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_health_reports_the_floor_only_while_an_utterance_plays(tmp_path: Path):
+    """The whole contract the floor indicator needs: two states."""
+
+    engine = make_engine(tmp_path, player=HeldPlayer())
+    assert (await engine.health())["floor_open"] is False
+
+    turn = asyncio.create_task(engine.converse("claude", "Hi"))
+    await _await_event(engine.player.started)
+    speaking = await engine.health()
+    await engine.control("panel", "toggle_floor")
+    declined = await engine.health()
+    engine.player.release.set()
+    await turn
+
+    assert speaking["floor_open"] is True
+    assert declined["floor_open"] is False
+    assert (await engine.health())["floor_open"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_the_floor_key_does_nothing_while_nothing_is_speaking(tmp_path: Path):
+    engine = make_engine(tmp_path)
+
+    assert await engine.control("panel", "toggle_floor") == {
+        "status": "not_speaking",
+        "floor_open": False,
+    }
+    assert (await engine.converse("claude", "Hi"))["heard"]["transcript"] == "hello world"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_the_floor_key_does_nothing_during_a_read_aloud(tmp_path: Path):
+    """Nobody is on the other end of a read-back, so there is nowhere to talk."""
+
+    engine = make_engine(tmp_path, player=HeldPlayer())
+
+    reading = asyncio.create_task(engine.read_aloud("panel", text="Exactly these words."))
+    await _await_event(engine.player.started)
+    pressed = await engine.control("panel", "toggle_floor")
+    engine.player.release.set()
+    result = await reading
+
+    assert pressed == {"status": "not_speaking", "floor_open": False}
+    assert result["status"] == "completed"
+    assert "heard" not in result
+
+
+class HeldBargingRecorder(FakeRecorder):
+    """An armed capture that hears the person only once the test says so."""
+
+    def __init__(self, path: Path):
+        super().__init__(path, speech=True)
+        self.armed = threading.Event()
+        self.talk = threading.Event()
+
+    def capture(self, *, device=None, control=None, on_speech_started=None):
+        self.armed.set()
+        if on_speech_started is not None:
+            self.talk.wait(5.0)
+            on_speech_started()
+        return super().capture(device=device, control=control)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_barge_in_beats_a_floor_the_person_closed(tmp_path: Path):
+    """Declining and then talking anyway makes the intention unmistakable."""
+
+    store = AudioStore(tmp_path / "audio")
+    recorder = HeldBargingRecorder(store.latest_stt)
+    engine = make_engine(
+        tmp_path, recorder=recorder, player=BlockingPlayer(), barge_in=True
+    )
+
+    turn = asyncio.create_task(engine.converse("claude", "Here is a long explanation."))
+    await _await_event(recorder.armed)
+    pressed = await engine.control("panel", "toggle_floor")
+    recorder.talk.set()
+    result = await turn
+
+    assert pressed == {"status": "floor_toggled", "floor_open": False}
+    assert result["spoken"]["status"] == "barge_in"
+    assert result["barge_in"] is True
+    assert result["heard"]["transcript"] == "hello world"
+    assert result["status"] == "completed"
+    assert "floor_override" not in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_a_dictate_mode_converse_still_opens_the_mic_cold(tmp_path: Path):
+    """No TTS played, so the cold-open guard and chime are still owed."""
+
+    engine = make_engine(tmp_path)
+    engine._save_io_mode("dictate")
+    seen: list[bool] = []
+    original = engine._listen_locked
+
+    async def wrapped(*args, **kwargs):
+        seen.append(engine._hot_listen_after_tts)
+        return await original(*args, **kwargs)
+
+    engine._listen_locked = wrapped  # type: ignore[method-assign]
+    result = await engine.converse("claude", "Hi")
+
+    assert seen == [False]
+    assert result["spoken"]["status"] == "skipped"
+    assert result["heard"]["transcript"] == "hello world"
+
+
+class DeadPlayer(FakePlayer):
+    """A player whose clip dies on its own, with nobody having cancelled."""
+
+    def play_file(self, *args, **kwargs):
+        handle = FakeHandle()
+        handle.wait = lambda: -15  # type: ignore[method-assign]
+        return handle
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_a_converse_whose_playback_died_reports_it(tmp_path: Path):
+    """The turn's status is the utterance's when no transcript exists."""
+
+    engine = make_engine(tmp_path, player=DeadPlayer())
+
+    result = await engine.converse("claude", "Hi")
+
+    assert result["spoken"]["status"] == "cancelled"
+    assert "heard" not in result
+    assert result["status"] == "cancelled"

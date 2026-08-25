@@ -446,7 +446,15 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
                 client_id=client_id,
                 **options,
             )
-        if action in {"cancel", "repeat", "status", "deliver_text", "gate_open", "gate_close"}:
+        if action in {
+            "cancel",
+            "repeat",
+            "status",
+            "deliver_text",
+            "gate_open",
+            "gate_close",
+            "toggle_floor",
+        }:
             return await _invoke(
                 current_engine(),
                 "control",
@@ -962,6 +970,7 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
             "deliver_text",
             "gate_open",
             "gate_close",
+            "toggle_floor",
             "dictate_start",
             "dictate_end",
             "read_aloud",
