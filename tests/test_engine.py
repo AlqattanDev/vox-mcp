@@ -2907,3 +2907,50 @@ async def test_a_converse_whose_playback_died_reports_it(tmp_path: Path):
     assert result["spoken"]["status"] == "cancelled"
     assert "heard" not in result
     assert result["status"] == "cancelled"
+
+
+class MidSentenceRecorder(FakeRecorder):
+    """A microphone that stays open, mid-sentence, until something ends it.
+
+    On a manual end it returns the speech heard so far, the way the real
+    recorder does; on a cancel it discards it. This is the ordering a privacy
+    pause lands in when the display idles out while the user is still talking.
+    """
+
+    def __init__(self, path: Path):
+        super().__init__(path, speech=True)
+        self.entered = threading.Event()
+
+    def capture(self, *, device=None, control=None, on_speech_started=None):
+        self.entered.set()
+        while control is not None and not (control.cancelled or control.manual_end_requested):
+            threading.Event().wait(0.005)
+        if control is not None and control.manual_end_requested and not control.cancelled:
+            result = super().capture(device=device, control=control)
+            return replace(result, reason=CaptureStopReason.MANUAL_END)
+        return super().capture(device=device, control=control)
+
+
+@pytest.mark.asyncio
+async def test_pause_mid_listen_delivers_what_was_already_heard(tmp_path: Path):
+    """The display idling out mid-sentence used to throw the sentence away.
+
+    A pause is the privacy stop — the microphone must close now — but the
+    words already captured were said to the agent on purpose. They are
+    transcribed and returned to the listen that was waiting for them; the
+    session is paused afterwards.
+    """
+    engine = make_engine(tmp_path)
+    recorder = MidSentenceRecorder(engine.store.latest_stt)
+    engine.recorder = recorder
+    listening = asyncio.create_task(engine.listen("claude"))
+    assert await asyncio.to_thread(recorder.entered.wait, 1)
+
+    paused = await engine.session("http-control", "pause")
+
+    result = await asyncio.wait_for(listening, 5)
+    assert result["status"] == "completed"
+    assert result["transcript"] == "hello world"
+    assert paused["session"]["state"] == "paused"
+    assert (await engine.status())["session"]["state"] == "paused"
+    assert (await engine.status())["session"]["microphone_open"] is False

@@ -706,7 +706,16 @@ class VoxEngine:
         manual_end: bool,
         cancel_task: bool = True,
         force: bool = False,
+        keep_heard: bool = False,
     ) -> dict[str, Any]:
+        """Stop whatever holds the microphone or the speaker.
+
+        ``keep_heard`` is the privacy-pause variant: everything is still
+        cancelled, except that a listen already under way is *ended* rather
+        than cancelled, so the words captured so far are transcribed and
+        reach the agent that was waiting for them. The display idling out
+        mid-sentence is a pause, not a "stop, that was wrong".
+        """
         with self._active_lock:
             task = self._active_task
             control = self._capture_control
@@ -759,7 +768,7 @@ class VoxEngine:
         if control is not None:
             with self._active_lock:
                 self._microphone_closing = True
-            control.end_utterance() if manual_end else control.cancel()
+            control.end_utterance() if (manual_end or keep_heard) else control.cancel()
         if barge_control is not None:
             with self._active_lock:
                 self._microphone_closing = True
@@ -771,7 +780,27 @@ class VoxEngine:
         # has closed.  Signal CaptureControl and let the turn unwind normally.
         if cancel_async_task and task is not None:
             task.cancel()
-        return {"signalled": signalled, "client_id": client, "manual_end": manual_end}
+        return {
+            "signalled": signalled,
+            "client_id": client,
+            "manual_end": manual_end,
+            "heard_kept": keep_heard and control is not None,
+        }
+
+    async def _settle_kept_turn(self, timeout: float = 10.0) -> None:
+        """Let a listen whose words were kept finish transcribing them.
+
+        Forcing the session idle underneath it would make its own
+        complete_turn illegal and lose the transcript a second way.
+        """
+        with self._active_lock:
+            task = self._active_task
+        if task is None or task is asyncio.current_task():
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout)
+        except Exception:
+            pass
 
     @property
     def barge_in_armed(self) -> bool:
@@ -2440,7 +2469,7 @@ class VoxEngine:
         elif action in {"pause", "mute"}:
             if not administrative and not force:
                 await self._claim(client_id)
-            self._signal_cancel(manual_end=False, force=True)
+            signal = self._signal_cancel(manual_end=False, force=True, keep_heard=True)
             # A turn that queued before the pause would otherwise inherit the
             # mic afterwards and speak straight through a privacy hold.
             self.gate.drain("paused")
@@ -2449,6 +2478,8 @@ class VoxEngine:
             # Pause is the privacy stop, not the gate: the stream itself goes,
             # so the device is released and the indicator light goes out.
             await self._close_source()
+            if signal.get("heard_kept"):
+                await self._settle_kept_turn()
             if self.state.state is not SessionState.PAUSED:
                 if self.state.state not in {SessionState.IDLE, SessionState.OFF}:
                     self._return_idle_if_active()

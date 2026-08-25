@@ -184,7 +184,37 @@ final class VoxHUD {
     }
 
     @objc private func screensChanged() {
-        if state != nil { reposition() }
+        guard state != nil else { return }
+        reposition()
+        rejoinCurrentSpace()
+    }
+
+    /// Whether the window server is actually drawing the pill on the active
+    /// space — as distinct from AppKit believing it is visible.
+    private var onScreenPerWindowServer: Bool {
+        let number = CGWindowID(panel.windowNumber)
+        guard
+            let list = CGWindowListCopyWindowInfo([.optionIncludingWindow], number)
+                as? [[String: Any]],
+            let info = list.first
+        else { return false }
+        return (info[kCGWindowIsOnscreen as String] as? Bool) ?? false
+    }
+
+    /// Put the panel back on whichever space is active.
+    ///
+    /// A long-lived `canJoinAllSpaces` panel can fall out of another app's
+    /// full-screen space — seen after sleep/wake and display sleep: AppKit
+    /// reports it visible at the right frame, `orderFrontRegardless` is a
+    /// no-op because nothing changed on AppKit's side, and the window server
+    /// never draws it on that space until the process restarts. Ordering it
+    /// out and back in is what re-registers it with every space.
+    private func rejoinCurrentSpace() {
+        panel.orderOut(nil)
+        panel.collectionBehavior = [
+            .canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle,
+        ]
+        panel.orderFrontRegardless()
     }
 
     /// Drive the HUD from one status poll. `nil` hides it.
@@ -253,6 +283,11 @@ final class VoxHUD {
             layer.removeAllAnimations()
             layer.transform = CATransform3DIdentity
             layer.opacity = 1
+        }
+        // Self-heal every poll: visible to AppKit but absent from the active
+        // space means the window server dropped it (see rejoinCurrentSpace).
+        if panel.alphaValue == 1, panel.isVisible, !onScreenPerWindowServer {
+            rejoinCurrentSpace()
         }
         if panel.alphaValue == 1 { return }
         NSAnimationContext.runAnimationGroup { context in

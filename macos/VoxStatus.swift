@@ -2,6 +2,7 @@ import AppKit
 import AVFoundation
 import Carbon.HIToolbox
 import Foundation
+import IOKit.pwr_mgt
 
 /// The global hotkeys Vox owns, with meaning carried by the gesture.
 ///
@@ -367,6 +368,14 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private var runtime: Process?
     private var timer: Timer?
+    /// Held while a turn is live. Talking generates no key or mouse events,
+    /// so a five-minute display-sleep timer runs out mid-conversation; the
+    /// screen going dark then reads as "inactive" and pauses the session
+    /// under the person's sentence. A live microphone or a playing utterance
+    /// *is* the person using the machine, and this says so to power
+    /// management. Released the moment the turn ends, so an idle Vox never
+    /// keeps a lid-open Mac awake.
+    private var turnAwakeAssertion: IOPMAssertionID = 0
     private var pollInterval: TimeInterval = 0
     private var runtimeFailures: [Date] = []
     private var restartWorkItem: DispatchWorkItem?
@@ -1095,6 +1104,7 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // the panel — is on screen, and fall back to the light glyph-tracking
         // cadence the moment neither is.
         let hudShowing = hudEnabled ? hudState(normalized: normalized) : nil
+        keepDisplayAwake(microphoneOpen || streamOpen || dictating || normalized == "speaking")
         if hudEnabled {
             hud.apply(
                 hudShowing,
@@ -1530,6 +1540,24 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             NSMenu.popUpContextMenu(menu, with: event, for: moreButton)
         } else {
             menu.popUp(positioning: nil, at: NSPoint(x: 0, y: moreButton.bounds.height), in: moreButton)
+        }
+    }
+
+    /// Idle display sleep only — a closed lid, a lock, or an explicit sleep
+    /// still pause exactly as before.
+    private func keepDisplayAwake(_ awake: Bool) {
+        if awake, turnAwakeAssertion == 0 {
+            var id = IOPMAssertionID(0)
+            let created = IOPMAssertionCreateWithName(
+                kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
+                IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                "Vox voice turn in progress" as CFString,
+                &id
+            )
+            if created == kIOReturnSuccess { turnAwakeAssertion = id }
+        } else if !awake, turnAwakeAssertion != 0 {
+            IOPMAssertionRelease(turnAwakeAssertion)
+            turnAwakeAssertion = 0
         }
     }
 
