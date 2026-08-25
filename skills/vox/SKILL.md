@@ -118,12 +118,31 @@ Hard rules:
 
 ## User-initiated reply (they grab the turn)
 
-Even when you did not open the mic, the user can answer on their own terms — a
-**Reply** button in the panel or a tap of the global hotkey **⌘§** opens the mic
-and captures one utterance, auto-addressed to whoever last spoke. It surfaces as
-`undelivered_heard` (`kind == "note"`) in that agent's status, so treat it like
-any addressed note: whenever you see `undelivered_heard.present`, claim it and
-act on it. This is how the user replies after you have already hung up.
+Even when you did not open the mic, the user can answer on their own terms — the
+**Reply** button in the panel opens the mic and captures one utterance,
+auto-addressed to whoever last spoke. It surfaces as `undelivered_heard`
+(`kind == "note"`) in that agent's status, so treat it like any addressed note:
+whenever you see `undelivered_heard.present`, claim it and act on it. This is how
+the user replies after you have already hung up.
+
+## The floor (they take the mic while you are talking)
+
+While an utterance of yours is playing, the user can press **⌘⇧§** to flip **the
+floor** — who speaks next. It never interrupts you: the utterance finishes
+exactly as it would have, and only what happens at the end of it changes. One
+utterance, one flip; the next call starts from your own plan again.
+
+`converse` and `speak` report it in `floor_override`, beside what was said and
+never inside the transcript:
+
+- `"taken"` — you planned no listen and they claimed one anyway. The transcript
+  is in `heard`, in that same call's result, even for a bare `speak`.
+- `"declined"` — you planned a listen and they waved it off. There is no `heard`,
+  the status is `completed`, and nothing failed or timed out.
+
+Absent means your own plan ran. **Nobody interrupted you** in either case, so do
+not apologise, do not treat it as a cancellation, and answer what they said as an
+ordinary turn.
 
 ## Visible transcript echo
 

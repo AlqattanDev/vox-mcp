@@ -2757,17 +2757,21 @@ async def test_a_floor_taken_during_a_speak_does_not_survive_the_utterance(tmp_p
     assert "floor_override" not in result
 
 
-class HeldDeadPlayer(FakePlayer):
-    """A held clip that dies on its own, with nobody having cancelled."""
+class DeadHeldHandle(HeldHandle):
+    """A held clip that reports a killed player when the test lets it end."""
 
-    def __init__(self):
-        self.started = threading.Event()
-        self.release = threading.Event()
+    def wait(self, timeout=None):
+        super().wait(timeout)
+        # A signal death, which is how playback that did not finish on its own
+        # comes back — nobody cancelled it.
+        return -15
+
+
+class HeldDeadPlayer(HeldPlayer):
+    """A player whose utterance dies rather than finishing."""
 
     def play_file(self, *args, **kwargs):
-        handle = HeldHandle(self.started, self.release)
-        handle.wait = lambda timeout=None: (self.started.set(), self.release.wait(5.0), -15)[-1]  # type: ignore[method-assign]
-        return handle
+        return DeadHeldHandle(self.started, self.release)
 
 
 @pytest.mark.asyncio
@@ -2778,6 +2782,40 @@ async def test_a_floor_taken_on_an_utterance_that_died_reports_no_override(tmp_p
     engine = make_engine(tmp_path, player=HeldDeadPlayer())
 
     result, pressed = await _speak_with_presses(engine, 1)
+
+    assert pressed[0] == {"status": "floor_toggled", "floor_open": True}
+    assert result["status"] == "cancelled"
+    assert "heard" not in result
+    assert "floor_override" not in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_a_floor_declined_on_an_utterance_that_died_reports_no_override(tmp_path: Path):
+    """An utterance that died says only that it died. The listen it planned was
+    never going to run once it was cut off, so a decline changed nothing and
+    there is nothing to tell the agent about."""
+
+    engine = make_engine(tmp_path, player=HeldDeadPlayer())
+
+    result, pressed = await _converse_with_presses(engine, 1)
+
+    assert pressed[0] == {"status": "floor_toggled", "floor_open": False}
+    assert result["status"] == "cancelled"
+    assert "heard" not in result
+    assert "floor_override" not in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_a_floor_taken_on_a_converse_that_died_reports_no_override(tmp_path: Path):
+    """The conversation path owes the agent the same rule the narration does:
+    a claimed floor an utterance died before delivering leaves nothing to
+    answer, so there is no override to report."""
+
+    engine = make_engine(tmp_path, player=HeldDeadPlayer())
+
+    result, pressed = await _converse_with_presses(engine, 1, wait_for_response=False)
 
     assert pressed[0] == {"status": "floor_toggled", "floor_open": True}
     assert result["status"] == "cancelled"

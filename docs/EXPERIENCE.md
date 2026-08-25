@@ -299,10 +299,11 @@ worded as an ordinary turn:
 
 Absent means its own plan ran. An utterance whose floor was closed still reports
 a **completed** turn, never a cancelled one — declining to speak is not an error,
-and nothing was interrupted.
+and nothing was interrupted. An utterance that was cancelled reports no override
+at all: it says only that it died.
 
-Barge-in still beats the flag: someone who declines the floor and then talks over
-Vox anyway has made their intention unmistakable, and that path wins. Wanting the
+Barge-in still beats the flag: someone who declines the floor and then barges in
+anyway has made their intention unmistakable, and that path wins. Wanting the
 mic open for a whole session is still what **narrate** mode is for; this key stays
 one-shot.
 

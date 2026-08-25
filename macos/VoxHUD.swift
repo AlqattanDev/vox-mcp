@@ -196,7 +196,7 @@ final class VoxHUD {
     /// `floorOpen` is whether the microphone follows the utterance playing. It
     /// only draws while Vox is speaking; every other state already has the mic
     /// either open or irrelevant, and a wash there would say nothing.
-    func apply(_ next: HUDState?, levels: [CGFloat], floorOpen: Bool = false) {
+    func apply(_ next: HUDState?, levels: [CGFloat], floorOpen: Bool) {
         guard let next else {
             hide()
             return

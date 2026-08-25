@@ -24,10 +24,12 @@ loopback address; Vox refuses to start if they do not.
   dropped in the realtime callback: nothing is queued, buffered, or classified.
   The device itself is released once nothing needs it, so macOS's own
   microphone indicator is lit only when Vox can genuinely hear you.
-- One global hotkey that works in any app and needs no permission grant,
-  because Carbon hotkeys need none: **⌘§** held dictates at the cursor, and
-  **⌘§** tapped reads the selection aloud. A tap never opens the microphone —
-  listening happens only while the key is held.
+- Global hotkeys that work in any app and need no permission grant, because
+  Carbon hotkeys need none: **⌘§** held dictates at the cursor, **⌘§** tapped
+  reads the selection aloud, and **⌘⇧§** — while an agent is talking — flips
+  **the floor**, meaning who speaks next: it claims the microphone for the
+  moment that utterance ends, or waves off one you were about to be offered. A tap never opens the
+  microphone; listening happens only while the key is held.
 - A floating pill at the bottom of the screen that appears only while Vox is
   warming up, listening, dictating, or speaking, with a live waveform of your
   actual microphone level.
@@ -163,10 +165,11 @@ spoken transcripts on the clipboard too).
 ## Permissions
 
 - **Microphone** — required for everything. Requested on first launch.
-- **Accessibility** — required only for ⌘§ held and ⇧⌘§, which post ⌘V/⌘C and
+- **Accessibility** — required only for the ⌘§ gestures, which post ⌘V/⌘C and
   read the focused element. Vox prompts the first time you use either, and
   says so in the panel rather than failing silently. Grant it to
-  `Vox` under System Settings › Privacy & Security › Accessibility.
+  `Vox` under System Settings › Privacy & Security › Accessibility. ⌘⇧§ needs
+  none of it: it flips a flag in the runtime and posts no keystrokes.
 
 macOS pins these grants to the app's code signature, so the build refuses to
 fall back to ad-hoc signing: an ad-hoc signature changes on every build and

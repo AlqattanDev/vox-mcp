@@ -1875,10 +1875,6 @@ class VoxEngine:
         skip_speak = mode == "dictate"
 
         async def operation() -> dict[str, Any]:
-            # Resolved inside the turn, not before it: resolving first would let
-            # voice-lookup latency decide queue order instead of arrival order.
-            # An explicit voice= always wins over the agent's assigned voice.
-            self._hot_listen_after_tts = effective_wait and not skip_speak
             try:
                 if skip_speak:
                     # No utterance, so there is nothing to hold a floor: the
@@ -1895,6 +1891,10 @@ class VoxEngine:
                     spoken = await self._speak_locked(
                         client_id,
                         message,
+                        # The voice is resolved inside the turn, not before it:
+                        # resolving first would let voice-lookup latency decide
+                        # queue order instead of arrival order. An explicit
+                        # voice= always wins over the agent's assigned voice.
                         voice=voice or await self._agent_voice(agent),
                         speed=speed,
                         instructions=instructions,
@@ -1910,7 +1910,7 @@ class VoxEngine:
                 self._hot_listen_after_tts = resolved_wait and not skip_speak
                 result: dict[str, Any] = {"spoken": spoken, "io_mode": mode}
                 if spoken.get("status") == "barge_in":
-                    # The user talked over the reply. The capture that detected
+                    # The person barged in over the reply. The capture that found
                     # them is still running and already holds their opening words
                     # in its pre-roll, so it *is* the answer — opening a second
                     # listen here would ask them to repeat themselves.
@@ -1933,11 +1933,14 @@ class VoxEngine:
                     if "heard" in result
                     else spoken.get("status")
                 )
-                if overridden and spoken.get("status") != "barge_in":
+                if overridden and spoken.get("status") not in {"barge_in", "cancelled"}:
                     # Beside the transcript, never inside it, and worded as an
-                    # ordinary turn: the agent was not interrupted. A person
-                    # who talked over the reply has already said everything the
-                    # barge-in path reports, so it needs nothing added.
+                    # ordinary turn: the agent was not interrupted. Someone who
+                    # barged in over the reply has already said everything the
+                    # barge-in path reports, so it needs nothing added — and an
+                    # utterance that died says only that it died: the listen it
+                    # planned was never going to run once it was cut off, and a
+                    # floor claimed on it leaves the agent nothing to answer.
                     result["floor_override"] = "taken" if resolved_wait else "declined"
                 result["session"] = self.state.snapshot().to_dict()
                 return result

@@ -504,7 +504,12 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
             "Speak a message locally and optionally listen for one response. "
             "Talk normally, in complete thoughts: do not call other tools between "
             "conversation turns, and put lists, code, and plans in the chat text "
-            "rather than in the spoken message."
+            "rather than in the spoken message. The person can flip who speaks "
+            "next while the message plays: floor_override 'taken' means a "
+            "transcript arrived in 'heard' that you did not ask for, and "
+            "'declined' means they waved off the microphone you did plan — no "
+            "transcript, and nothing failed or timed out. Either way nobody "
+            "interrupted you; answer it as an ordinary turn."
         ),
         annotations=LOCAL_ACTION,
     )

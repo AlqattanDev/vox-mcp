@@ -471,18 +471,19 @@ give back and someone is already talking on both. `capture.elapsed_seconds` on
 every heard result is how long the mic was open, which
 `audio_duration_seconds` never said.
 
-**One hotkey, meaning carried by the gesture** — a permission-free Carbon
-registration on `kVK_ISO_Section` (verified to map to "§" under this machine's
+**One key, meaning carried by the gesture** — permission-free Carbon
+registrations on `kVK_ISO_Section` (verified to map to "§" under this machine's
 ABC layout).
 
 | | |
 |---|---|
 | **⌘§** tapped | Read the selection aloud — tap again to stop. With an agent's mic already open, the tap ends that turn instead |
 | **⌘§** held | Dictate at the cursor; release injects |
+| **⌘⇧§** tapped | While an agent is talking, flip **the floor** — who speaks next — for the utterance playing right now. Any other time it does nothing |
 
 **A tap never opens the microphone; listening happens only while the key is
 held.** That is Ali's rule, verbatim: "speech to text only on hold." The
-tap-to-talk turn key and the separate ⇧⌘§ read combo are gone — live use showed
+tap-to-talk turn key and the old ⇧⌘§ read combo are gone — live use showed
 a shifted combo landing on the tap path and opening the mic on a key pressed to
 *hear* text, which is the exact wrong direction to fail in. Tap and hold are
 told apart by a **350 ms** threshold: nothing happens on key-down, because what
@@ -491,6 +492,15 @@ panel's Reply button); the key's only mic is the hold. The Carbon handler had
 to be rewritten before any of this: it installed one `EventTypeSpec` and
 ignored all three of its arguments, so it could tell neither which hotkey fired
 nor whether the key went down or up.
+
+**The shifted combo is back, for the floor, and cannot repeat that failure.**
+It is its own registration with its own id, Carbon matches modifiers exactly —
+so ⌘⇧§ never reaches the plain binding and ⌘§ keeps every job it has — and the
+handler that could not tell its hotkeys apart is the one already rewritten
+above. It opens no microphone of its own either: it flips a flag the runtime
+reads when the utterance ends, which is why it is a tap with no hold gesture
+and no earcon (the key only ever fires while Vox is talking, so a cue would
+play over its own voice).
 
 **The floating pill** (`macos/VoxHUD.swift`) is a capsule at bottom-centre that
 exists *only* while something is happening, so its presence is the signal and its
@@ -511,6 +521,22 @@ non-destructive multi-reader contract as the mic waveform. Verified live:
 speech frames at 0.5–0.65 with zero-runs exactly at the sentence's commas. A
 file the envelope cannot be read from (the `say` fallback can emit non-PCM)
 yields flat bars, never a failed playback. `VOX_HUD=0` disables.
+
+**The frosted disc tints while the floor is open** — whether the microphone
+follows the utterance playing right now (`/health` serves the one boolean,
+`floor_open`). It draws only while speaking; every other state already has the
+mic open or irrelevant. The colour is the listening red, reused deliberately:
+the sphere keeps saying who is talking, the disc says whether the mic is
+coming, so red means one thing — the microphone — and can say "open" and "about
+to open" without the two competing, because they sit on different objects. The
+**`colorBlendMode` compositing filter is load-bearing, not decoration**: flat
+colour at any alpha lightens the frosted disc and washes it out, while a colour
+blend keeps the disc's own luminance and takes only the hue, which is what a
+coloured filter over dark glass does. The prototype settled on 15%, but it
+judged the tint over a flat dark background; shot against a saturated desktop
+the disc already carries that desktop's hue through the blur and 15% barely
+moved it. **30%** is the least that reads on a busy backdrop while staying a
+wash rather than a ring on a dark one.
 
 **The waveform carries the microphone's real 50 Hz detail at a 12.5 Hz poll.**
 Frames are 20 ms, so levels are measured 50 times a second while the app polls
@@ -568,7 +594,9 @@ user whatever they had actually copied. `tests/conftest.py` fails any test that
 reaches the real `pbcopy`: with the old default, 27 of them did, so running the
 suite left the fixture transcript on the developer's clipboard.
 
-**Accessibility is required** for ⌘§ held and ⇧⌘§. macOS pins TCC grants to the
+**Accessibility is required** for both ⌘§ gestures — the hold posts ⌘V, the tap
+reads the focused element and falls back to ⌘C. ⌘⇧§ needs none: it posts no
+keystrokes and reads no other app. macOS pins TCC grants to the
 code signature, so `build_macos_app.sh` **fails** rather than falling back to
 ad-hoc signing, which would revoke the grant on every install with no error
 anywhere. `VOX_ALLOW_ADHOC_SIGN=1` opts out.
