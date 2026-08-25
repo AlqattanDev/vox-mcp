@@ -51,9 +51,27 @@ final class VoxHUD {
     /// squint at is just a dot.
     private static let size = NSSize(width: 64, height: 64)
 
+    /// The floor indicator: a disc-sized wash over the frosted glass, on when
+    /// the microphone follows the utterance playing and off when it does not.
+    ///
+    /// It sits on the glass rather than on the sphere so the two readings stay
+    /// separate — the sphere keeps saying who is talking, the disc says whether
+    /// the mic is coming. The colour is the listening tint verbatim, so red
+    /// keeps meaning exactly one thing in this app: the microphone.
+    ///
+    /// The prototype settled on 0.15, but it judged the tint over a flat dark
+    /// background. Shot against a saturated desktop the disc already carries
+    /// that desktop's own hue through the blur, and a 15% colour blend barely
+    /// moves it — the two states came out all but identical. 0.30 is the least
+    /// that reads on a busy backdrop while staying a wash rather than a ring
+    /// on a dark one.
+    private static let floorTintAlpha: CGFloat = 0.30
+
     private let panel: HUDPanel
     private let orb = OrbMeterView()
+    private let floorTint = NSView()
     private var state: HUDState?
+    private var floorIndicatorOn = false
     private var onClick: () -> Void = {}
 
     init() {
@@ -94,6 +112,25 @@ final class VoxHUD {
         blur.layer?.masksToBounds = true
         blur.translatesAutoresizingMaskIntoConstraints = false
 
+        // Added before the orb so the sphere draws over it: the sphere is
+        // meant to be bit-for-bit what it is today in both floor states.
+        floorTint.wantsLayer = true
+        floorTint.translatesAutoresizingMaskIntoConstraints = false
+        if let tint = floorTint.layer {
+            tint.backgroundColor = HUDState.listening.tint
+                .withAlphaComponent(VoxHUD.floorTintAlpha).cgColor
+            tint.cornerRadius = VoxHUD.size.height / 2
+            tint.cornerCurve = .continuous
+            // Load-bearing, not decoration. Flat colour at any alpha lightens
+            // the frosted disc and washes it out; a colour blend keeps the
+            // disc's own luminance and takes only the hue, which is what a
+            // coloured filter over dark glass does. Core Animation takes the
+            // CIFilter name with its "CI" dropped and lowercased.
+            tint.compositingFilter = "colorBlendMode"
+            tint.opacity = 0
+        }
+        blur.addSubview(floorTint)
+
         orb.translatesAutoresizingMaskIntoConstraints = false
         blur.addSubview(orb)
 
@@ -107,6 +144,11 @@ final class VoxHUD {
             blur.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             blur.topAnchor.constraint(equalTo: root.topAnchor),
             blur.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            // The wash covers the whole frosted disc, rim included.
+            floorTint.leadingAnchor.constraint(equalTo: blur.leadingAnchor),
+            floorTint.trailingAnchor.constraint(equalTo: blur.trailingAnchor),
+            floorTint.topAnchor.constraint(equalTo: blur.topAnchor),
+            floorTint.bottomAnchor.constraint(equalTo: blur.bottomAnchor),
             // The orb fills the circle, square and centred, with a hair of
             // breathing room to the frosted rim.
             orb.leadingAnchor.constraint(equalTo: blur.leadingAnchor, constant: 3),
@@ -150,7 +192,11 @@ final class VoxHUD {
     /// `levels` is every level the runtime measured since the last poll, oldest
     /// first — a burst, not a single reading, which is what lets the bars carry
     /// the microphone's real ~50 Hz detail at a 12.5 Hz poll rate.
-    func apply(_ next: HUDState?, levels: [CGFloat]) {
+    ///
+    /// `floorOpen` is whether the microphone follows the utterance playing. It
+    /// only draws while Vox is speaking; every other state already has the mic
+    /// either open or irrelevant, and a wash there would say nothing.
+    func apply(_ next: HUDState?, levels: [CGFloat], floorOpen: Bool = false) {
         guard let next else {
             hide()
             return
@@ -160,6 +206,7 @@ final class VoxHUD {
             orb.tint = next.tint
             orb.speaking = next == .speaking
         }
+        setFloorIndicator(floorOpen && next == .speaking)
         // Full-screen terminals (tmux, iTerm) and Space switches can bury the
         // pill after it was first shown. Climb back every poll, not only on
         // the listening/speaking edge.
@@ -185,6 +232,18 @@ final class VoxHUD {
         }
     }
 
+    /// No fade: the person pressed a key and is watching for the answer, and
+    /// nothing else tells them it landed — there is no sound on the press,
+    /// because the key only ever fires while the agent is already talking.
+    private func setFloorIndicator(_ open: Bool) {
+        guard open != floorIndicatorOn else { return }
+        floorIndicatorOn = open
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        floorTint.layer?.opacity = open ? 1 : 0
+        CATransaction.commit()
+    }
+
     private func show() {
         // orderFrontRegardless, never makeKeyAndOrderFront: this must appear
         // without Vox becoming the active application. Call it every poll —
@@ -204,6 +263,7 @@ final class VoxHUD {
 
     private func hide() {
         state = nil
+        setFloorIndicator(false)
         guard panel.alphaValue != 0 || panel.isVisible else { return }
         guard let layer = panel.contentView?.layer else {
             panel.orderOut(nil)

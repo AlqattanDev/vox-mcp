@@ -3,20 +3,26 @@ import AVFoundation
 import Carbon.HIToolbox
 import Foundation
 
-/// The one global hotkey Vox owns, with meaning carried by the gesture.
+/// The global hotkeys Vox owns, with meaning carried by the gesture.
 ///
-/// It lives on **§**, the key left of 1 — `kVK_ISO_Section`, verified to map to
-/// "§" under this machine's layout. Carbon registers it with no permission
+/// Both live on **§**, the key left of 1 — `kVK_ISO_Section`, verified to map to
+/// "§" under this machine's layout. Carbon registers them with no permission
 /// grant at all, which a bare Fn key (Wispr's default) cannot do without an event
-/// tap and Input Monitoring. ⌘ alone is enough for that — extra modifiers buy
-/// nothing here, so a key reached dozens of times a day costs two fingers.
+/// tap and Input Monitoring. Plain ⌘ carries the everyday gesture, so the key
+/// reached dozens of times a day costs two fingers and no more.
 ///
-///   ⌘§ tapped  read the selection aloud — tap again to stop
-///   ⌘§ held    dictate at the cursor, release to inject
+///   ⌘§ tapped   read the selection aloud — tap again to stop
+///   ⌘§ held     dictate at the cursor, release to inject
+///   ⌘⇧§ tapped  flip the floor for the utterance playing right now
 ///
 /// A tap never opens the microphone. Listening happens only while the key is
 /// held — the user's rule, stated exactly: "speech to text only on hold."
 /// `holdThreshold` is what tells the two gestures apart.
+///
+/// The floor lives on its own key rather than sharing ⌘§, because cancelling an
+/// utterance and taking the floor are opposite intentions: one throws the
+/// utterance away, the other lets it finish untouched. Carbon matches modifiers
+/// exactly, so ⌘⇧§ never fires the plain binding and ⌘§ keeps every job today.
 struct HotKeyBinding {
     let id: UInt32
     let keyCode: UInt32
@@ -35,7 +41,16 @@ struct HotKeyBinding {
         label: "⌘§"
     )
 
-    static let all: [HotKeyBinding] = [.voice]
+    /// Take or decline the floor. Tap only — there is no hold gesture here, so
+    /// it acts on the press and the release is ignored.
+    static let floor = HotKeyBinding(
+        id: 2,
+        keyCode: UInt32(kVK_ISO_Section),
+        modifiers: UInt32(cmdKey | shiftKey),
+        label: "⌘⇧§"
+    )
+
+    static let all: [HotKeyBinding] = [.voice, .floor]
 }
 
 /// Reads whatever text is selected in the frontmost app.
@@ -365,6 +380,19 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // The mic is open *during* playback so speaking over Vox interrupts it.
     // Distinct from plain listening: the agent is still talking.
     private var micArmedForBargeIn = false
+    // Whether the microphone follows the utterance currently playing — the one
+    // thing the floor indicator draws. The runtime owns it and reports it false
+    // whenever nothing is speaking, so this needs no clearing of its own.
+    private var floorOpen = false
+    /// The runtime publishes state as a string; three separate gestures turn on
+    /// this one reading of it, so it is spelled out once.
+    private var isSpeaking: Bool { state.lowercased() == "speaking" }
+    /// When the floor was last set from a toggle's own answer. A health poll
+    /// issued before that moment saw the old floor, so its `floor_open` is
+    /// stale however late it lands — and applying it would blank the tint for a
+    /// frame, which is the only confirmation the person gets that the key
+    /// landed at all.
+    private var floorSettledAt = Date.distantPast
     private var lastStopReason: String?
     private var ioMode = "talk"
     private let baseURL = URL(string: "http://127.0.0.1:8766")!
@@ -425,7 +453,7 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             guard let self else { return }
             // While Vox is speaking the pill shows a stop glyph, so a click on
             // it stops the read — the same thing ⌘§ does mid-speech.
-            if self.state.lowercased() == "speaking" {
+            if self.isSpeaking {
                 self.sendControl("cancel", notice: "Stopped reading.", serialized: false)
                 return
             }
@@ -500,6 +528,10 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         switch id {
         case HotKeyBinding.voice.id:
             if pressed { voiceKeyDown() } else { voiceKeyUp() }
+        case HotKeyBinding.floor.id:
+            // Tap only: act on the way down and let the release go by, so a
+            // key held down by accident is still one flip and not two.
+            if pressed { floorKeyTapped() }
         default:
             return
         }
@@ -541,7 +573,7 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // Speaking → stop it. An agent's mic already open → end that turn (which
     // closes a gate, never opens one). Otherwise → read the selection aloud.
     private func voiceKeyTapped() {
-        if state.lowercased() == "speaking" {
+        if isSpeaking {
             sendControl("cancel", notice: "Stopped reading.", serialized: false)
             return
         }
@@ -570,6 +602,58 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             extra: ["text": selection],
             serialized: false
         )
+    }
+
+    // ⌘⇧§: flip who speaks next for the utterance playing right now.
+    //
+    // It only means something while Vox is talking, so any other time it does
+    // nothing at all — no request, no notice, no state the person cannot see.
+    // Nothing audible either: the key only ever fires while the agent is
+    // speaking, and an earcon would play over its own voice.
+    private func floorKeyTapped() {
+        guard isSpeaking else { return }
+        sendFloorToggle()
+    }
+
+    /// Ask the runtime to flip the floor, and take the answer as the truth.
+    ///
+    /// Deliberately not `sendControl`: this one's body says which way the floor
+    /// ended up, which is both the notice's wording and — until the next poll
+    /// lands — what the pill draws. It is never serialised, because a flip
+    /// swallowed by a control still in flight would leave the person looking at
+    /// an indicator that disagrees with the key they just pressed.
+    ///
+    /// A read-aloud has no agent on the other end, so no floor is ever on air
+    /// for one; the runtime answers `not_speaking` and nothing changes here.
+    private func sendFloorToggle() {
+        // A flag flip, answered without touching the utterance — if this is
+        // slow, something is wrong, and waiting the full control timeout would
+        // only delay a pill the person is watching.
+        let request = controlRequest("toggle_floor", timeout: 3.0)
+        URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                guard
+                    let result = VoxAppDelegate.controlResult(data),
+                    (result["status"] as? String) == "floor_toggled",
+                    let open = result["floor_open"] as? Bool
+                else {
+                    // Nothing was speaking after all, or the runtime could not
+                    // be reached. Either way the floor is where it was.
+                    return
+                }
+                self.floorOpen = open
+                self.floorSettledAt = Date()
+                // Past tense on purpose: notices in this panel are never
+                // cleared, and one worded as a promise about the utterance
+                // would go on making it long after that utterance ended.
+                self.actionNotice =
+                    open
+                    ? "You took the floor for that utterance."
+                    : "You declined the floor for that utterance."
+                self.updatePresentation()
+            }
+        }.resume()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -846,6 +930,9 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         var request = URLRequest(url: url)
         request.timeoutInterval = 1.0
+        // When this poll asked its question, so a late answer can be told from
+        // a current one.
+        let issuedAt = Date()
         URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
             guard let self else { return }
             DispatchQueue.main.async {
@@ -875,6 +962,15 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 // tap from leaving the toggle inverted forever.
                 self.gateOpen = (payload["gate_open"] as? Bool) ?? self.microphoneOpen
                 self.micArmedForBargeIn = (payload["mic_armed_for_barge_in"] as? Bool) ?? false
+                // Read back every poll for the same reason the gate is: the key
+                // only asks for the flip, and the runtime's answer is the one
+                // that decides what the pill says. A poll already in flight
+                // when the flip landed is the one exception — it answers about
+                // the floor as it was, and at the pill's 80 ms cadence it can
+                // arrive after the toggle's own answer.
+                if issuedAt > self.floorSettledAt {
+                    self.floorOpen = (payload["floor_open"] as? Bool) ?? false
+                }
                 // The device, as distinct from the gate. A stream open with the
                 // gate shut is the warm-up window: the macOS microphone
                 // indicator is lit but nothing can be heard yet.
@@ -999,7 +1095,13 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // the panel — is on screen, and fall back to the light glyph-tracking
         // cadence the moment neither is.
         let hudShowing = hudEnabled ? hudState(normalized: normalized) : nil
-        if hudEnabled { hud.apply(hudShowing, levels: hudShowing == .speaking ? ttsBurst : burst) }
+        if hudEnabled {
+            hud.apply(
+                hudShowing,
+                levels: hudShowing == .speaking ? ttsBurst : burst,
+                floorOpen: floorOpen
+            )
+        }
         setPollInterval(hudShowing != nil || popover.isShown ? 0.08 : 0.4)
 
         detailLabel.stringValue = meterCaption(normalized)
@@ -1169,6 +1271,36 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         return detail
     }
 
+    /// Every control goes to the same route with the same headers; only the
+    /// action, the body and how long it is worth waiting differ.
+    private func controlRequest(_ action: String, timeout: TimeInterval, extra: [String: Any] = [:])
+        -> URLRequest
+    {
+        var request = URLRequest(url: baseURL.appendingPathComponent("control"))
+        request.httpMethod = "POST"
+        request.timeoutInterval = timeout
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("status-bar", forHTTPHeaderField: "X-Vox-Control-Source")
+        if let token = controlToken() {
+            request.setValue(token, forHTTPHeaderField: "X-Vox-Token")
+        }
+        var payload: [String: Any] = ["action": action]
+        payload.merge(extra) { _, new in new }
+        request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+        return request
+    }
+
+    /// The `result` object a control answers with, or nil if the runtime could
+    /// not be reached or refused. Two senders read their own body; the rest
+    /// discard it.
+    private static func controlResult(_ data: Data?) -> [String: Any]? {
+        guard
+            let data,
+            let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return payload["result"] as? [String: Any]
+    }
+
     /// - Parameter serialized: pass `false` for hotkey-driven controls. The
     ///   in-flight guard exists so panel buttons cannot be double-fired, but a
     ///   turn key whose second tap gets swallowed leaves the microphone open
@@ -1185,20 +1317,10 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         actionNotice = notice
         updatePresentation()
-        var request = URLRequest(url: baseURL.appendingPathComponent("control"))
-        request.httpMethod = "POST"
         // Stop/pause wait up to ~3s for the mic to close server-side. A 2s
         // client timeout made Stop look broken while the runtime was still
         // finishing the privacy shutdown.
-        request.timeoutInterval = 6.0
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("status-bar", forHTTPHeaderField: "X-Vox-Control-Source")
-        if let token = try? String(contentsOf: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".vox/control.token"), encoding: .utf8) {
-            request.setValue(token.trimmingCharacters(in: .whitespacesAndNewlines), forHTTPHeaderField: "X-Vox-Token")
-        }
-        var payload: [String: Any] = ["action": action]
-        payload.merge(extra) { _, new in new }
-        request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+        let request = controlRequest(action, timeout: 6.0, extra: extra)
         URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -1222,27 +1344,16 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }.resume()
     }
 
-    /// The one control whose *body* matters. Every other sender discards the
-    /// response — dictation has to get the transcript back so it can be typed
-    /// where the user is looking.
+    /// Dictation has to get the transcript back so it can be typed where the
+    /// user is looking — one of the two controls whose *body* matters, the
+    /// other being the floor toggle. Every other sender discards the response.
     private func sendDictationEnd(completion: @escaping (String?) -> Void) {
-        var request = URLRequest(url: baseURL.appendingPathComponent("control"))
-        request.httpMethod = "POST"
         // Whisper small on a two-minute hold is the worst case this has to
         // survive; the shared 6s ceiling would abandon the transcript.
-        request.timeoutInterval = 30.0
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("status-bar", forHTTPHeaderField: "X-Vox-Control-Source")
-        if let token = controlToken() {
-            request.setValue(token, forHTTPHeaderField: "X-Vox-Token")
-        }
-        request.httpBody = try? JSONSerialization.data(withJSONObject: ["action": "dictate_end"])
+        let request = controlRequest("dictate_end", timeout: 30.0)
         URLSession.shared.dataTask(with: request) { data, _, _ in
             guard
-                let data,
-                let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                let result = payload["result"] as? [String: Any],
-                let text = result["text"] as? String,
+                let text = VoxAppDelegate.controlResult(data)?["text"] as? String,
                 !text.isEmpty
             else {
                 DispatchQueue.main.async { completion(nil) }

@@ -39,6 +39,7 @@ burning with no honest meaning.
 | `listen` | Opens for one bounded turn | Open for the turn |
 | **⌘§** held | Open for exactly as long as the key is down | Open for the hold |
 | **⌘§** tapped | Shut — read-aloud never listens; with an agent's mic already open the tap shuts it and submits the turn | **Closed** |
+| **⌘⇧§** tapped, mid-utterance | Unchanged now; the floor it flips decides whether the gate opens when that utterance ends | Unchanged now |
 | The user says a short standalone “wait” phrase | Shut during the wait, then reopened for a fresh bounded turn | Open |
 | No speech arrives within the 5 s onset timeout | Shut; session remains `IDLE` | Released |
 | Speech ends | Shut after adaptive trailing silence | Released |
@@ -183,6 +184,9 @@ itself on.
 On speakers a **⌘§ tap** (or the panel) is the interruption path: same
 outcome, no acoustics involved.
 
+Taking the floor is the other thing you can do while Vox talks, and it is not
+an interruption at all — see *The floor*, below.
+
 Off by default. `VOX_BARGE_IN_ENABLED=1` opens the microphone alongside
 playback so interrupting is something you *do* rather than a button you press.
 Start talking and the sentence being spoken stops mid-word, the rest of the
@@ -255,10 +259,52 @@ escalates back to the agent rather than taking the voice turn down.
 | “Wait” / “give me a second” | Closes the mic, waits, then listens again |
 | Escape or `voice_control(cancel)` | Cancels only the current turn; voice mode remains active |
 | Manual end-of-turn | Closes the current recording immediately and transcribes what was captured |
+| **⌘⇧§** mid-utterance | Takes the floor, or declines it — see *The floor*, below |
 
 Spoken controls are recognized only as short standalone utterances. A long
 dictation containing the words “stop voice mode” is treated as content, not a
 control command.
+
+## The floor
+
+Who speaks next when the current utterance ends. The agent decides it when it
+makes the call — a `converse` that waits plans to hand it over, a `speak` does
+not — and until now that decision was invisible and final.
+
+**⌘⇧§** flips it for the utterance playing right now. It never stops the
+utterance: the rest of it plays exactly as it would have, and all that changes
+is the moment it ends.
+
+| Before the key | After it |
+|---|---|
+| No listen planned | The person **takes the floor**; the mic opens as the utterance ends |
+| A listen planned | The person **declines the floor**; the work carries straight on |
+
+One-shot, and one utterance only. Press twice and it is as if you never pressed;
+the next utterance starts from the agent's own plan again. Pressed while nothing
+is speaking, or during a **⌘§** read-aloud — which has no agent on the other end
+to deliver anything to — it does nothing at all.
+
+Nothing is audible on the press, because the key only ever fires while the agent
+is already talking. What answers instead is the **floor indicator**: the pill's
+frosted disc takes on the same red that already means *microphone* everywhere
+else in Vox, and drops it again when the floor closes. The sphere is untouched —
+it goes on saying who is talking, while the disc says whether the mic is coming.
+
+The agent is told afterwards, beside what was said rather than inside it, and
+worded as an ordinary turn:
+
+    floor_override: "taken"     # a listen it did not plan; the transcript is there
+    floor_override: "declined"  # a listen it did plan; there is no transcript
+
+Absent means its own plan ran. An utterance whose floor was closed still reports
+a **completed** turn, never a cancelled one — declining to speak is not an error,
+and nothing was interrupted.
+
+Barge-in still beats the flag: someone who declines the floor and then talks over
+Vox anyway has made their intention unmistakable, and that path wins. Wanting the
+mic open for a whole session is still what **narrate** mode is for; this key stays
+one-shot.
 
 ## Shared session (no exclusive owner)
 
