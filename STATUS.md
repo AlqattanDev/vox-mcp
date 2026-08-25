@@ -558,12 +558,15 @@ structurally, not as a promise: `_speak_locked` takes `barge_in=False` by defaul
 and only `converse`'s reply passes `True`. Verified live across a whole spoken
 reply: zero `capture.stream_opened`, zero `barge_in.armed`.
 
-**Everything heard is left on the clipboard.** Dictation stops restoring the
-previous pasteboard, and a spoken transcript is copied from `_record_heard` via
-`pbcopy` (`VOX_CLIPBOARD_TRANSCRIPT=0` opts out). A paste into a surface with no
-editable field silently goes nowhere and the words were simply gone; now the
-fallback is always ⌘V. Skipped for `deliver_text`, which the user typed and
-already has.
+**Dictated text is left on the clipboard**, which is the keybinding's own
+recovery story: a paste into a surface with no editable field silently goes
+nowhere and the words were simply gone, so dictation stops restoring the
+previous pasteboard and the fallback is always ⌘V. Conversational turns are
+**not** copied — `_record_heard` is opt-in behind `VOX_CLIPBOARD_TRANSCRIPT=1`,
+because taking the clipboard for every sentence spoken to an agent costs the
+user whatever they had actually copied. `tests/conftest.py` fails any test that
+reaches the real `pbcopy`: with the old default, 27 of them did, so running the
+suite left the fixture transcript on the developer's clipboard.
 
 **Accessibility is required** for ⌘§ held and ⇧⌘§. macOS pins TCC grants to the
 code signature, so `build_macos_app.sh` **fails** rather than falling back to
@@ -577,7 +580,7 @@ loopback — test capture by speaking.
 `/control` actions: `gate_open`, `gate_close`, `dictate_start`, `dictate_end`,
 `read_aloud`. Knobs: `VOX_PERSISTENT_CAPTURE` (1),
 `VOX_STREAM_OPEN_GUARD_SECONDS` (1.0), `VOX_STREAM_IDLE_RELEASE_SECONDS` (2.0),
-`VOX_CLIPBOARD_TRANSCRIPT` (1), `VOX_HUD` (1), `VOX_DICTATION_CLEANUP`
+`VOX_CLIPBOARD_TRANSCRIPT` (0), `VOX_HUD` (1), `VOX_DICTATION_CLEANUP`
 (`rules`), `VOX_DICTATION_MAX_SECONDS` (120). `/health` carries `gate_open` and
 `stream_open`, which are not the same thing, plus `mic_levels` +
 `mic_levels_seq` for the mic waveform (`?levels_since=N`) and `tts_levels` +

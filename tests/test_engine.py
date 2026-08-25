@@ -2270,8 +2270,15 @@ async def test_reading_aloud_never_opens_the_microphone(tmp_path: Path):
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(30)
-async def test_what_was_said_is_left_on_the_clipboard(tmp_path: Path):
-    """So a turn that landed nowhere is still recoverable with ⌘V."""
+async def test_talking_to_an_agent_does_not_take_the_clipboard(tmp_path: Path):
+    """Ali's clipboard was every sentence he had ever said to an agent.
+
+    The recovery story this was written for belongs to the keybinding: ⌘§ held
+    pastes at the cursor and leaves the words there, so a paste that landed in
+    no editable field is still a ⌘V away. A conversational turn has nowhere it
+    was trying to land — the agent asked, and the agent heard the answer — so
+    copying it only costs the user whatever they had actually copied.
+    """
 
     engine, _ = make_live_engine(tmp_path)
     copied: list[bytes] = []
@@ -2279,7 +2286,7 @@ async def test_what_was_said_is_left_on_the_clipboard(tmp_path: Path):
     try:
         result = await engine.listen("claude")
         assert result["transcript"] == "hello world"
-        assert copied == [b"hello world"]
+        assert copied == []
     finally:
         await engine.session("http-control", "stop")
 
@@ -2290,6 +2297,7 @@ async def test_typed_text_does_not_clobber_the_clipboard(tmp_path: Path):
     """Text the user typed is already theirs; taking their clipboard for it is rude."""
 
     engine, _ = make_live_engine(tmp_path)
+    engine._clipboard_transcript = True
     copied: list[bytes] = []
     engine._clipboard_runner = lambda argv, payload: copied.append(payload)
     try:
@@ -2306,14 +2314,16 @@ async def test_typed_text_does_not_clobber_the_clipboard(tmp_path: Path):
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(30)
-async def test_the_clipboard_hand_off_can_be_switched_off(tmp_path: Path):
+async def test_the_clipboard_hand_off_can_be_switched_back_on(tmp_path: Path):
+    """VOX_CLIPBOARD_TRANSCRIPT=1 restores it for anyone who wants it."""
+
     engine, _ = make_live_engine(tmp_path)
-    engine._clipboard_transcript = False
+    engine._clipboard_transcript = True
     copied: list[bytes] = []
     engine._clipboard_runner = lambda argv, payload: copied.append(payload)
     try:
         await engine.listen("claude")
-        assert copied == []
+        assert copied == [b"hello world"]
     finally:
         await engine.session("http-control", "stop")
 

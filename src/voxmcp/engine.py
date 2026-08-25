@@ -227,11 +227,15 @@ class VoxEngine:
         self._stream_idle_release_s = max(
             0.0, float(os.environ.get("VOX_STREAM_IDLE_RELEASE_SECONDS", "2.0"))
         )
-        # Leave every spoken transcript on the clipboard, so a dictation that
-        # landed in no text field at all is still recoverable with ⌘V.
+        # Off by default: a conversational turn is not going anywhere the user
+        # has to paste it. The recovery story belongs to the keybinding — ⌘§
+        # held pastes at the cursor and leaves the words on the pasteboard, so
+        # a paste into a surface with no editable field is still a ⌘V away —
+        # and taking the clipboard for every sentence spoken to an agent just
+        # means whatever the user actually copied is gone.
         self._clipboard_transcript = os.environ.get(
-            "VOX_CLIPBOARD_TRANSCRIPT", "1"
-        ).strip().lower() not in {"0", "false", "no", "off"}
+            "VOX_CLIPBOARD_TRANSCRIPT", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
         # Overridden by tests so the suite never writes to the real clipboard.
         self._clipboard_runner: ClipboardRunner | None = None
         # Hold-to-talk dictation. The cap is a backstop for a key that never
@@ -1726,9 +1730,10 @@ class VoxEngine:
             self._clipboard_transcript
             and capture.reason is not CaptureStopReason.DELIVERED_TEXT
         ):
-            # Everything spoken is left on the clipboard, so a turn the user
-            # meant to land somewhere can always be pasted by hand. Skipped for
-            # delivered text, which the user typed and already has.
+            # Opt-in (VOX_CLIPBOARD_TRANSCRIPT=1): every spoken turn is left on
+            # the clipboard, so one the user meant to land somewhere can be
+            # pasted by hand. Skipped for delivered text, which the user typed
+            # and already has.
             copy_to_clipboard(transcript, runner=self._clipboard_runner)
         return transcript, turn_id, classify_spoken_intent(transcript)
 

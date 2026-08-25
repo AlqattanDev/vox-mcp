@@ -153,11 +153,12 @@ agent host closed:
   agent that is already speaking rather than talking over it. It never opens the
   microphone.
 
-Anything Vox hears is **left on your clipboard** — the dictated text after it is
-pasted at the cursor, and the transcript of a spoken turn
-(`VOX_CLIPBOARD_TRANSCRIPT=0` to opt out). A paste into a surface with no
-editable field silently goes nowhere; leaving the words on the clipboard means
-the fallback is always ⌘V.
+**Dictated text is left on your clipboard** after it is pasted at the cursor. A
+paste into a surface with no editable field silently goes nowhere; leaving the
+words there means the fallback is always ⌘V. Only the keybinding does this —
+what you say in conversation with an agent is not copied, because it is not
+going anywhere you would have to paste it (`VOX_CLIPBOARD_TRANSCRIPT=1` puts
+spoken transcripts on the clipboard too).
 
 ## Permissions
 
