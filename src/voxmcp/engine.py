@@ -103,6 +103,7 @@ class Floor:
 
     planned: bool
     overridden: bool = False
+    immediate: bool = False
 
     @property
     def open(self) -> bool:
@@ -334,7 +335,10 @@ class VoxEngine:
             audio_root = Path(audio_tempdir.name)
         store = AudioStore(audio_root, replay_items=8, ttl_hours=24)
         capture = CaptureConfig(
-            onset_timeout_s=float(os.environ.get("VOX_ONSET_TIMEOUT_SECONDS", "5")),
+            # Five seconds is the shortest useful reply window. Hosts have
+            # historically supplied one second here, which made silence look
+            # like the person had declined before they could begin speaking.
+            onset_timeout_s=max(5.0, float(os.environ.get("VOX_ONSET_TIMEOUT_SECONDS", "5"))),
             trailing_silence_s=float(os.environ.get("VOX_TRAILING_SILENCE_SECONDS", "1.6")),
             short_trailing_silence_s=float(
                 os.environ.get("VOX_SHORT_TRAILING_SILENCE_SECONDS", "0.6")
@@ -550,6 +554,24 @@ class VoxEngine:
             self._floor = floor
         self._log("floor.toggled", client_id=client_id, floor_open=floor.open)
         return {"status": "floor_toggled", "floor_open": floor.open}
+
+    def _take_floor_now(self, client_id: str) -> dict[str, Any]:
+        """End the utterance on air, retaining an already-planned reply listen.
+
+        This is deliberately distinct from cancel: the turn key means "I am
+        done hearing this", not "throw the whole turn away".  A narration has
+        no reply window to preserve, so it simply stops and never replays.
+        """
+
+        with self._active_lock:
+            floor = self._floor
+            if floor is None:
+                return {"status": "not_speaking", "listening": False}
+            listening = floor.open
+            self._floor = replace(floor, immediate=listening)
+        self._signal_cancel(manual_end=False, cancel_task=False)
+        self._log("floor.taken_now", client_id=client_id, listening=listening)
+        return {"status": "floor_taken", "listening": listening}
 
     async def _run_operation(
         self,
@@ -1745,10 +1767,11 @@ class VoxEngine:
                 # not start speaking within it, the listen returns no_speech fast
                 # instead of holding the mic open, so a declined reply closes
                 # itself rather than hanging.
-                onset_timeout_s=(
+                onset_timeout_s=max(
+                    5.0,
                     onset_timeout
                     if onset_timeout is not None
-                    else self.recorder.config.onset_timeout_s
+                    else self.recorder.config.onset_timeout_s or 5.0,
                 ),
             )
             selected_recorder = AudioRecorder(capture_config)
@@ -1897,6 +1920,8 @@ class VoxEngine:
         agent: str | None = None,
         **_: Any,
     ) -> dict[str, Any]:
+        if onset_timeout is not None:
+            onset_timeout = max(5.0, onset_timeout)
         mode = self._io_mode
         # Session io_mode is the panel/user preference; it wins over the caller's
         # wait_for_response when it forces narrate (no mic) or dictate (no TTS).
@@ -1914,7 +1939,7 @@ class VoxEngine:
                         "backend": None,
                         "elapsed_ms": 0,
                     }
-                    resolved_wait, overridden = effective_wait, False
+                    resolved_wait, overridden, immediate = effective_wait, False, False
                 else:
                     self._open_floor(planned=effective_wait)
                     spoken = await self._speak_locked(
@@ -1933,7 +1958,11 @@ class VoxEngine:
                     # Whatever the floor says now that the utterance has ended
                     # is what happens — the plan only decided where it started.
                     floor = self._close_floor()
-                    resolved_wait, overridden = floor.open, floor.overridden
+                    resolved_wait, overridden, immediate = (
+                        floor.open,
+                        floor.overridden,
+                        floor.immediate,
+                    )
                 # A claimed floor is still a listen that follows our own TTS,
                 # so it skips the cold-open guard and chime like a planned one.
                 self._hot_listen_after_tts = resolved_wait and not skip_speak
@@ -1945,7 +1974,7 @@ class VoxEngine:
                     # listen here would ask them to repeat themselves.
                     result["barge_in"] = True
                     result["heard"] = await self._harvest_barge_in(client_id, language=language)
-                elif resolved_wait and spoken.get("status") != "cancelled":
+                elif resolved_wait and (spoken.get("status") != "cancelled" or immediate):
                     result["heard"] = await self._listen_locked(
                         client_id,
                         listen_duration_max=listen_duration_max,
@@ -2015,7 +2044,7 @@ class VoxEngine:
                 # happens; a narration only ever started it closed.
                 floor = self._close_floor()
                 result: dict[str, Any] = {**spoken, "io_mode": self._io_mode}
-                if floor.open and spoken.get("status") != "cancelled":
+                if floor.open and (spoken.get("status") != "cancelled" or floor.immediate):
                     # The microphone opens inside this still-open call rather
                     # than the answer being held as a note until the agent's
                     # next action, which would make the person wait to be
@@ -2569,6 +2598,8 @@ class VoxEngine:
             # A flag flip, so it answers immediately: it must never stop the
             # utterance, and the person is waiting to see the pill change.
             return self._toggle_floor(client_id)
+        if action == "take_floor":
+            return self._take_floor_now(client_id)
         if action == "gate_open":
             return await self._gate_open(client_id)
         if action == "gate_close":

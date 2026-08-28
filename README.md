@@ -26,10 +26,10 @@ loopback address; Vox refuses to start if they do not.
   microphone indicator is lit only when Vox can genuinely hear you.
 - Global hotkeys that work in any app and need no permission grant, because
   Carbon hotkeys need none: **⌘§** held dictates at the cursor, **⌘§** tapped
-  reads the selection aloud, and **⌘⇧§** — while an agent is talking — flips
+  takes the floor immediately while an agent is talking (otherwise it reads
+  the selection aloud), and **⌘⇧§** — while an agent is talking — flips
   **the floor**, meaning who speaks next: it claims the microphone for the
-  moment that utterance ends, or waves off one you were about to be offered. A tap never opens the
-  microphone; listening happens only while the key is held.
+  moment that utterance ends, or waves off one you were about to be offered.
 - A floating pill at the bottom of the screen that appears only while Vox is
   warming up, listening, dictating, or speaking, with a live waveform of your
   actual microphone level.
@@ -154,6 +154,11 @@ agent host closed:
   number, a name, or a line of code. Tap again to stop. It queues behind an
   agent that is already speaking rather than talking over it. It never opens the
   microphone.
+
+While an agent utterance is playing, the same tap instead takes the floor now:
+it stops the utterance and immediately opens the already-planned reply listen.
+For a narration that did not plan a reply, it simply stops; it never replays
+the utterance.
 
 **Dictated text is left on your clipboard** after it is pasted at the cursor. A
 paste into a surface with no editable field silently goes nowhere; leaving the

@@ -26,7 +26,8 @@ _Avoid_: interrupt, talk-over
 
 **Cancel**:
 The person stopping an utterance with no intention of answering it. Reserved for
-"stop, that was wrong" — never used to describe wanting to speak.
+"stop, that was wrong". The explicit Cancel control has this meaning; the ⌘§
+turn key is not Cancel when an agent utterance is playing.
 _Avoid_: interrupt, abort
 
 ### The floor

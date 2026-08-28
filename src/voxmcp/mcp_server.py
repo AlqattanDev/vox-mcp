@@ -454,6 +454,7 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
             "gate_open",
             "gate_close",
             "toggle_floor",
+            "take_floor",
         }:
             return await _invoke(
                 current_engine(),
@@ -981,6 +982,7 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
             "gate_open",
             "gate_close",
             "toggle_floor",
+            "take_floor",
             "dictate_start",
             "dictate_end",
             "read_aloud",

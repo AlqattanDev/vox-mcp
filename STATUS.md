@@ -212,15 +212,15 @@ Package is `src/voxmcp/`.
   Turn-off/Restart/Open-folder controls. Sleep/inactivity auto-pause unchanged.
 - **User-decided replies.** Turn-taking is the user's call, not only the
   agent's. **(1) Reply window:** `converse`/`listen` take `onset_timeout` — a
-  short value (~4s) opens the mic for a beat after the agent speaks and returns
-  `no_speech` fast on silence, so a conversational turn offers a reply without a
+  value clamped to **at least 5s** opens the mic for a beat after the agent
+  speaks and returns `no_speech` on silence, so a conversational turn offers a reply without a
   hanging mic. The skill tells agents to end back-and-forth turns this way and
   reserve bare `speak` for a true sign-off. **(2) Reply on demand:** the panel
   **Reply** button (idle primary) grabs the mic and answers whoever last spoke —
   `reply` control → `engine.reply` auto-targets `last_spoken_agent` (tracked in
   `_speak_locked`, exposed on `/health`) and delivers via the note path, so it
   surfaces as that agent's `undelivered_heard` on its next turn. The ⌘§ tap
-  deliberately does not do this: a tap never opens the mic. The agent-picker
+  takes the floor only during a live agent utterance. The agent-picker
   note moved into **More…**. Inherent limit: a reply after a full sign-off waits
   for the agent's next action (host-injection is the `deliver_text` PLAN item).
 - **Type instead of talking, without waiting the mic out.** `deliver_text` ends
@@ -477,12 +477,12 @@ ABC layout).
 
 | | |
 |---|---|
-| **⌘§** tapped | Read the selection aloud — tap again to stop. With an agent's mic already open, the tap ends that turn instead |
+| **⌘§** tapped | While an agent speaks, take the floor now: cut its utterance short and open its planned reply listen. Otherwise read the selection aloud — tap again to stop |
 | **⌘§** held | Dictate at the cursor; release injects |
 | **⌘⇧§** tapped | While an agent is talking, flip **the floor** — who speaks next — for the utterance playing right now. Any other time it does nothing |
 
-**A tap never opens the microphone; listening happens only while the key is
-held.** That is Ali's rule, verbatim: "speech to text only on hold." The
+**A tap opens the microphone only when it cuts an utterance that already planned
+a reply listen; otherwise listening happens only while the key is held.** The
 tap-to-talk turn key and the old ⇧⌘§ read combo are gone — live use showed
 a shifted combo landing on the tap path and opening the mic on a key pressed to
 *hear* text, which is the exact wrong direction to fail in. Tap and hold are

@@ -1012,9 +1012,10 @@ async def test_user_note_skips_the_stream_open_guard(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_converse_onset_timeout_flows_into_capture(tmp_path: Path):
-    # The reply window is a short onset_timeout; it must reach the recorder so a
-    # declined reply closes fast instead of holding the mic for the full onset.
+async def test_converse_never_shortens_the_reply_window_below_five_seconds(tmp_path: Path):
+    # A host may guess at this parameter, but a one-second reply window is not
+    # long enough for a person to answer an agent.  The public contract is five
+    # seconds minimum, measured from when the capture actually starts.
     engine = make_engine(tmp_path)
     captured: dict[str, float] = {}
     original = engine._listen_locked
@@ -1024,8 +1025,8 @@ async def test_converse_onset_timeout_flows_into_capture(tmp_path: Path):
         return await original(client_id, **kwargs)
 
     engine._listen_locked = spy  # type: ignore[assignment]
-    await engine.converse("claude", "hi", onset_timeout=3.0)
-    assert captured["onset_timeout"] == 3.0
+    await engine.converse("claude", "hi", onset_timeout=1.0)
+    assert captured["onset_timeout"] == 5.0
 
 
 @pytest.mark.asyncio
@@ -2580,6 +2581,39 @@ async def test_declining_the_floor_completes_the_turn_without_listening(tmp_path
     assert "heard" not in result
     assert result["floor_override"] == "declined"
     assert result["status"] == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_taking_the_floor_now_cuts_a_planned_reply_short_and_listens(tmp_path: Path):
+    """The turn key is not a replay request: it hands the live reply to us."""
+
+    engine = make_engine(tmp_path, player=HeldPlayer())
+    turn = asyncio.create_task(engine.converse("claude", "Long explanation."))
+    await _await_event(engine.player.started)
+
+    pressed = await engine.control("panel", "take_floor")
+    result = await turn
+
+    assert pressed == {"status": "floor_taken", "listening": True}
+    assert result["spoken"]["status"] == "cancelled"
+    assert result["heard"]["transcript"] == "hello world"
+    assert result["status"] == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_taking_the_floor_now_cuts_narration_short_without_listening(tmp_path: Path):
+    engine = make_engine(tmp_path, player=HeldPlayer())
+    turn = asyncio.create_task(engine.speak("claude", "Long narration."))
+    await _await_event(engine.player.started)
+
+    pressed = await engine.control("panel", "take_floor")
+    result = await turn
+
+    assert pressed == {"status": "floor_taken", "listening": False}
+    assert result["status"] == "cancelled"
+    assert "heard" not in result
 
 
 @pytest.mark.asyncio

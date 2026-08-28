@@ -38,7 +38,8 @@ burning with no honest meaning.
 | `converse(...)` with barge-in enabled | Armed *during* playback, gated against Vox's own voice, so talking interrupts | Open, shared with the listen that follows |
 | `listen` | Opens for one bounded turn | Open for the turn |
 | **⌘§** held | Open for exactly as long as the key is down | Open for the hold |
-| **⌘§** tapped | Shut — read-aloud never listens; with an agent's mic already open the tap shuts it and submits the turn | **Closed** |
+| **⌘§** tapped, mid-agent utterance with reply planned | Opens immediately after cutting the utterance short | Open for the reply turn |
+| **⌘§** tapped otherwise | Shut — read-aloud never listens | **Closed** |
 | **⌘⇧§** tapped, mid-utterance | Unchanged now; the floor it flips decides whether the gate opens when that utterance ends | Unchanged now |
 | The user says a short standalone “wait” phrase | Shut during the wait, then reopened for a fresh bounded turn | Open |
 | No speech arrives within the 5 s onset timeout | Shut; session remains `IDLE` | Released |
@@ -181,8 +182,9 @@ that session; `vox set` refuses to write the key, because an override that
 outlives the experiment turns every reply into an echo the agent interrupts
 itself on.
 
-On speakers a **⌘§ tap** (or the panel) is the interruption path: same
-outcome, no acoustics involved.
+On speakers a **⌘§ tap** is the turn-taking path: it cuts the agent utterance
+and opens its planned reply listen, with no acoustics involved. The panel's
+Cancel remains an actual cancellation.
 
 Taking the floor is the other thing you can do while Vox talks, and it is not
 an interruption at all — see *The floor*, below.

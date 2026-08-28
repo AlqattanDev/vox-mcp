@@ -12,18 +12,17 @@ import IOKit.pwr_mgt
 /// tap and Input Monitoring. Plain ⌘ carries the everyday gesture, so the key
 /// reached dozens of times a day costs two fingers and no more.
 ///
-///   ⌘§ tapped   read the selection aloud — tap again to stop
+///   ⌘§ tapped   read the selection aloud; while an agent speaks, take the floor now
 ///   ⌘§ held     dictate at the cursor, release to inject
 ///   ⌘⇧§ tapped  flip the floor for the utterance playing right now
 ///
-/// A tap never opens the microphone. Listening happens only while the key is
-/// held — the user's rule, stated exactly: "speech to text only on hold."
+/// A tap opens the microphone only when it cuts an agent utterance that had
+/// already promised the person a reply listen. Dictation otherwise happens
+/// only while the key is held.
 /// `holdThreshold` is what tells the two gestures apart.
 ///
-/// The floor lives on its own key rather than sharing ⌘§, because cancelling an
-/// utterance and taking the floor are opposite intentions: one throws the
-/// utterance away, the other lets it finish untouched. Carbon matches modifiers
-/// exactly, so ⌘⇧§ never fires the plain binding and ⌘§ keeps every job today.
+/// ⌘⇧§ still changes the floor after an utterance finishes; ⌘§ takes it now.
+/// Carbon matches modifiers exactly, so ⌘⇧§ never fires the plain binding.
 struct HotKeyBinding {
     let id: UInt32
     let keyCode: UInt32
@@ -578,12 +577,12 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         endDictation()
     }
 
-    // A tap never opens the microphone — listening is only ever the hold.
-    // Speaking → stop it. An agent's mic already open → end that turn (which
-    // closes a gate, never opens one). Otherwise → read the selection aloud.
+    // Speaking → take the floor now. An agent's mic already open → end that
+    // turn (which closes a gate, never opens one). Otherwise → read the
+    // selection aloud.
     private func voiceKeyTapped() {
         if isSpeaking {
-            sendControl("cancel", notice: "Stopped reading.", serialized: false)
+            sendControl("take_floor", notice: "Taking the floor…", serialized: false)
             return
         }
         if gateOpen {
@@ -1430,6 +1429,7 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         case "pause": return "Voice session paused. The microphone is closed."
         case "resume": return "Voice session resumed. Shared queue; mic still closed until a turn listens."
         case "cancel": return "Current turn cancelled. Mic closing."
+        case "take_floor": return "Agent stopped. Listening if it was your turn next."
         case "end_turn": return "Got it. Recording closed; transcribing what you said."
         case "stop": return "Voice stopped. Microphone closed."
         case "cycle_mode": return "Mode cycled. Talk = both · Narrate = agent speaks · Dictate = you only."
