@@ -338,7 +338,9 @@ def create_mcp(engine: Any | None = None, *, control_token: str | None = None) -
         instructions=(
             "Vox is local-only voice I/O. Start an explicit voice session before "
             "listening. The microphone is permitted only during listen/converse; "
-            "cancel ends the current turn, while stop ends the session.\n"
+            "cancel ends the current turn, while stop ends the session. "
+            "An idle or sleep-paused session restarts itself on the next speak/converse; "
+            "voice is off only after the user stops it.\n"
             "Voice turn contract: a spoken turn is a conversation, not a report. "
             "Talk normally, in complete thoughts. Do not call other "
             "tools between conversation turns — the user is sitting in silence "

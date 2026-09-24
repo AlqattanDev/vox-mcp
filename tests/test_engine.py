@@ -12,8 +12,9 @@ import pytest
 from voxmcp.audio import AudioRecorder, CaptureConfig, CaptureResult, CaptureStopReason
 from voxmcp.config import VoxConfig
 from voxmcp.engine import VoxEngine
-from voxmcp.errors import BusyError, VoxError
-from voxmcp.eventlog import JsonlEventLogger
+from voxmcp.errors import BusyError, PrivacyError, VoxError
+from voxmcp.eventlog import JsonlEventLogger, read_events
+from voxmcp.models import SessionState
 from voxmcp.lease import LeaseManager, OperationGate
 from voxmcp.speech import SpeechResult
 from voxmcp.state import VoiceStateMachine
@@ -2988,3 +2989,116 @@ async def test_pause_mid_listen_delivers_what_was_already_heard(tmp_path: Path):
     assert paused["session"]["state"] == "paused"
     assert (await engine.status())["session"]["state"] == "paused"
     assert (await engine.status())["session"]["microphone_open"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_a_sleep_pause_lifts_itself_on_the_next_agent_turn(tmp_path: Path):
+    """The Mac slept; the person never asked for quiet, so voice is not off."""
+
+    speech = CountingSpeech()
+    engine = make_engine(tmp_path, speech_client=speech)
+    await engine.session("claude", "start")
+    await engine.session("http-control", "pause", reason="system_sleep")
+    status = await engine.status()
+    assert status["state"] == "paused"
+    assert "resumes" in status["detail"]
+
+    result = await engine.speak("claude", "Back after the lid.")
+
+    assert result["status"] == "completed"
+    assert speech.spans == ["Back after the lid."]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_a_chosen_pause_still_refuses_and_says_so(tmp_path: Path):
+    engine = make_engine(tmp_path, speech_client=CountingSpeech())
+    await engine.session("claude", "start")
+    await engine.session("http-control", "pause")
+
+    with pytest.raises(PrivacyError, match="paused by the user"):
+        await engine.speak("claude", "Should not play.")
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_wake_resumes_only_an_automatic_pause(tmp_path: Path):
+    engine = make_engine(tmp_path, speech_client=CountingSpeech())
+    await engine.session("claude", "start")
+
+    await engine.session("http-control", "pause")
+    await engine.session("http-control", "resume", reason="wake")
+    assert engine.state.state is SessionState.PAUSED
+
+    await engine.session("http-control", "resume")
+    await engine.session("http-control", "pause", reason="system_sleep")
+    await engine.session("http-control", "resume", reason="wake")
+    assert engine.state.state is SessionState.IDLE
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_start_resumes_a_paused_session(tmp_path: Path):
+    engine = make_engine(tmp_path, speech_client=CountingSpeech())
+    await engine.session("claude", "start")
+    await engine.session("http-control", "pause")
+
+    await engine.session("claude", "start")
+
+    assert engine.state.state is SessionState.IDLE
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_read_aloud_works_through_a_pause(tmp_path: Path):
+    """Pressing the key is the person asking; the pause stood in for them."""
+
+    speech = CountingSpeech()
+    engine = make_engine(tmp_path, speech_client=speech)
+    await engine.session("claude", "start")
+    await engine.session("http-control", "pause")
+
+    result = await engine.read_aloud("http-control", text="Read this.")
+
+    assert result["status"] == "completed"
+    assert speech.spans == ["Read this."]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_the_turn_key_stops_a_read_aloud(tmp_path: Path):
+    engine = make_engine(tmp_path, player=HeldPlayer())
+
+    reading = asyncio.create_task(engine.read_aloud("panel", text="A long selection."))
+    await _await_event(engine.player.started)
+    pressed = await engine.control("panel", "take_floor")
+    engine.player.release.set()
+    result = await reading
+
+    assert pressed["status"] == "stopped"
+    assert result["status"] == "cancelled"
+    assert engine.state.state is SessionState.IDLE
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_idle_expiry_does_not_read_as_off(tmp_path: Path):
+    engine = make_engine(tmp_path, speech_client=CountingSpeech())
+    status = await engine.status()
+    assert "ready" in status["detail"]
+
+    await engine.session("claude", "start")
+    await engine.session("claude", "stop")
+    status = await engine.status()
+    assert "stopped by the user" in status["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_pausing_an_off_session_is_not_logged_as_a_pause(tmp_path: Path):
+    engine = make_engine(tmp_path, speech_client=CountingSpeech())
+    await engine.session("http-control", "pause")
+    path = engine.logger.path
+    events = [row["event"] for row in read_events(path)] if path.exists() else []
+    assert "session.pause" not in events

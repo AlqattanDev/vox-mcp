@@ -123,6 +123,8 @@ class StateSnapshot:
     pause_until: float | None = None
     last_stop_reason: StopReason | None = None
     error: str | None = None
+    # Who paused: "pause"/"mute" for a person, "auto:<why>" for the machine.
+    pause_reason: str | None = None
 
     @property
     def microphone_open(self) -> bool:
@@ -148,6 +150,7 @@ class StateSnapshot:
                 self.last_stop_reason.value if self.last_stop_reason else None
             ),
             "error": self.error,
+            "pause_reason": self.pause_reason,
         }
 
     @classmethod
@@ -187,6 +190,7 @@ class StateSnapshot:
             pause_until=_optional_float(value.get("pause_until")),
             last_stop_reason=StopReason(str(stop_raw)) if stop_raw else None,
             error=_optional_string(value.get("error")),
+            pause_reason=_optional_string(value.get("pause_reason")),
         )
 
 

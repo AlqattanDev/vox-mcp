@@ -442,6 +442,11 @@ class VoxEngine:
         if start and snapshot.state is SessionState.OFF:
             self.state.start(client_id)
             self._log("session.started", client_id=client_id)
+        elif start and snapshot.state is SessionState.PAUSED and _is_auto_pause(snapshot.pause_reason):
+            # The Mac slept or locked; the person never asked for quiet. The
+            # next agent turn after wake is theirs, not a "voice is off".
+            self.state.resume(client_id=None)
+            self._log("session.auto_resumed", client_id=client_id, pause_reason=snapshot.pause_reason)
         elif snapshot.state is SessionState.ERROR:
             try:
                 self.state.recover(client_id=client_id)
@@ -565,6 +570,17 @@ class VoxEngine:
 
         with self._active_lock:
             floor = self._floor
+            speaking = self.state.state is SessionState.SPEAKING
+        if floor is None:
+            if not speaking:
+                return {"status": "not_speaking", "listening": False}
+            # Nothing planned a floor: a read-aloud, or a speak older than the
+            # floor. The key still means "stop talking", so it stops.
+            signal = self._signal_cancel(manual_end=False)
+            self._log("floor.taken_now", client_id=client_id, listening=False)
+            return {"status": "stopped", "listening": False, **signal}
+        with self._active_lock:
+            floor = self._floor
             if floor is None:
                 return {"status": "not_speaking", "listening": False}
             listening = floor.open
@@ -583,7 +599,11 @@ class VoxEngine:
     ) -> Any:
         await self._claim(client_id)
         if self.state.state is SessionState.PAUSED:
-            raise PrivacyError("Voice session is paused; resume it before using audio")
+            self._log("turn.rejected_paused", client_id=client_id, action=action)
+            raise PrivacyError(
+                "Voice is paused by the user (not off). Tell them it is paused; "
+                "call voice_session(action='resume') only if they ask to continue"
+            )
         async with self.gate.operation(client_id, action, agent=agent or DEFAULT_AGENT):
             self._set_active(client_id)
             with self._active_lock:
@@ -651,6 +671,7 @@ class VoxEngine:
                     client_id=client_id,
                     action=action,
                     error_type=type(exc).__name__,
+                    error=str(exc)[:200],
                 )
                 raise
             finally:
@@ -2081,6 +2102,11 @@ class VoxEngine:
         message = (text or "").strip()
         if not message:
             return {"status": "skipped", "reason": "empty_selection"}
+        # Pressing the key is the person asking; a pause only ever stood in
+        # for them, so it yields. The mic stays closed either way.
+        if self.state.state is SessionState.PAUSED:
+            self.state.resume(client_id=None)
+            self._log("session.resume", client_id=client_id, via="read_aloud")
 
         async def operation() -> dict[str, Any]:
             # io_mode is about what agents may do with the speaker; this is the
@@ -2435,11 +2461,13 @@ class VoxEngine:
         force: bool = False,
         agent: str | None = None,
         mode: str | None = None,
+        reason: str | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         del kwargs
         action = action.lower().strip()
         administrative = client_id == "http-control"
+        changed = True
         if action == "status":
             return await self._status_for_agent(agent)
         if action in {"set_mode", "mode"}:
@@ -2495,6 +2523,10 @@ class VoxEngine:
                     self.state.start(client_id=None)
             else:
                 await self._claim(client_id)
+            # Asking to start is asking to hear; a pause is not a second
+            # switch the agent has to know about.
+            if self.state.state is SessionState.PAUSED:
+                self.state.resume(client_id=None)
         elif action in {"pause", "mute"}:
             if not administrative and not force:
                 await self._claim(client_id)
@@ -2509,16 +2541,27 @@ class VoxEngine:
             await self._close_source()
             if signal.get("heard_kept"):
                 await self._settle_kept_turn()
+            changed = False
             if self.state.state is not SessionState.PAUSED:
                 if self.state.state not in {SessionState.IDLE, SessionState.OFF}:
                     self._return_idle_if_active()
                 if self.state.state is SessionState.IDLE:
                     until = time.time() + pause_seconds if pause_seconds else None
-                    self.state.pause(action, until=until, client_id=None)
+                    label = f"{AUTO_PAUSE_PREFIX}{reason}" if reason else action
+                    self.state.pause(label, until=until, client_id=None)
+                    changed = True
         elif action == "resume":
             if not administrative and not force:
                 await self._claim(client_id, start=False)
-            self.state.resume(client_id=None)
+            snapshot = self.state.snapshot()
+            if reason:
+                # Wake/unlock: undo only a pause the machine made. A pause the
+                # person chose outlives the lid.
+                changed = snapshot.state is SessionState.PAUSED and _is_auto_pause(snapshot.pause_reason)
+            else:
+                changed = snapshot.state is SessionState.PAUSED
+            if changed:
+                self.state.resume(client_id=None)
         elif action == "stop":
             self._signal_cancel(manual_end=False, force=True)
             self.gate.drain("stopped")
@@ -2572,7 +2615,13 @@ class VoxEngine:
                 self.state.resume(client_id=None)
         else:
             raise VoxError(f"Unknown voice session action: {action}")
-        self._log(f"session.{action}", client_id=client_id, agent=agent or DEFAULT_AGENT)
+        if changed:
+            self._log(
+                f"session.{action}",
+                client_id=client_id,
+                agent=agent or DEFAULT_AGENT,
+                **({"reason": reason} if reason else {}),
+            )
         return await self._status_for_agent(agent)
 
     async def control(
@@ -3009,7 +3058,7 @@ class VoxEngine:
         session = self.state.snapshot().to_dict()
         session["microphone_open"] = self.microphone_open
         microphone_open = self.microphone_open
-        detail = _state_detail(self.state.state)
+        detail = _state_detail(self.state.snapshot())
         with self._active_lock:
             microphone_closing = self._microphone_closing
             barge_in_armed = self._barge_in_control is not None
@@ -3297,9 +3346,23 @@ def _privacy_filtered_exchange_history(
     }
 
 
-def _state_detail(state: SessionState) -> str:
+AUTO_PAUSE_PREFIX = "auto:"
+
+
+def _is_auto_pause(label: str | None) -> bool:
+    return bool(label) and str(label).startswith(AUTO_PAUSE_PREFIX)
+
+
+def _state_detail(snapshot: Any) -> str:
+    state = snapshot.state
+    if state is SessionState.OFF and snapshot.last_stop_reason != StopReason.USER_REQUEST:
+        # Idle expiry, not a choice: the next speak/converse starts it again,
+        # so saying "off" only teaches agents to tell the person it is broken.
+        return "Voice is idle and ready; the next speak or converse starts it"
+    if state is SessionState.PAUSED and _is_auto_pause(snapshot.pause_reason):
+        return "Voice paused while the Mac slept; the next speak or converse resumes it"
     return {
-        SessionState.OFF: "Voice mode is off; microphone closed",
+        SessionState.OFF: "Voice was stopped by the user; microphone closed",
         SessionState.IDLE: "Voice session ready; microphone closed",
         SessionState.LISTENING: "Listening for one bounded turn",
         SessionState.PROCESSING: "Transcribing locally; microphone closed",

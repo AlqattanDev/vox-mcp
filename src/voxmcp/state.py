@@ -235,7 +235,7 @@ class VoiceStateMachine:
                 SessionState.PAUSED,
                 paused_from=self.state,
                 pause_until=until,
-                error=_bounded_text(reason),
+                pause_reason=_bounded_text(reason),
             )
 
     def resume(self, *, client_id: str | None = None) -> StateSnapshot:
@@ -382,6 +382,7 @@ class VoiceStateMachine:
         pause_until: float | None = None,
         stop_reason: StopReason | None = None,
         error: str | None = None,
+        pause_reason: str | None = None,
         now: float | None = None,
     ) -> StateSnapshot:
         source = self.state
@@ -420,6 +421,7 @@ class VoiceStateMachine:
             pause_until=pause_until if target is SessionState.PAUSED else None,
             last_stop_reason=stop_reason if target is SessionState.OFF else None,
             error=error if target is SessionState.ERROR else None,
+            pause_reason=pause_reason if target is SessionState.PAUSED else None,
         )
         return self._commit_locked(candidate)
 

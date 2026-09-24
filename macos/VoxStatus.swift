@@ -446,10 +446,20 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             name: NSWorkspace.sessionDidResignActiveNotification,
             object: nil
         )
+        // A dimmed screen is not a person leaving: agents work for minutes
+        // between turns, and pausing on display sleep is what made them
+        // report "voice is off". Sleep and a lock still pause; wake and
+        // unlock undo only those automatic pauses.
         workspaceNotifications.addObserver(
             self,
-            selector: #selector(protectPrivacyForInactiveSession),
-            name: NSWorkspace.screensDidSleepNotification,
+            selector: #selector(resumeAfterWake),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
+        workspaceNotifications.addObserver(
+            self,
+            selector: #selector(resumeAfterWake),
+            name: NSWorkspace.sessionDidBecomeActiveNotification,
             object: nil
         )
         // Poll fast so the menu-bar glyph tracks the real mic state almost
@@ -1344,6 +1354,11 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                         reason += ": \(errorName)"
                     }
                     self.actionNotice = "Could not \(action): \(reason)"
+                } else if let result = VoxAppDelegate.controlResult(data),
+                          result["status"] as? String == "error" {
+                    // HTTP 200 carrying a refusal: never paint it as success.
+                    let message = result["message"] as? String ?? "refused"
+                    self.actionNotice = "Could not \(action): \(message)"
                 } else {
                     self.actionNotice = self.successNotice(for: action)
                 }
@@ -1563,7 +1578,7 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     @objc private func pauseBeforeSleep() {
         actionNotice = "Pausing before sleep and closing the microphone…"
-        if !sendControlSynchronously("pause", timeout: 3.5) {
+        if !sendControlSynchronously("pause", timeout: 3.5, extra: ["reason": "system_sleep"]) {
             actionNotice = "Could not confirm the privacy pause before sleep"
         } else {
             actionNotice = "Paused before sleep. The microphone is closed."
@@ -1572,10 +1587,30 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     @objc private func protectPrivacyForInactiveSession() {
-        sendControl("pause", notice: "Pausing because the Mac became inactive…")
+        sendControl(
+            "pause",
+            notice: "Pausing because the Mac became inactive…",
+            extra: ["reason": "session_inactive"],
+            serialized: false
+        )
     }
 
-    private func sendControlSynchronously(_ action: String, timeout: TimeInterval) -> Bool {
+    /// The runtime resumes only a pause it recorded as automatic, so a pause
+    /// the person chose survives the lid.
+    @objc private func resumeAfterWake() {
+        sendControl(
+            "resume",
+            notice: "Resuming after wake…",
+            extra: ["reason": "wake"],
+            serialized: false
+        )
+    }
+
+    private func sendControlSynchronously(
+        _ action: String,
+        timeout: TimeInterval,
+        extra: [String: Any] = [:]
+    ) -> Bool {
         var request = URLRequest(url: baseURL.appendingPathComponent("control"))
         request.httpMethod = "POST"
         request.timeoutInterval = timeout
@@ -1588,7 +1623,9 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         ) {
             request.setValue(token.trimmingCharacters(in: .whitespacesAndNewlines), forHTTPHeaderField: "X-Vox-Token")
         }
-        request.httpBody = try? JSONSerialization.data(withJSONObject: ["action": action])
+        var body = extra
+        body["action"] = action
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
         let finished = DispatchSemaphore(value: 0)
         var accepted = false
         URLSession.shared.dataTask(with: request) { _, response, _ in
