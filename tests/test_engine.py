@@ -3017,7 +3017,7 @@ async def test_a_chosen_pause_still_refuses_and_says_so(tmp_path: Path):
     await engine.session("claude", "start")
     await engine.session("http-control", "pause")
 
-    with pytest.raises(PrivacyError, match="paused by the user"):
+    with pytest.raises(PrivacyError, match="paused \\(not off\\)"):
         await engine.speak("claude", "Should not play.")
 
 
@@ -3130,3 +3130,48 @@ async def test_a_long_reply_window_is_clamped_not_refused(tmp_path: Path):
     assert _reply_window(30) == 15.0
     assert _reply_window(1) == 5.0
     CaptureConfig(onset_timeout_s=_reply_window(30))
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_a_lock_pause_waits_for_unlock_not_for_an_agent(tmp_path: Path):
+    """No agent may open the mic on a locked Mac; wake alone is not unlock."""
+
+    engine = make_engine(tmp_path, speech_client=CountingSpeech())
+    await engine.session("claude", "start")
+    await engine.session("http-control", "pause", reason="screen_locked")
+    await engine.session("http-control", "pause", reason="system_sleep")
+
+    with pytest.raises(PrivacyError):
+        await engine.speak("claude", "Nobody is here.")
+    await engine.session("http-control", "resume", reason="wake")
+    assert engine.state.state is SessionState.PAUSED
+
+    await engine.session("http-control", "resume", reason="unlock")
+    assert engine.state.state is SessionState.IDLE
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_muting_a_sleeping_session_makes_it_the_users_pause(tmp_path: Path):
+    engine = make_engine(tmp_path, speech_client=CountingSpeech())
+    await engine.session("claude", "start")
+    await engine.session("http-control", "pause", reason="system_sleep")
+    await engine.session("claude", "mute", force=True)
+
+    with pytest.raises(PrivacyError, match="paused \\(not off\\)"):
+        await engine.speak("claude", "Should stay quiet.")
+    await engine.session("http-control", "resume", reason="unlock")
+    assert engine.state.state is SessionState.PAUSED
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_the_cancel_settle_leaves_a_later_pause_alone(tmp_path: Path):
+    engine = make_engine(tmp_path, speech_client=CountingSpeech())
+    await engine.session("claude", "start")
+    await engine.session("http-control", "pause")
+
+    await engine._idle_after_cancel()
+
+    assert engine.state.state is SessionState.PAUSED

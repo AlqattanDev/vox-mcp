@@ -50,11 +50,12 @@ Package is `src/voxmcp/`.
 - **Listen earcons.** A rising blip marks the mic opening (talk now), a falling
   blip marks it closing (stopped) — the start tone plays before capture so it
   can't leak in. Off via `VOX_EARCONS=0`.
-- **Paused is not off.** The app pauses on sleep and fast-user-switch only —
+- **Paused is not off.** The app pauses on sleep, lock and fast-user-switch —
   never on display sleep, which fired ~5 min into every stretch of agent work
   and was the source of "voice is off" (957 pauses, 7 app resumes). Those
-  pauses carry `pause_reason: "auto:*"`; wake/unlock and the next
-  speak/converse lift them. A pause the user chose still refuses, and says so.
+  pauses carry `pause_reason: "auto:*"`. A sleep pause lifts on wake or the
+  next speak/converse; a lock pause only on unlock (no agent opens a mic on a
+  locked Mac). A pause the user chose outranks both and still refuses.
   `start` and read-aloud resume any pause. An idle-expired session reports
   "idle and ready", not "off".
 - **Playback is in process.** PortAudio, not `afplay`, which cost a fixed

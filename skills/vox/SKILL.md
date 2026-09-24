@@ -18,9 +18,9 @@ agent “has” Vox. Do not ask for takeover/handoff for normal multi-agent use.
 - If someone is speaking or listening, your call **queues** (FIFO) and runs
   when the mic/speaker free up. Just call and wait.
 - `BusyError` means the 30 s queue wait ran out: retry the call once.
-- **Paused is not off.** A pause the Mac made (sleep, lock) lifts itself on your
-  next call. A `PrivacyError` saying *paused by the user* means they chose
-  quiet: tell them Vox is paused and resume when they ask. Report voice as
+- **Paused is not off.** A sleep pause lifts itself on your next call; a lock
+  pause lifts when the user unlocks. A `PrivacyError` means the user is away
+  or chose quiet: tell them Vox is paused and resume when they ask. Report voice as
   stopped only when status says the user stopped it; an idle session starts
   itself on your next `speak`/`converse`.
 - `stop` / panel Stop is a global privacy kill (any client may stop).

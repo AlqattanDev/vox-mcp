@@ -444,9 +444,10 @@ class VoxEngine:
         if start and snapshot.state is SessionState.OFF:
             self.state.start(client_id)
             self._log("session.started", client_id=client_id)
-        elif start and snapshot.state is SessionState.PAUSED and _is_auto_pause(snapshot.pause_reason):
-            # The Mac slept or locked; the person never asked for quiet. The
-            # next agent turn after wake is theirs, not a "voice is off".
+        elif start and snapshot.state is SessionState.PAUSED and snapshot.pause_reason == SLEEP_PAUSE:
+            # The Mac slept; the person never asked for quiet. The next agent
+            # turn after wake is theirs, not a "voice is off". A lock is
+            # different: the mic stays shut until the person unlocks.
             self.state.resume(client_id=None)
             self._log("session.auto_resumed", client_id=client_id, pause_reason=snapshot.pause_reason)
         elif snapshot.state is SessionState.ERROR:
@@ -603,8 +604,8 @@ class VoxEngine:
         if self.state.state is SessionState.PAUSED:
             self._log("turn.rejected_paused", client_id=client_id, action=action)
             raise PrivacyError(
-                "Voice is paused by the user (not off). Tell them it is paused; "
-                "call voice_session(action='resume') only if they ask to continue"
+                "Voice is paused (not off): the user paused it or the Mac is locked. "
+                "Tell them it is paused; call voice_session(action='resume') only if they ask"
             )
         async with self.gate.operation(client_id, action, agent=agent or DEFAULT_AGENT):
             self._set_active(client_id)
@@ -679,7 +680,14 @@ class VoxEngine:
                     client_id=client_id,
                     action=action,
                     error_type=type(exc).__name__,
-                    error=str(exc)[:200],
+                    # Our own validation messages only: a subprocess error can
+                    # carry the utterance itself (say's argv on timeout).
+                    **(
+                        {"error": str(exc)[:200]}
+                        if isinstance(exc, (ValueError, VoxError, IllegalStateTransition))
+                        and not isinstance(exc, ServiceUnavailableError)
+                        else {}
+                    ),
                 )
                 raise
             finally:
@@ -715,7 +723,8 @@ class VoxEngine:
         await self._wait_for_microphone_closed(timeout=5.0)
         with self._active_lock:
             busy = self._active_task is not None
-        if not busy:
+        # Only a turn state is ours to settle; a pause taken meanwhile is not.
+        if not busy and self.state.state in _TURN_STATES:
             self._return_idle_if_active()
 
     def _heal_orphaned_turn(self, client_id: str) -> None:
@@ -2577,12 +2586,21 @@ class VoxEngine:
             if signal.get("heard_kept"):
                 await self._settle_kept_turn()
             changed = False
-            if self.state.state is not SessionState.PAUSED:
+            until = time.time() + pause_seconds if pause_seconds else None
+            label = f"{AUTO_PAUSE_PREFIX}{reason}" if reason else action
+            if self.state.state is SessionState.PAUSED:
+                # Already paused: the reason can still change hands, e.g. the
+                # person muting a session the Mac paused for sleep.
+                current = self.state.snapshot()
+                before = current.pause_reason
+                # The machine never shortens or lengthens a person's timed wait.
+                keep_until = current.pause_until if reason else until
+                self.state.pause(label, until=keep_until, client_id=None)
+                changed = self.state.snapshot().pause_reason != before
+            else:
                 if self.state.state not in {SessionState.IDLE, SessionState.OFF}:
                     self._return_idle_if_active()
                 if self.state.state is SessionState.IDLE:
-                    until = time.time() + pause_seconds if pause_seconds else None
-                    label = f"{AUTO_PAUSE_PREFIX}{reason}" if reason else action
                     self.state.pause(label, until=until, client_id=None)
                     changed = True
         elif action == "resume":
@@ -2590,9 +2608,11 @@ class VoxEngine:
                 await self._claim(client_id, start=False)
             snapshot = self.state.snapshot()
             if reason:
-                # Wake/unlock: undo only a pause the machine made. A pause the
-                # person chose outlives the lid.
-                changed = snapshot.state is SessionState.PAUSED and _is_auto_pause(snapshot.pause_reason)
+                # Wake lifts only a sleep pause (the Mac may wake to a lock
+                # screen); unlock lifts any machine pause. A pause the person
+                # chose outlives both.
+                lifts = _is_auto_pause if reason == "unlock" else (lambda r: r == SLEEP_PAUSE)
+                changed = snapshot.state is SessionState.PAUSED and lifts(snapshot.pause_reason)
             else:
                 changed = snapshot.state is SessionState.PAUSED
             if changed:
@@ -3392,6 +3412,7 @@ def _reply_window(seconds: float) -> float:
 
 
 AUTO_PAUSE_PREFIX = "auto:"
+SLEEP_PAUSE = "auto:system_sleep"
 _TURN_STATES = {SessionState.LISTENING, SessionState.PROCESSING, SessionState.SPEAKING}
 
 
@@ -3405,8 +3426,10 @@ def _state_detail(snapshot: Any) -> str:
         # Idle expiry, not a choice: the next speak/converse starts it again,
         # so saying "off" only teaches agents to tell the person it is broken.
         return "Voice is idle and ready; the next speak or converse starts it"
-    if state is SessionState.PAUSED and _is_auto_pause(snapshot.pause_reason):
+    if state is SessionState.PAUSED and snapshot.pause_reason == SLEEP_PAUSE:
         return "Voice paused while the Mac slept; the next speak or converse resumes it"
+    if state is SessionState.PAUSED and _is_auto_pause(snapshot.pause_reason):
+        return "Voice paused while the Mac is locked; it resumes on unlock"
     return {
         SessionState.OFF: "Voice was stopped by the user; microphone closed",
         SessionState.IDLE: "Voice session ready; microphone closed",

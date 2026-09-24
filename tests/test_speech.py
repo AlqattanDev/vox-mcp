@@ -87,3 +87,14 @@ async def test_transcribe_rejects_missing_file(tmp_path: Path):
     )
     with pytest.raises(VoxError, match="does not exist"):
         await client.transcribe(tmp_path / "missing.wav")
+
+
+def test_a_header_that_claims_audio_it_does_not_contain_is_refused(tmp_path: Path):
+    from voxmcp.speech import _validate_synthesized_wav
+
+    wav = bytearray(_wav_bytes(duration_s=1.0))[:44]
+    path = tmp_path / "empty.wav"
+    path.write_bytes(bytes(wav))
+
+    with pytest.raises(ServiceUnavailableError, match="too short"):
+        _validate_synthesized_wav(path)

@@ -34,7 +34,12 @@ def _validate_synthesized_wav(path: Path) -> None:
     try:
         with wave.open(str(path), "rb") as audio:
             frame_rate = audio.getframerate()
-            duration = audio.getnframes() / frame_rate if frame_rate else 0.0
+            frame_bytes = audio.getsampwidth() * audio.getnchannels()
+            # Count what is there, not what the header claims: Kokoro streams
+            # with an unknown (0xFFFFFFFF) length, and a bare header can
+            # declare a second of audio it does not contain.
+            present = len(audio.readframes(audio.getnframes())) // frame_bytes if frame_bytes else 0
+            duration = present / frame_rate if frame_rate else 0.0
     except (OSError, EOFError, wave.Error) as exc:
         raise ServiceUnavailableError("TTS returned invalid WAV audio") from exc
     if duration < MIN_SYNTHESIZED_SPEECH_SECONDS:

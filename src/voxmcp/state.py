@@ -221,7 +221,7 @@ class VoiceStateMachine:
         with self._lock:
             self._assert_owner(client_id)
             if self.state is SessionState.PAUSED:
-                return self._update_pause_locked(until)
+                return self._update_pause_locked(until, _bounded_text(reason))
             if self.state not in {
                 SessionState.IDLE,
                 SessionState.LISTENING,
@@ -361,10 +361,17 @@ class VoiceStateMachine:
         )
         return self._commit_locked(candidate)
 
-    def _update_pause_locked(self, until: float | None) -> StateSnapshot:
+    def _update_pause_locked(self, until: float | None, reason: str | None = None) -> StateSnapshot:
         now = float(self._clock())
+        current = self._snapshot.pause_reason
+        # A person's pause outranks the machine's, and a lock outranks sleep:
+        # otherwise muting a sleeping session kept "auto:" and the next agent
+        # turn lifted a mute the user had just asked for.
+        if reason is not None and _pause_rank(reason) >= _pause_rank(current):
+            current = reason
         candidate = replace(
             self._snapshot,
+            pause_reason=current,
             revision=self._snapshot.revision + 1,
             updated_at=now,
             last_activity_at=now,
@@ -538,3 +545,15 @@ def _bounded_text(value: str | None, limit: int = 512) -> str | None:
     if value is None:
         return None
     return str(value).replace("\x00", "")[:limit]
+
+
+def _pause_rank(reason: str | None) -> int:
+    """sleep (lifts on the next turn) < lock (lifts on unlock) < a person."""
+
+    if not reason:
+        return -1
+    if reason == "auto:system_sleep":
+        return 0
+    if reason.startswith("auto:"):
+        return 1
+    return 2

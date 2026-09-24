@@ -458,7 +458,7 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         )
         workspaceNotifications.addObserver(
             self,
-            selector: #selector(resumeAfterWake),
+            selector: #selector(resumeAfterUnlock),
             name: NSWorkspace.sessionDidBecomeActiveNotification,
             object: nil
         )
@@ -472,7 +472,7 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         )
         distributed.addObserver(
             self,
-            selector: #selector(resumeAfterWake),
+            selector: #selector(resumeAfterUnlock),
             name: NSNotification.Name("com.apple.screenIsUnlocked"),
             object: nil
         )
@@ -1609,13 +1609,23 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         )
     }
 
-    /// The runtime resumes only a pause it recorded as automatic, so a pause
-    /// the person chose survives the lid.
+    /// Wake lifts only a sleep pause — the Mac may wake to a lock screen.
+    /// The runtime never lifts a pause the person chose.
     @objc private func resumeAfterWake() {
         sendControl(
             "resume",
             notice: "Resuming after wake…",
             extra: ["reason": "wake"],
+            serialized: false
+        )
+    }
+
+    /// Unlock lifts any pause the machine made (sleep or lock).
+    @objc private func resumeAfterUnlock() {
+        sendControl(
+            "resume",
+            notice: "Resuming after unlock…",
+            extra: ["reason": "unlock"],
             serialized: false
         )
     }
