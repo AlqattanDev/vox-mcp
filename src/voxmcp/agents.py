@@ -8,11 +8,13 @@ never insertion-ordered) and written to disk the first time they are made.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from .lease import DEFAULT_AGENT
 
@@ -32,12 +34,39 @@ FALLBACK_VOICES: tuple[str, ...] = (
 # Japanese, Portuguese and Mandarin. Auto-assignment must stay in English or an
 # agent ends up reading English status updates in a Mandarin voice.
 ENGLISH_PREFIXES: tuple[str, ...] = ("af_", "am_", "bf_", "bm_")
+VOICE_ID = re.compile(r"^[a-z]{2}_[a-z0-9]+$")
 
 
 def is_english_voice(voice: str) -> bool:
     """True for an English Kokoro voice that is not a superseded v0 variant."""
 
     return voice.startswith(ENGLISH_PREFIXES) and "_v0" not in voice
+
+
+def _voice_id(value: Any) -> str | None:
+    """Extract one Kokoro id from the plain or UI-shaped persisted value."""
+
+    if isinstance(value, dict):
+        return _voice_id(value.get("id")) or _voice_id(value.get("name"))
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if VOICE_ID.fullmatch(candidate):
+        return candidate
+    # Some MCP/UI clients persisted the selected object through ``str()`` and
+    # left values such as "{'id': 'bm_daniel', 'name': 'bm_daniel'}".  It is
+    # still recoverable, but sending that whole literal to Kokoro makes every
+    # turn fall through to the OS voice.
+    if candidate.startswith("{") and candidate.endswith("}"):
+        try:
+            decoded = json.loads(candidate)
+        except ValueError:
+            try:
+                decoded = ast.literal_eval(candidate)
+            except (SyntaxError, ValueError):
+                return None
+        return _voice_id(decoded)
+    return None
 
 
 class AgentVoices:
@@ -61,14 +90,22 @@ class AgentVoices:
             return {}
         if not isinstance(document, dict):
             return {}
-        return {
-            str(agent): str(voice)
+        assignments = {
+            agent: voice_id
             for agent, voice in document.items()
-            if isinstance(agent, str) and isinstance(voice, str) and voice.strip()
+            if isinstance(agent, str) and (voice_id := _voice_id(voice)) is not None
         }
+        # Normalize recoverable object-shaped values immediately. A restart
+        # must not load the same poisoned voice again.
+        if assignments != document:
+            self._write(assignments)
+        return assignments
 
     def _save(self) -> None:
-        payload = json.dumps(self.assignments, indent=2, sort_keys=True) + "\n"
+        self._write(self.assignments)
+
+    def _write(self, assignments: dict[str, str]) -> None:
+        payload = json.dumps(assignments, indent=2, sort_keys=True) + "\n"
         temporary = self.path.with_suffix(".tmp")
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -95,8 +132,11 @@ class AgentVoices:
         return assigned
 
     def _assign(self, label: str, available: Sequence[str] | None) -> str:
-        offered = [voice for voice in (available or FALLBACK_VOICES) if isinstance(voice, str)]
-        offered = sorted({voice.strip() for voice in offered if voice.strip()})
+        offered = sorted({
+            voice_id
+            for voice in (available or FALLBACK_VOICES)
+            if (voice_id := _voice_id(voice)) is not None
+        })
         # An explicit mapping in agents.json is honoured verbatim; only what we
         # pick on someone's behalf is held to English.
         pool = [voice for voice in offered if is_english_voice(voice)] or offered

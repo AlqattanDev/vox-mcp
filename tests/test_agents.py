@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -109,6 +110,46 @@ def test_unreadable_map_falls_back_to_assignment(tmp_path: Path):
     path.write_text("{ this is not json")
     voices = AgentVoices(path, default_voice="af_sky")
     assert voices.resolve("infra", POOL) in POOL
+
+
+def test_serialized_voice_objects_are_repaired_and_persisted(tmp_path: Path):
+    """A UI-shaped voice must not become a literal, nonexistent Kokoro id."""
+
+    path = tmp_path / "agents.json"
+    path.write_text(json.dumps({
+        "codex": "{'id': 'bm_daniel', 'name': 'bm_daniel'}",
+        "claude": {"id": "af_bella", "name": "Bella"},
+    }))
+
+    voices = AgentVoices(path, default_voice="af_sky")
+
+    assert voices.assignments == {"codex": "bm_daniel", "claude": "af_bella"}
+    assert json.loads(path.read_text()) == {
+        "claude": "af_bella",
+        "codex": "bm_daniel",
+    }
+
+
+def test_malformed_voice_id_is_discarded_and_reassigned(tmp_path: Path):
+    path = tmp_path / "agents.json"
+    path.write_text('{"codex": "not a Kokoro voice"}')
+    voices = AgentVoices(path, default_voice="af_sky")
+
+    assert voices.resolve("codex", POOL) in POOL
+    assert voices.resolve("codex", POOL) != "not a Kokoro voice"
+
+
+def test_new_assignment_normalizes_object_shaped_voice_list(tmp_path: Path):
+    """The first turn must work even when the voices endpoint returns objects."""
+
+    voices = AgentVoices(tmp_path / "agents.json", default_voice="af_sky")
+    offered = [
+        "{'id': 'bm_daniel', 'name': 'Daniel'}",
+        '{"id": "af_bella", "name": "Bella"}',
+    ]
+
+    assert voices.resolve("codex", offered) in {"bm_daniel", "af_bella"}
+    assert set(voices.assignments.values()) <= {"bm_daniel", "af_bella"}
 
 
 def test_fallback_pool_is_used_when_no_voices_are_offered(tmp_path: Path):

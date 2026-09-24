@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import wave
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -22,6 +23,24 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 
 from .errors import ServiceUnavailableError, VoxError
+
+
+MIN_SYNTHESIZED_SPEECH_SECONDS = 0.1
+
+
+def _validate_synthesized_wav(path: Path) -> None:
+    """Reject successful-looking WAVs that cannot contain an utterance."""
+
+    try:
+        with wave.open(str(path), "rb") as audio:
+            frame_rate = audio.getframerate()
+            duration = audio.getnframes() / frame_rate if frame_rate else 0.0
+    except (OSError, EOFError, wave.Error) as exc:
+        raise ServiceUnavailableError("TTS returned invalid WAV audio") from exc
+    if duration < MIN_SYNTHESIZED_SPEECH_SECONDS:
+        raise ServiceUnavailableError(
+            f"TTS returned audio too short to contain speech ({duration:.3f}s)"
+        )
 
 
 @dataclass(slots=True)
@@ -137,6 +156,7 @@ class LocalSpeechClient:
                                 output.write(chunk)
                 if temp_path.stat().st_size < 44:
                     raise ServiceUnavailableError("Kokoro returned an empty audio response")
+                _validate_synthesized_wav(temp_path)
                 os.replace(temp_path, destination)
                 return SpeechResult(
                     backend="kokoro",
@@ -326,6 +346,11 @@ async def synthesize_with_macos_say(
         if convert.returncode != 0:
             temp_wav.unlink(missing_ok=True)
             raise ServiceUnavailableError("Could not convert macOS say output")
+        try:
+            _validate_synthesized_wav(temp_wav)
+        except ServiceUnavailableError:
+            temp_wav.unlink(missing_ok=True)
+            raise
         os.replace(temp_wav, destination)
         return SpeechResult(
             backend="macOS say",

@@ -3102,3 +3102,31 @@ async def test_pausing_an_off_session_is_not_logged_as_a_pause(tmp_path: Path):
     path = engine.logger.path
     events = [row["event"] for row in read_events(path)] if path.exists() else []
     assert "session.pause" not in events
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_a_turn_state_with_no_turn_behind_it_heals_on_the_next_call(tmp_path: Path):
+    """Live: a cancelled converse left LISTENING for 32 min, then speak crashed."""
+
+    speech = CountingSpeech()
+    engine = make_engine(tmp_path, speech_client=speech)
+    await engine.session("claude", "start")
+    engine.state.begin_listening(client_id=None)
+
+    result = await engine.speak("claude", "Still here.")
+
+    assert result["status"] == "completed"
+    assert speech.spans == ["Still here."]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_a_long_reply_window_is_clamped_not_refused(tmp_path: Path):
+    """Agents ask for 30 s; CaptureConfig refuses over 15, which failed the turn."""
+
+    from voxmcp.engine import _reply_window
+
+    assert _reply_window(30) == 15.0
+    assert _reply_window(1) == 5.0
+    CaptureConfig(onset_timeout_s=_reply_window(30))

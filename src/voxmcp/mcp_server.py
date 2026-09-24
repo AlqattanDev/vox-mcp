@@ -115,7 +115,26 @@ def _agent_id(ctx: Context, explicit: str | None = None) -> str:
     them queue and sound different.
     """
 
-    return _normalize_agent(_agent_from_url(ctx)) or _normalize_agent(explicit) or DEFAULT_AGENT
+    return (
+        _normalize_agent(_agent_from_url(ctx))
+        or _normalize_agent(explicit)
+        or _agent_from_host(_client_id(ctx))
+        or DEFAULT_AGENT
+    )
+
+
+def _agent_from_host(client_id: str) -> str | None:
+    """Name an unlabelled caller after its host: claude-code -> claude.
+
+    No installed config carries ?agent=, so every Claude, Codex and Cursor
+    session spoke as "default" in one voice and the panel's Reply went to
+    nobody in particular. The host name is the next best label there is.
+    """
+
+    prefix = "mcp:host:"
+    if not client_id.startswith(prefix):
+        return None
+    return _normalize_agent(client_id[len(prefix):].split("-", 1)[0])
 
 
 def _drop_none(values: Mapping[str, Any]) -> dict[str, Any]:

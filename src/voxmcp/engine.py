@@ -240,6 +240,7 @@ class VoxEngine:
         # engine-level slot has the per-operation lifetime the floor needs, and
         # a queued utterance behind this one starts from its own agent's plan.
         self._floor: Floor | None = None
+        self._settle_tasks: set[asyncio.Task[None]] = set()
         # How long the device stays open after the last capture lets go.
         #
         # This is not a grace period for idling: macOS lights its microphone
@@ -338,7 +339,7 @@ class VoxEngine:
             # Five seconds is the shortest useful reply window. Hosts have
             # historically supplied one second here, which made silence look
             # like the person had declined before they could begin speaking.
-            onset_timeout_s=max(5.0, float(os.environ.get("VOX_ONSET_TIMEOUT_SECONDS", "5"))),
+            onset_timeout_s=_reply_window(float(os.environ.get("VOX_ONSET_TIMEOUT_SECONDS", "5"))),
             trailing_silence_s=float(os.environ.get("VOX_TRAILING_SILENCE_SECONDS", "1.6")),
             short_trailing_silence_s=float(
                 os.environ.get("VOX_SHORT_TRAILING_SILENCE_SECONDS", "0.6")
@@ -438,6 +439,7 @@ class VoxEngine:
         """
 
         await self.lease.claim(client_id)
+        self._heal_orphaned_turn(client_id)
         snapshot = self.state.snapshot()
         if start and snapshot.state is SessionState.OFF:
             self.state.start(client_id)
@@ -622,6 +624,12 @@ class VoxEngine:
                 pending_heard, turn_id = self._take_pending_heard()
                 self._signal_cancel(manual_end=False, cancel_task=False)
                 self._return_idle_if_active()
+                if self.state.state in _TURN_STATES:
+                    # The capture thread had not let go of the microphone yet,
+                    # so the return to idle was skipped. Left alone that is a
+                    # session stuck in LISTENING until something crashes on it
+                    # (live: 32 minutes, then speak -> IllegalStateTransition).
+                    self._schedule_idle_after_cancel()
                 self._log("turn.cancelled", client_id=client_id, action=action)
                 if pending_heard is not None and not user_requested:
                     # Host dropped the tool after STT finished. Return the
@@ -697,6 +705,28 @@ class VoxEngine:
                 self.state.cancel_turn(client_id=None)
             except IllegalStateTransition:
                 pass
+
+    def _schedule_idle_after_cancel(self) -> None:
+        task = asyncio.get_running_loop().create_task(self._idle_after_cancel())
+        self._settle_tasks.add(task)
+        task.add_done_callback(self._settle_tasks.discard)
+
+    async def _idle_after_cancel(self) -> None:
+        await self._wait_for_microphone_closed(timeout=5.0)
+        with self._active_lock:
+            busy = self._active_task is not None
+        if not busy:
+            self._return_idle_if_active()
+
+    def _heal_orphaned_turn(self, client_id: str) -> None:
+        """A turn state with no turn behind it is a wedge, not a turn."""
+
+        with self._active_lock:
+            orphaned = self._active_task is None and not self._microphone_active
+        if orphaned and self.state.state in _TURN_STATES:
+            stuck = self.state.state.value
+            self._return_idle_if_active()
+            self._log("session.recovered_stuck", client_id=client_id, stuck_in=stuck)
 
     async def _wait_for_microphone_closed(self, timeout: float = 3.0) -> bool:
         deadline = asyncio.get_running_loop().time() + timeout
@@ -1788,8 +1818,7 @@ class VoxEngine:
                 # not start speaking within it, the listen returns no_speech fast
                 # instead of holding the mic open, so a declined reply closes
                 # itself rather than hanging.
-                onset_timeout_s=max(
-                    5.0,
+                onset_timeout_s=_reply_window(
                     onset_timeout
                     if onset_timeout is not None
                     else self.recorder.config.onset_timeout_s or 5.0,
@@ -1942,7 +1971,7 @@ class VoxEngine:
         **_: Any,
     ) -> dict[str, Any]:
         if onset_timeout is not None:
-            onset_timeout = max(5.0, onset_timeout)
+            onset_timeout = _reply_window(onset_timeout)
         mode = self._io_mode
         # Session io_mode is the panel/user preference; it wins over the caller's
         # wait_for_response when it forces narrate (no mic) or dictate (no TTS).
@@ -3346,7 +3375,18 @@ def _privacy_filtered_exchange_history(
     }
 
 
+def _reply_window(seconds: float) -> float:
+    """Clamp a requested reply window to 5-15 s rather than failing the turn.
+
+    Agents ask for 20 or 30 s; refusing that killed the whole converse with a
+    ValueError after the agent had already spoken (29 of 33 failed turns).
+    """
+
+    return min(15.0, max(5.0, float(seconds)))
+
+
 AUTO_PAUSE_PREFIX = "auto:"
+_TURN_STATES = {SessionState.LISTENING, SessionState.PROCESSING, SessionState.SPEAKING}
 
 
 def _is_auto_pause(label: str | None) -> bool:

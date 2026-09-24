@@ -273,7 +273,7 @@ async def test_explicit_agent_param_is_used_without_a_url_param(tmp_path: Path) 
 
     speaks = [arguments for name, arguments in engine.calls if name == "speak"]
     assert speaks[0]["agent"] == "mobilescape"
-    assert speaks[1]["agent"] == "default"  # unset stays single-agent
+    assert speaks[1]["agent"] == "mcp"  # unset falls back to the host name
 
 
 @pytest.mark.asyncio
@@ -299,7 +299,7 @@ async def test_tool_arguments_are_adapted_to_engine_contract(tmp_path: Path) -> 
     assert calls["session"] == {
         "action": "pause",
         "client_id": owner,
-        "agent": "default",
+        "agent": "mcp",  # the test client names itself "mcp"
         "pause_seconds": 8,
         "target_client_id": "next-host",
         "force": True,
@@ -678,3 +678,12 @@ async def test_the_floor_key_reaches_the_engine_over_loopback(tmp_path: Path) ->
     assert unauthorised.status_code == 401
     control_calls = [arguments for name, arguments in engine.calls if name == "control"]
     assert control_calls == [{"action": "toggle_floor", "client_id": "http-control"}]
+
+
+def test_an_unlabelled_host_speaks_under_its_own_name() -> None:
+    from voxmcp.mcp_server import _agent_from_host
+
+    assert _agent_from_host("mcp:host:claude-code") == "claude"
+    assert _agent_from_host("mcp:host:codex-mcp-client") == "codex"
+    assert _agent_from_host("mcp:host:cursor-vscode") == "cursor"
+    assert _agent_from_host("mcp:3f2a") is None
