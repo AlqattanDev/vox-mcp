@@ -1334,7 +1334,9 @@ class VoxEngine:
         replay_path = self.store.commit_tts(Path(result.path or destination))
         return replay_path, result
 
-    async def _play_and_wait(self, replay_path: Path, *, interruptible: bool) -> bool:
+    async def _play_and_wait(
+        self, replay_path: Path, *, interruptible: bool, last: bool = False
+    ) -> bool:
         """Play one committed clip; return True if it finished, False if cancelled."""
 
         # afplay takes its volume as a launch argument, so ducking cannot react
@@ -1342,7 +1344,9 @@ class VoxEngine:
         # the whole turn plays slightly quieter instead, widening the gap the
         # echo gate has to work with for the price of a barely audible drop.
         volume = self.volume * self._barge_in_duck_volume if self.barge_in_armed else self.volume
-        handle = self.player.play_file(replay_path, volume=volume, blocking=False)
+        # The last span's trailing silence is only a wait before the listen.
+        extra = {"trim_tail": True} if last else {}
+        handle = self.player.play_file(replay_path, volume=volume, blocking=False, **extra)
         # Published from the file's actual samples, aligned to the moment the
         # player launched — the true waveform of this span, not an animation.
         self.playback_levels.begin(replay_path)
@@ -1378,7 +1382,7 @@ class VoxEngine:
         replay_path, result = await self._render_tts(
             message, voice=voice, speed=speed, instructions=instructions
         )
-        finished = await self._play_and_wait(replay_path, interruptible=interruptible)
+        finished = await self._play_and_wait(replay_path, interruptible=interruptible, last=True)
         # Checked regardless of how playback ended: a barge-in during synthesis
         # can leave the span itself completing normally.
         with self._active_lock:
@@ -1452,7 +1456,9 @@ class VoxEngine:
                 if index + 1 < len(chunks)
                 else None
             )
-            finished = await self._play_and_wait(replay_path, interruptible=interruptible)
+            finished = await self._play_and_wait(
+                replay_path, interruptible=interruptible, last=index + 1 == len(chunks)
+            )
             with self._active_lock:
                 barged = self._barge_in_fired
             if barged or not finished:

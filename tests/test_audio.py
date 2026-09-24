@@ -1670,3 +1670,107 @@ def test_a_short_window_can_still_measure_the_room_it_is_watching() -> None:
     assert state.phase is CapturePhase.WAITING_FOR_SPEECH
     assert state.noise_spread_db > settings.vad_margin_db
     assert state._vad_required_rise_db() == pytest.approx(settings.max_vad_margin_db)
+
+
+class _FakeOutputDevice:
+    """Drives an OutputStream callback on a thread, like PortAudio does."""
+
+    class CallbackStop(Exception):
+        pass
+
+    def __init__(self) -> None:
+        self.played: list = []
+        self.aborted = False
+
+    def query_devices(self, *args, **kwargs):
+        return []
+
+    def _terminate(self) -> None:
+        pass
+
+    def _initialize(self) -> None:
+        pass
+
+    def OutputStream(self, *, samplerate, channels, dtype, callback, finished_callback):
+        device = self
+
+        class Stream:
+            def start(self_inner) -> None:
+                def run() -> None:
+                    while not device.aborted:
+                        out = np.zeros((256, channels), dtype=np.float32)
+                        try:
+                            callback(out, 256, None, None)
+                        except device.CallbackStop:
+                            device.played.append(out.copy())
+                            break
+                        device.played.append(out.copy())
+                    finished_callback()
+
+                threading.Thread(target=run, daemon=True).start()
+
+            def abort(self_inner) -> None:
+                device.aborted = True
+
+            def close(self_inner) -> None:
+                pass
+
+        return Stream()
+
+
+def _pcm_wav(path, samples: np.ndarray, rate: int = 24_000) -> None:
+    import wave as _wave
+
+    with _wave.open(str(path), "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(rate)
+        writer.writeframes((samples * 32767).astype(np.int16).tobytes())
+
+
+def test_playback_runs_in_process_and_plays_every_sample(tmp_path):
+    from voxmcp.audio import AudioPlayer, PlaybackRegistry
+
+    clip = tmp_path / "clip.wav"
+    _pcm_wav(clip, np.full(1000, 0.5, dtype=np.float32))
+    device = _FakeOutputDevice()
+    player = AudioPlayer(registry=PlaybackRegistry(), sounddevice=device)
+
+    handle = player.play_file(clip, blocking=True)
+
+    assert handle.command[0] == "vox-portaudio"
+    played = np.concatenate(device.played)
+    assert np.count_nonzero(played) == 1000
+
+
+def test_last_span_loses_its_trailing_silence_but_keeps_a_breath(tmp_path):
+    from voxmcp.audio import TAIL_KEEP_S, AudioPlayer, PlaybackRegistry
+
+    rate = 24_000
+    speech = np.full(rate // 2, 0.5, dtype=np.float32)
+    clip = tmp_path / "clip.wav"
+    _pcm_wav(clip, np.concatenate([speech, np.zeros(int(0.36 * rate), dtype=np.float32)]), rate)
+    device = _FakeOutputDevice()
+    player = AudioPlayer(registry=PlaybackRegistry(), sounddevice=device)
+
+    player.play_file(clip, blocking=True, trim_tail=True)
+
+    played = np.concatenate(device.played)
+    kept = int(np.flatnonzero(played[:, 0])[-1]) + 1
+    assert kept == len(speech)
+    assert len(played) < len(speech) + int(TAIL_KEEP_S * rate) + 256
+
+
+def test_cancel_stops_in_process_playback(tmp_path):
+    from voxmcp.audio import AudioPlayer, PlaybackRegistry
+
+    clip = tmp_path / "clip.wav"
+    _pcm_wav(clip, np.full(24_000 * 60, 0.5, dtype=np.float32))
+    device = _FakeOutputDevice()
+    player = AudioPlayer(registry=PlaybackRegistry(), sounddevice=device)
+
+    handle = player.play_file(clip)
+    handle.cancel(grace_s=1.0)
+
+    assert handle.process.poll() is not None
+    assert handle.wait() < 0

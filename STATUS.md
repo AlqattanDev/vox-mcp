@@ -50,6 +50,17 @@ Package is `src/voxmcp/`.
 - **Listen earcons.** A rising blip marks the mic opening (talk now), a falling
   blip marks it closing (stopped) — the start tone plays before capture so it
   can't leak in. Off via `VOX_EARCONS=0`.
+- **Paused is not off.** The app pauses on sleep and fast-user-switch only —
+  never on display sleep, which fired ~5 min into every stretch of agent work
+  and was the source of "voice is off" (957 pauses, 7 app resumes). Those
+  pauses carry `pause_reason: "auto:*"`; wake/unlock and the next
+  speak/converse lift them. A pause the user chose still refuses, and says so.
+  `start` and read-aloud resume any pause. An idle-expired session reports
+  "idle and ready", not "off".
+- **Playback is in process.** PortAudio, not `afplay`, which cost a fixed
+  ~0.85 s per clip. The last span's trailing silence is trimmed to 80 ms. Last
+  word → mic open measured **0.44 s** (was ~1.2 s). `VOX_INPROCESS_PLAYBACK=0`
+  returns to `afplay`; non-PCM clips (the `say` fallback) always use it.
 - **Streamed TTS.** Long replies speak sentence-by-sentence; the next span
   synthesizes while the current one plays, so audio starts after the first
   sentence. Off via `VOX_STREAM_TTS=0`.
@@ -342,7 +353,7 @@ full 1.6 s — and is never cut off mid-thought.
 | `com.vox.runtime` | ~73 MB | ~73 MB |
 | **total** | **~2.7 GB** | **~3.2 GB** |
 
-Tests: `.venv/bin/python -m pytest tests/` — **463 passing**. Run it that way,
+Tests: `.venv/bin/python -m pytest tests/` — **515 passing**. Run it that way,
 from the repo root: `tests/test_agents.py` imports a helper from
 `tests.test_engine`, so a bare `pytest` cannot collect it.
 
@@ -356,8 +367,9 @@ installs to `~/Applications/Vox.app` **cleanly** (removes the old app first —
 binary), guards against nesting, and restarts `com.vox.runtime`. The editable
 Python runtime picks up code changes on that restart.
 
-The build **fails without a persistent codesigning identity** (currently Apple
-Development, team `YN9839UZF5`). That is deliberate: macOS pins Accessibility
+The build **fails without a persistent codesigning identity** (on this Mac the
+self-signed **"Vox Local Signing"** in the login keychain — pass it as
+`VOX_CODESIGN_IDENTITY="Vox Local Signing"`; there is no Apple Development cert). That is deliberate: macOS pins Accessibility
 to the code signature, and the old ad-hoc fallback minted a new cdhash every
 build — silently revoking dictation and read-aloud on every deploy with nothing
 to explain why. Set `VOX_CODESIGN_IDENTITY`, or `VOX_ALLOW_ADHOC_SIGN=1` to

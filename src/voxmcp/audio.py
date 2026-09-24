@@ -1621,6 +1621,121 @@ class PlaybackProcess(Protocol):
     def kill(self) -> None: ...
 
 
+class InProcessPlayback:
+    """A :class:`PlaybackProcess` played through PortAudio instead of afplay.
+
+    ``afplay`` costs a fixed ~0.85 s of wall clock per clip (measured: 0.5 s,
+    2 s and 5 s of audio all took duration + 0.85-0.93 s), paid between every
+    sentence and again before the reply listen can open. In process the clip
+    ends when its last buffer drains, so the hand-off follows the voice.
+    """
+
+    pid = 0
+
+    def __init__(self, sounddevice: Any, samples: np.ndarray, sample_rate: int) -> None:
+        self._samples = samples
+        self._position = 0
+        self._stop = sounddevice.CallbackStop
+        self._done = threading.Event()
+        self._code: int | None = None
+        self._terminated = False
+        self._closed = False
+        self._in_use = _PortAudioInUse().__enter__()
+        try:
+            self._stream = sounddevice.OutputStream(
+                samplerate=sample_rate,
+                channels=samples.shape[1],
+                dtype="float32",
+                callback=self._callback,
+                finished_callback=self._finished,
+            )
+            self._stream.start()
+        except BaseException:
+            self._in_use.__exit__()
+            raise
+
+    def _callback(self, outdata: Any, frames: int, _time: Any, _status: Any) -> None:
+        chunk = self._samples[self._position : self._position + frames]
+        count = len(chunk)
+        outdata[:count] = chunk
+        self._position += count
+        if count < frames:
+            outdata[count:] = 0
+            raise self._stop
+
+    def _finished(self) -> None:
+        if self._done.is_set():
+            return
+        self._code = -15 if self._terminated else 0
+        self._in_use.__exit__()
+        self._done.set()
+
+    def _close(self) -> None:
+        # Never from the PortAudio thread: closing inside finished_callback
+        # deadlocks. wait() runs on the monitor or caller thread.
+        if not self._closed:
+            self._closed = True
+            try:
+                self._stream.close()
+            except Exception:
+                pass
+
+    def poll(self) -> int | None:
+        return self._code if self._done.is_set() else None
+
+    def wait(self, timeout: float | None = None) -> int:
+        if not self._done.wait(timeout):
+            raise subprocess.TimeoutExpired("vox-portaudio", timeout or 0.0)
+        self._close()
+        return int(self._code or 0)
+
+    def terminate(self) -> None:
+        if self._done.is_set():
+            return
+        self._terminated = True
+        try:
+            self._stream.abort()
+        except Exception:
+            self._finished()
+
+    kill = terminate
+
+
+def _load_pcm(path: Path, volume: float) -> tuple[np.ndarray, int]:
+    """Read 16-bit PCM as float32 frames, or raise for anything else."""
+
+    with wave.open(str(path), "rb") as reader:
+        if reader.getsampwidth() != 2:
+            raise PlaybackError("in-process playback needs 16-bit PCM")
+        channels = reader.getnchannels()
+        sample_rate = reader.getframerate()
+        raw = reader.readframes(reader.getnframes())
+    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) * (volume / 32768.0)
+    return samples.reshape(-1, channels), sample_rate
+
+
+TAIL_KEEP_S = 0.08
+
+
+def trim_trailing_silence(samples: np.ndarray, sample_rate: int, *, floor: float = 0.004) -> np.ndarray:
+    """Drop the silence Kokoro leaves after the last word, keeping 80 ms.
+
+    Every clip ends in ~0.36 s of digital quiet. Between sentences that is the
+    pause a listener expects; after the last one it is dead air the person
+    waits through before the microphone opens.
+    """
+
+    loud = np.flatnonzero(np.max(np.abs(samples), axis=1) > floor)
+    if loud.size == 0:
+        return samples
+    end = min(len(samples), int(loud[-1]) + 1 + int(TAIL_KEEP_S * sample_rate))
+    return samples[:end]
+
+
+def _inprocess_playback_enabled() -> bool:
+    return os.environ.get("VOX_INPROCESS_PLAYBACK", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
 class PlaybackRegistry:
     """Tracks only player subprocesses created by the current Vox process."""
 
@@ -1861,6 +1976,39 @@ class AudioPlayer:
         ).start()
         return handle
 
+    def _inprocess_playback(
+        self,
+        audio_path: Path,
+        *,
+        volume: float,
+        cleanup_paths: Iterable[Path],
+        trim_tail: bool = False,
+    ) -> "PlaybackHandle | None":
+        """Play through PortAudio, or return None to use the player process.
+
+        Only on the real runtime (an injected ``popen_factory`` means a test
+        that wants the subprocess path) and only for PCM this can read; the
+        ``say`` fallback can emit other formats, which afplay still handles.
+        """
+
+        if self._popen is not subprocess.Popen and self._sounddevice is None:
+            return None
+        if not _inprocess_playback_enabled():
+            return None
+        try:
+            device = self._sounddevice or _load_sounddevice()
+            samples, sample_rate = _load_pcm(audio_path, min(1.0, max(0.0, volume)))
+            if trim_tail:
+                samples = trim_trailing_silence(samples, sample_rate, floor=0.004 * max(volume, 0.05))
+            # The output is the default device *now*, as afplay's always was.
+            refresh_devices(device)
+            process = InProcessPlayback(device, samples, sample_rate)
+        except Exception:
+            return None
+        handle = PlaybackHandle(process, ("vox-portaudio", str(audio_path)), self.registry, cleanup_paths)
+        self.registry.register(handle)
+        return handle
+
     def play_file(
         self,
         path: Path | str,
@@ -1869,6 +2017,7 @@ class AudioPlayer:
         blocking: bool = False,
         preferred_player: str | None = None,
         cleanup_paths: Iterable[Path] = (),
+        trim_tail: bool = False,
     ) -> PlaybackHandle:
         audio_path = Path(path).expanduser().resolve(strict=True)
         remote = self._remote_playback(audio_path, volume=volume, cleanup_paths=cleanup_paths)
@@ -1876,6 +2025,23 @@ class AudioPlayer:
             if blocking:
                 remote.wait()
             return remote
+        local = (
+            self._inprocess_playback(
+                audio_path, volume=volume, cleanup_paths=cleanup_paths, trim_tail=trim_tail
+            )
+            if preferred_player is None
+            else None
+        )
+        if local is not None:
+            if blocking:
+                local.wait()
+            else:
+                threading.Thread(
+                    target=local.monitor,
+                    name=f"vox-playback-{local.id[:8]}",
+                    daemon=True,
+                ).start()
+            return local
         player = self._resolve_player(preferred_player)
         command = self._command(player, audio_path, volume)
         try:
@@ -1958,6 +2124,7 @@ __all__ = [
     "FrameDecision",
     "PLAYBACK_REGISTRY",
     "PlaybackError",
+    "InProcessPlayback",
     "PlaybackHandle",
     "PlaybackRegistry",
     "WebRTCVADClassifier",
