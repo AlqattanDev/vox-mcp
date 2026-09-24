@@ -1372,6 +1372,11 @@ class VoxEngine:
             return_code = await asyncio.to_thread(handle.wait)
         finally:
             self.playback_levels.end()
+        underflows = getattr(getattr(handle, "process", None), "underflows", 0)
+        if isinstance(underflows, int) and underflows:
+            # Each one is an audible click; the log is how "a noise after
+            # every word" becomes a number.
+            self._log("playback.underflow", count=underflows)
         with self._active_lock:
             cancelled = self._cancel_requested
             self._playback = None

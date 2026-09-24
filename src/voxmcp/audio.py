@@ -1640,12 +1640,20 @@ class InProcessPlayback:
         self._code: int | None = None
         self._terminated = False
         self._closed = False
+        self.underflows = 0
         self._in_use = _PortAudioInUse().__enter__()
         try:
             self._stream = sounddevice.OutputStream(
                 samplerate=sample_rate,
                 channels=samples.shape[1],
                 dtype="float32",
+                # The callback is Python and shares the GIL with capture, the
+                # event loop and the level meter. PortAudio's low-latency
+                # default left ~10 ms of slack, and every stall under it was an
+                # audible click between words. Latency here costs nothing: it
+                # only delays when a clip starts, never the hand-off after.
+                blocksize=2048,
+                latency="high",
                 callback=self._callback,
                 finished_callback=self._finished,
             )
@@ -1654,7 +1662,9 @@ class InProcessPlayback:
             self._in_use.__exit__()
             raise
 
-    def _callback(self, outdata: Any, frames: int, _time: Any, _status: Any) -> None:
+    def _callback(self, outdata: Any, frames: int, _time: Any, status: Any) -> None:
+        if status and getattr(status, "output_underflow", False):
+            self.underflows += 1
         chunk = self._samples[self._position : self._position + frames]
         count = len(chunk)
         outdata[:count] = chunk

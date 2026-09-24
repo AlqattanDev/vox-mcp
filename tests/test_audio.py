@@ -1691,7 +1691,7 @@ class _FakeOutputDevice:
     def _initialize(self) -> None:
         pass
 
-    def OutputStream(self, *, samplerate, channels, dtype, callback, finished_callback):
+    def OutputStream(self, *, samplerate, channels, dtype, callback, finished_callback, **_options):
         device = self
 
         class Stream:
