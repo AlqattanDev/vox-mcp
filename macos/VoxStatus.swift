@@ -462,6 +462,20 @@ final class VoxAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             name: NSWorkspace.sessionDidBecomeActiveNotification,
             object: nil
         )
+        // A lock is the person walking away; the dimmed screen before it is not.
+        let distributed = DistributedNotificationCenter.default()
+        distributed.addObserver(
+            self,
+            selector: #selector(protectPrivacyForInactiveSession),
+            name: NSNotification.Name("com.apple.screenIsLocked"),
+            object: nil
+        )
+        distributed.addObserver(
+            self,
+            selector: #selector(resumeAfterWake),
+            name: NSNotification.Name("com.apple.screenIsUnlocked"),
+            object: nil
+        )
         // Poll fast so the menu-bar glyph tracks the real mic state almost
         // instantly instead of lagging a second behind what the mic is doing.
         setPollInterval(0.4)
