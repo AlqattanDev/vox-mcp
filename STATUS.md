@@ -380,7 +380,6 @@ build anyway and re-grant by hand.
 
 | project | agent | voice |
 |---|---|---|
-| `~/infra` | `infra` | `af_jessica` |
 | `~/fable-5/games/mobilescape` | `mobilescape` | `am_fenrir` |
 | `~/vox-mcp` | `vox` | `am_liam` |
 | `~/.claude` | `claude` | `af_bella` |

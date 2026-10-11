@@ -5,7 +5,8 @@ It keeps the audio engine in a persistent daemon and makes each MCP server a
 small reconnectable adapter. Restarting or updating an agent host therefore
 does not tear down the voice engine or corrupt its session state.
 
-Vox uses the Whisper.cpp and Kokoro services already installed on this Mac.
+Vox runs speech locally with whisper.cpp (speech-to-text) and Kokoro
+(text-to-speech); `install.sh` builds both on your Mac.
 It makes **no paid or cloud speech calls**. Speech endpoints must resolve to a
 loopback address; Vox refuses to start if they do not.
 
@@ -47,20 +48,39 @@ loopback address; Vox refuses to start if they do not.
 - Last-audio recovery is on by default; conversation archives and raw text
   logging are off by default.
 
-## Status
+## Install
 
-This directory contains the implementation, installer, host skills, and
-tests. See `docs/EXPERIENCE.md` for the listening contract and
-`docs/ARCHITECTURE.md` for the process model.
-
-Build, inspect the dry-run, then activate transactionally:
+Requirements: an Apple silicon Mac on macOS 13 or later, the Xcode Command Line
+Tools (`xcode-select --install`), [uv](https://docs.astral.sh/uv/), and
+[Homebrew](https://brew.sh) for `cmake` and `ffmpeg` if you do not have them.
+Plan for about 3 GB of disk (PyTorch for Kokoro, the Whisper model) and a few
+minutes of building.
 
 ```bash
-uv sync --extra test --frozen
-./scripts/build_macos_app.sh
-uv run vox install
-uv run vox install --activate --yes
+git clone https://github.com/AlqattanDev/vox-mcp.git ~/vox-mcp
+~/vox-mcp/install.sh
 ```
+
+`install.sh` builds whisper.cpp and Kokoro under `~/.voicemode/services`
+(`scripts/setup_speech.sh`; set `VOX_SPEECH_ROOT` to put them elsewhere),
+builds and signs `Vox.app`, installs the runtime from the frozen lock, prints
+the installer's dry-run plan and asks before activating it. Activation writes
+three launch agents (runtime, Whisper, Kokoro), installs the menu-bar app to
+`~/Applications`, and registers the MCP server with Claude Code and Codex when
+they are installed. It keeps a rollback snapshot. The runtime runs from the
+clone, so leave it where it is.
+
+The app build wants a stable code-signing identity, because macOS ties the
+Accessibility grant to the signature. A free Apple ID gives you one: Xcode ›
+Settings › Accounts › add the Apple ID › Manage Certificates › + › Apple
+Development. Without one, `VOX_ALLOW_ADHOC_SIGN=1 ./install.sh` works, but
+Accessibility has to be granted again after every rebuild.
+
+Any other MCP client connects to `http://127.0.0.1:8766/mcp`.
+
+To work on Vox itself: `uv sync --extra test --frozen`, then
+`.venv/bin/python -m pytest -q tests`. `docs/EXPERIENCE.md` is the listening
+contract and `docs/ARCHITECTURE.md` the process model.
 
 Quick checks after installation:
 

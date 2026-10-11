@@ -107,8 +107,13 @@ class InstallerPaths:
         user_home = Path.home().resolve() if home is None else Path(home).expanduser().resolve()
         vox_root = user_home / ".vox"
         launch_agents = user_home / "Library" / "LaunchAgents"
-        whisper_root = user_home / ".voicemode" / "services" / "whisper"
-        kokoro_root = user_home / ".voicemode" / "services" / "kokoro"
+        # scripts/setup_speech.sh builds both services here; VOX_SPEECH_ROOT
+        # moves them, and the launch agents follow.
+        speech_root = Path(
+            os.environ.get("VOX_SPEECH_ROOT") or user_home / ".voicemode" / "services"
+        ).expanduser().resolve()
+        whisper_root = speech_root / "whisper"
+        kokoro_root = speech_root / "kokoro"
         return cls(
             home=user_home,
             project_root=project,
