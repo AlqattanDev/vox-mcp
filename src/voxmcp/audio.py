@@ -1677,7 +1677,6 @@ class InProcessPlayback:
         if self._done.is_set():
             return
         self._code = -15 if self._terminated else 0
-        self._in_use.__exit__()
         self._done.set()
 
     def _close(self) -> None:
@@ -1689,6 +1688,10 @@ class InProcessPlayback:
                 self._stream.close()
             except Exception:
                 pass
+            # Released only once the stream is closed: released at "finished",
+            # the next clip's refresh_devices() terminated PortAudio before this
+            # close ran, and Pa_CloseStream on the freed stream segfaulted voxd.
+            self._in_use.__exit__()
 
     def poll(self) -> int | None:
         return self._code if self._done.is_set() else None

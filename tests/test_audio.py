@@ -1774,3 +1774,17 @@ def test_cancel_stops_in_process_playback(tmp_path):
 
     assert handle.process.poll() is not None
     assert handle.wait() < 0
+
+
+def test_portaudio_stays_in_use_until_the_finished_stream_is_closed():
+    """A drained stream is not a closed one: terminating PortAudio between the
+    two (the next clip's device refresh) made Pa_CloseStream segfault voxd."""
+    from voxmcp.audio import InProcessPlayback, refresh_devices
+
+    device = _FakeOutputDevice()
+    playback = InProcessPlayback(device, np.full((300, 1), 0.5, dtype=np.float32), 24_000)
+    assert playback._done.wait(2.0)
+
+    assert refresh_devices(device) is False
+    playback.wait()
+    assert refresh_devices(device) is True
