@@ -1,8 +1,8 @@
 #!/bin/zsh
 # One command from a fresh clone to a running Vox:
 #
-#   git clone https://github.com/AlqattanDev/vox-mcp.git ~/vox-mcp
-#   ~/vox-mcp/install.sh
+#   git clone https://github.com/AlqattanDev/vox-mcp.git ~/tools/vox-mcp
+#   ~/tools/vox-mcp/install.sh
 #
 # 1. builds the local speech services (scripts/setup_speech.sh),
 # 2. builds and signs Vox.app,

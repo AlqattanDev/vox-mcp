@@ -57,8 +57,8 @@ Plan for about 3 GB of disk (PyTorch for Kokoro, the Whisper model) and a few
 minutes of building.
 
 ```bash
-git clone https://github.com/AlqattanDev/vox-mcp.git ~/vox-mcp
-~/vox-mcp/install.sh
+git clone https://github.com/AlqattanDev/vox-mcp.git ~/tools/vox-mcp
+~/tools/vox-mcp/install.sh
 ```
 
 `install.sh` builds whisper.cpp and Kokoro under `~/.voicemode/services`

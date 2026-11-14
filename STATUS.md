@@ -23,8 +23,8 @@ state you forget.
 
 ## Where it lives
 
-Repo `~/vox-mcp` → private `AlqattanDev/vox-mcp`. Launch agent
-`com.vox.runtime` runs `~/Applications/Vox.app` → `~/vox-mcp/.venv/bin/voxd`.
+Repo `~/tools/vox-mcp` → private `AlqattanDev/vox-mcp`. Launch agent
+`com.vox.runtime` runs `~/Applications/Vox.app` → `~/tools/vox-mcp/.venv/bin/voxd`.
 Package is `src/voxmcp/`.
 
 ## What works
@@ -380,8 +380,8 @@ build anyway and re-grant by hand.
 
 | project | agent | voice |
 |---|---|---|
-| `~/fable-5/games/mobilescape` | `mobilescape` | `am_fenrir` |
-| `~/vox-mcp` | `vox` | `am_liam` |
+| `~/Archives/2026-11-14-cleanup/fable-5/games/mobilescape` | `mobilescape` | `am_fenrir` |
+| `~/tools/vox-mcp` | `vox` | `am_liam` |
 | `~/.claude` | `claude` | `af_bella` |
 
 ```bash
